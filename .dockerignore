@@ -1,0 +1,12 @@
+.git
+.venv
+**/.venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/*.egg-info
+**/.pytest_cache
+**/.mypy_cache
+legacy
+infra/sql/bootstrap_schema.sql

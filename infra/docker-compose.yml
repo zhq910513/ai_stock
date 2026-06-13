@@ -1,0 +1,272 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: ai-stock-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ai_stock}
+      POSTGRES_USER: ${POSTGRES_USER:-ai_stock}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_stock}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai_stock} -d ${POSTGRES_DB:-ai_stock}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    profiles: ["optional-infra"]
+    image: redis:7
+    container_name: ai-stock-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  nats:
+    profiles: ["optional-infra"]
+    image: nats:2.10
+    container_name: ai-stock-nats
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "${NATS_PORT:-4222}:4222"
+      - "${NATS_MONITOR_PORT:-8222}:8222"
+    volumes:
+      - nats_data:/data
+    restart: unless-stopped
+
+  minio:
+    profiles: ["optional-infra"]
+    image: minio/minio:latest
+    container_name: ai-stock-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+
+  schema-bootstrap:
+    build:
+      context: ..
+      dockerfile: infra/docker/db-schema.Dockerfile
+    container_name: ai-stock-schema-bootstrap
+    environment:
+      AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  source-data-service:
+    build:
+      context: ..
+      dockerfile: infra/docker/service.Dockerfile
+      args:
+        SERVICE_DIR: services/source-data-service
+        SERVICE_EXTRAS: "[providers]"
+    container_name: ai-stock-source-data-service
+    environment:
+      AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_PROVIDER_TIMEOUT_SECONDS: ${SOURCE_DATA_PROVIDER_TIMEOUT_SECONDS:-12}
+      SOURCE_DATA_PROVIDER_MAX_RETRIES: ${SOURCE_DATA_PROVIDER_MAX_RETRIES:-2}
+      SOURCE_DATA_CIRCUIT_BREAKER_FAILURE_THRESHOLD: ${SOURCE_DATA_CIRCUIT_BREAKER_FAILURE_THRESHOLD:-5}
+      SOURCE_DATA_CIRCUIT_BREAKER_RECOVERY_SECONDS: ${SOURCE_DATA_CIRCUIT_BREAKER_RECOVERY_SECONDS:-60}
+      SOURCE_DATA_TUSHARE_TOKEN: ${SOURCE_DATA_TUSHARE_TOKEN:-}
+      SOURCE_DATA_QUEUE_BACKEND: ${SOURCE_DATA_QUEUE_BACKEND:-postgres}
+      SOURCE_DATA_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SERVICE_NAME: source-data-service
+      PORT: 8041
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-bootstrap:
+        condition: service_completed_successfully
+    command: ["uvicorn", "source_data_service.api:app", "--host", "0.0.0.0", "--port", "8041"]
+    ports:
+      - "${SOURCE_DATA_SERVICE_PORT:-8041}:8041"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8041/readyz', timeout=3).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  source-data-worker:
+    build:
+      context: ..
+      dockerfile: infra/docker/service.Dockerfile
+      args:
+        SERVICE_DIR: services/source-data-service
+        SERVICE_EXTRAS: "[providers]"
+    container_name: ai-stock-source-data-worker
+    environment:
+      AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_QUEUE_BACKEND: ${SOURCE_DATA_QUEUE_BACKEND:-postgres}
+      SOURCE_DATA_WORKER_ID: ${SOURCE_DATA_WORKER_ID:-source-data-worker-1}
+      SOURCE_DATA_WORKER_MAX_JOBS: ${SOURCE_DATA_WORKER_MAX_JOBS:-5}
+      SOURCE_DATA_WORKER_LEASE_SECONDS: ${SOURCE_DATA_WORKER_LEASE_SECONDS:-120}
+      SOURCE_DATA_WORKER_POLL_SECONDS: ${SOURCE_DATA_WORKER_POLL_SECONDS:-1}
+      SOURCE_DATA_WORKER_DRY_RUN_PROVIDER: ${SOURCE_DATA_WORKER_DRY_RUN_PROVIDER:-false}
+      SOURCE_DATA_TUSHARE_TOKEN: ${SOURCE_DATA_TUSHARE_TOKEN:-}
+      SERVICE_NAME: source-data-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-bootstrap:
+        condition: service_completed_successfully
+      source-data-service:
+        condition: service_healthy
+    command: ["python", "-m", "source_data_service.worker_loop"]
+    restart: unless-stopped
+
+  hot-candidates-service:
+    build:
+      context: ..
+      dockerfile: infra/docker/service.Dockerfile
+      args:
+        SERVICE_DIR: services/models_services/hot-candidates-service
+    container_name: ai-stock-hot-candidates-service
+    environment:
+      AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_SERVICE_BASE_URL: http://source-data-service:8041
+      SERVICE_NAME: hot-candidates-service
+      PORT: 8031
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-bootstrap:
+        condition: service_completed_successfully
+      source-data-service:
+        condition: service_healthy
+    command: ["uvicorn", "hot_candidates_model_service.main:app", "--host", "0.0.0.0", "--port", "8031"]
+    ports:
+      - "${HOT_CANDIDATES_SERVICE_PORT:-8031}:8031"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/readyz', timeout=3).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  candidate-memory-service:
+    build:
+      context: ..
+      dockerfile: infra/docker/service.Dockerfile
+      args:
+        SERVICE_DIR: services/models_services/candidate-memory-service
+    container_name: ai-stock-candidate-memory-service
+    environment:
+      AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_SERVICE_BASE_URL: http://source-data-service:8041
+      SERVICE_NAME: candidate-memory-service
+      PORT: 8032
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-bootstrap:
+        condition: service_completed_successfully
+      source-data-service:
+        condition: service_healthy
+    command: ["uvicorn", "candidate_memory_model_service.main:app", "--host", "0.0.0.0", "--port", "8032"]
+    ports:
+      - "${CANDIDATE_MEMORY_SERVICE_PORT:-8032}:8032"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8032/readyz', timeout=3).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  ambush-watchlist-service:
+    build:
+      context: ..
+      dockerfile: infra/docker/service.Dockerfile
+      args:
+        SERVICE_DIR: services/models_services/ambush-watchlist-service
+    container_name: ai-stock-ambush-watchlist-service
+    environment:
+      AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_SERVICE_BASE_URL: http://source-data-service:8041
+      SERVICE_NAME: ambush-watchlist-service
+      PORT: 8033
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-bootstrap:
+        condition: service_completed_successfully
+      source-data-service:
+        condition: service_healthy
+    command: ["uvicorn", "ambush_watchlist_model_service.main:app", "--host", "0.0.0.0", "--port", "8033"]
+    ports:
+      - "${AMBUSH_WATCHLIST_SERVICE_PORT:-8033}:8033"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8033/readyz', timeout=3).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  scheduler-service:
+    build:
+      context: ..
+      dockerfile: infra/docker/service.Dockerfile
+      args:
+        SERVICE_DIR: services/scheduler-service
+    container_name: ai-stock-scheduler-service
+    environment:
+      AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_SERVICE_BASE_URL: http://source-data-service:8041
+      HOT_CANDIDATES_SERVICE_BASE_URL: http://hot-candidates-service:8031
+      CANDIDATE_MEMORY_SERVICE_BASE_URL: http://candidate-memory-service:8032
+      AMBUSH_WATCHLIST_SERVICE_BASE_URL: http://ambush-watchlist-service:8033
+      SERVICE_NAME: scheduler-service
+      PORT: 8023
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-bootstrap:
+        condition: service_completed_successfully
+      source-data-service:
+        condition: service_healthy
+      hot-candidates-service:
+        condition: service_healthy
+      candidate-memory-service:
+        condition: service_healthy
+      ambush-watchlist-service:
+        condition: service_healthy
+    command: ["uvicorn", "scheduler_service.main:app", "--host", "0.0.0.0", "--port", "8023"]
+    ports:
+      - "${SCHEDULER_SERVICE_PORT:-8023}:8023"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8023/readyz', timeout=3).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  nats_data:
+  minio_data:

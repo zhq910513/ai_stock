@@ -1,0 +1,14 @@
+[project]
+name = "ai-stock-scheduler-service"
+version = "0.2.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "pydantic>=2",
+  "tzdata>=2025.2",
+  "uvicorn[standard]>=0.30",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

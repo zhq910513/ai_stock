@@ -1,0 +1,92 @@
+# ai_stock git ignore rules
+#
+# Keep source code, contracts, schema, and requirement assets trackable.
+# Ignore only local secrets, runtime state, caches, generated artifacts,
+# browser audit profiles, and disposable test output.
+
+# Local secrets and runtime configuration
+.env
+.env.*
+!.env.example
+infra/env/stack.env
+infra/env/*.local
+*.pem
+*.key
+*.crt
+*.p12
+
+# Codex/local agent runtime state
+.codex/auth.json
+.codex/logs/
+.codex/tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.egg-info/
+.venv/
+venv/
+/env/
+
+# Node/frontend package managers and build output
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.next/
+.vite/
+dist/
+build/
+coverage/
+playwright-report/
+test-results/
+blob-report/
+
+# Disposable local audit output
+tmp/
+tmp_*
+_tmp_*
+tmp_*/
+_tmp_*/
+.tmp_*
+.tmp_*/
+.tmp_chrome_frontend_audit/
+chrome-audit-profile-*/
+chrome-all-routes-*/
+page-quick-*/
+ui-audit-screenshots/
+visual-audit/
+
+# Logs and process/runtime files
+logs/
+*.log
+*.pid
+*.seed
+*.pid.lock
+
+# Local databases and dumps
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.dump
+*.bak
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,1 @@
+"""Hot candidates model service."""

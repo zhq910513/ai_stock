@@ -1,0 +1,1 @@
+"""Candidate memory model service."""
