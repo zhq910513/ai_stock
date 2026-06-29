@@ -1,13 +1,49 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from scheduler_service.three_model_plan import THREE_MODEL_TASKS, THREE_MODEL_SCHEDULER_VERSION
 
 THREE_MODEL_MATERIALIZER_VERSION = "three_model_materializer_v1"
 DEFAULT_MARKET_TZ = "Asia/Shanghai"
+
+
+def _times_every_minutes(start: time, end: time, step_minutes: int) -> tuple[time, ...]:
+    anchor = datetime.combine(date(2000, 1, 1), start)
+    final = datetime.combine(date(2000, 1, 1), end)
+    step = timedelta(minutes=step_minutes)
+    items: list[time] = []
+    current = anchor
+    while current <= final:
+        items.append(current.time())
+        current += step
+    return tuple(items)
+
+
+def _trading_session_times_every_minutes(
+    sessions: tuple[tuple[time, time], ...],
+    step_minutes: int,
+) -> tuple[time, ...]:
+    return tuple(
+        item
+        for start, end in sessions
+        for item in _times_every_minutes(start, end, step_minutes)
+    )
+
+
+T_RELAY_DAY2_POST_ENTRY_MONITOR_TIMES_LOCAL = _trading_session_times_every_minutes(
+    ((time(9, 35), time(11, 30)), (time(13, 0), time(15, 0))),
+    5,
+)
+T_RELAY_OBSERVATION_MONITOR_TIMES_LOCAL = _trading_session_times_every_minutes(
+    ((time(9, 30), time(11, 30)), (time(13, 0), time(15, 0))),
+    5,
+)
+
+T_RELAY_DAY3_MORNING_MONITOR_TIMES_LOCAL = _times_every_minutes(time(9, 25), time(11, 30), 5)
+T_RELAY_DAY3_AFTERNOON_MONITOR_TIMES_LOCAL = _times_every_minutes(time(13, 0), time(15, 0), 5)
 
 # These are execution starts for task windows. High-frequency windows are owned by
 # the owner service after the scheduler starts the window task; the scheduler does
@@ -33,6 +69,42 @@ TASK_START_TIMES_LOCAL: dict[str, tuple[time, ...]] = {
     "ambush.phase3.release_gate.close": (time(15, 35),),
     "ambush.buy_point.reference": (time(15, 35),),
     "ambush.observe.outcome.evolution": (time(15, 55),),
+    "t_relay.day1.scan.close": (time(15, 5), time(15, 30)),
+    "t_relay.day2.watch.rolling_5m": (
+        time(9, 30),
+        time(9, 35),
+        time(9, 40),
+        time(9, 45),
+        time(9, 50),
+        time(9, 55),
+        time(10, 0),
+        time(10, 5),
+        time(10, 10),
+        time(10, 15),
+        time(10, 20),
+        time(10, 25),
+        time(10, 30),
+    ),
+    "t_relay.day2.trigger.rolling_5m": (
+        time(9, 30),
+        time(9, 35),
+        time(9, 40),
+        time(9, 45),
+        time(9, 50),
+        time(9, 55),
+        time(10, 0),
+        time(10, 5),
+        time(10, 10),
+        time(10, 15),
+        time(10, 20),
+        time(10, 25),
+        time(10, 30),
+    ),
+    "t_relay.day2.post_entry.monitor": T_RELAY_DAY2_POST_ENTRY_MONITOR_TIMES_LOCAL,
+    "t_relay.day3.exit.open": T_RELAY_DAY3_MORNING_MONITOR_TIMES_LOCAL,
+    "t_relay.day3.exit.tail": T_RELAY_DAY3_AFTERNOON_MONITOR_TIMES_LOCAL,
+    "t_relay.observation.monitor.snapshot_5m": T_RELAY_OBSERVATION_MONITOR_TIMES_LOCAL,
+    "t_relay.outcome.build": (time(15, 40),),
 }
 
 OPTIONAL_RESEARCH_INTRADAY_TIMES_LOCAL: dict[str, tuple[time, ...]] = {
@@ -142,5 +214,7 @@ def materialize_three_model_day(
             "High-frequency inner loops are owned by owner services after the scheduler starts the window task.",
             "Each materialized task has a deterministic biz_key and idempotency_seed.",
             "Optional research intraday scans are marked non-official and cannot publish signals.",
+            "Model-four Day2 post-entry and Day3 hold/exit observations are materialized every five minutes during trading sessions.",
+            "Model-four observation monitor snapshots persist the current user-readable model output every five minutes for later tuning.",
         ],
     }

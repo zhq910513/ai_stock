@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from threading import Lock
 from typing import Any
 
 from source_data_service.adapters.base import ProviderAdapter
 from source_data_service.models import Provider, RawFetchResult
+
+
+_BAOSTOCK_LOCK = Lock()
 
 
 class BaoStockAdapter(ProviderAdapter):
@@ -19,6 +23,10 @@ class BaoStockAdapter(ProviderAdapter):
     def fetch(self, api_name: str, params: dict[str, Any], *, dry_run: bool = False) -> RawFetchResult:
         if dry_run:
             return self.build_result(api_name, params, [], dry_run=True, warning="dry_run: provider not called")
+        with _BAOSTOCK_LOCK:
+            return self._fetch_locked(api_name, params)
+
+    def _fetch_locked(self, api_name: str, params: dict[str, Any]) -> RawFetchResult:
         try:
             import baostock as bs  # type: ignore
         except Exception as exc:  # pragma: no cover - depends on optional provider

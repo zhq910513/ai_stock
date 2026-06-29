@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timezone
+from datetime import time, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -16,6 +17,7 @@ from source_data_service.models import (
     QualityStatus,
 )
 from source_data_service.provider_registry import get_api_spec
+from source_data_service.symbol_rules import normalize_symbol
 
 
 def utcnow() -> datetime:
@@ -47,6 +49,42 @@ def _schema_table(table_name: str) -> tuple[str, str]:
         raise ValueError(f"table name must be schema-qualified: {table_name}")
     schema, table = table_name.split(".", 1)
     return schema, table
+
+
+def _split_canonical_symbol(symbol: str | None) -> tuple[str | None, str | None]:
+    if not symbol:
+        return None, None
+    text = str(symbol).strip()
+    if "." in text:
+        code, exchange = text.split(".", 1)
+        return code, exchange.upper()
+    if len(text) == 6 and text.startswith(("0", "3")):
+        return text, "SZ"
+    if len(text) == 6 and text.startswith("6"):
+        return text, "SH"
+    return text, None
+
+
+def _daily_bar_event_time(trade_date: date | None) -> datetime | None:
+    if trade_date is None:
+        return None
+    china_tz = timezone(timedelta(hours=8))
+    return datetime.combine(trade_date, time(hour=15), tzinfo=china_tz)
+
+
+def _datetime_or_none(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text = str(value)
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
 def _date_or_none(value: Any) -> date | None:
@@ -105,31 +143,270 @@ def _extract_trade_date(row: dict[str, Any], request_params: dict[str, Any]) -> 
 
 
 def _extract_code(row: dict[str, Any], request_params: dict[str, Any]) -> str | None:
-    value = _first(row, "code", "代码", "ts_code", "symbol")
+    value = _first(row, "symbol", "code", "代码", "provider_code", "ts_code", "secid")
     if value is None:
-        value = _first(request_params, "code", "symbol", "ts_code")
+        value = _first(request_params, "code", "symbol", "provider_code", "ts_code", "secid")
     return None if value is None else str(value)
 
 
 def _normalize_symbol(value: Any) -> str | None:
-    if value in (None, ""):
-        return None
-    text = str(value)
-    if text.startswith("sz."):
-        return f"{text[3:]}.SZ"
-    if text.startswith("sh."):
-        return f"{text[3:]}.SH"
-    if text.endswith(".SZ") or text.endswith(".SH"):
-        return text
-    if text.endswith(".SZ") or text.endswith(".SH"):
-        return text
-    if len(text) == 6 and text.startswith(("0", "3")):
-        return f"{text}.SZ"
-    if len(text) == 6 and text.startswith("6"):
-        return f"{text}.SH"
-    if len(text) == 9 and text.endswith((".SZ", ".SH")):
-        return text
-    return text
+    return normalize_symbol(value)
+
+
+def _source_payload_and_key(
+    row: SourceCanonicalRowOut,
+    columns: list[str],
+    *,
+    instrument_id: int | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    values = dict(row.values)
+    base = {
+        "symbol": row.symbol,
+        "trade_date": row.trade_date,
+        "source_quality_status": row.source_quality_status.value,
+        "primary_provider": row.primary_provider.value if row.primary_provider else None,
+        "build_batch_id": row.build_batch_id,
+        "captured_at": row.captured_at,
+        "available_at": row.available_at,
+    }
+    payload: dict[str, Any] = {**base, **values}
+    key_cols = [c for c in ["symbol", "trade_date"] if c in columns]
+
+    if row.source_table_name == "source.trade_calendar_v1" and "calendar_date" in columns:
+        calendar_date = _date_or_none(values.get("calendar_date")) or row.trade_date
+        is_trading_day = values.get("is_trading_day")
+        if is_trading_day is None and "is_open" in values:
+            is_trading_day = values.get("is_open")
+        payload["calendar_date"] = calendar_date
+        payload["is_trading_day"] = is_trading_day
+        payload.setdefault("exchange", values.get("exchange") or "SSE_SZSE")
+        payload["pretrade_date"] = _date_or_none(values.get("pretrade_date") or values.get("prev_trading_day"))
+        if "trading_day" in columns:
+            payload["trading_day"] = calendar_date
+        if "market_code" in columns:
+            payload["market_code"] = values.get("market_code") or "CN_A"
+        if "is_open" in columns:
+            payload["is_open"] = is_trading_day
+        if "prev_trading_day" in columns:
+            payload["prev_trading_day"] = payload.get("pretrade_date")
+        key_cols = ["trading_day", "market_code"] if {"trading_day", "market_code"} <= set(columns) else ["calendar_date"]
+
+    if row.source_table_name == "source.adjusted_daily_bar_v1" and "adjustment_mode" in columns:
+        payload.setdefault("adjustment_mode", "qfq")
+        key_cols = ["symbol", "trade_date", "adjustment_mode"]
+
+    if row.source_table_name == "source.index_daily_bar_v1" and "index_code" in columns:
+        payload["index_code"] = row.symbol
+        key_cols = ["index_code", "trade_date"]
+
+    moneyflow_key = {"symbol", "trade_date", "primary_provider"}
+    if row.source_table_name == "source.stock_moneyflow_daily_v1" and moneyflow_key <= set(columns):
+        if row.primary_provider is None:
+            raise RuntimeError("source.stock_moneyflow_daily_v1 physical table requires primary_provider")
+        key_cols = ["symbol", "trade_date", "primary_provider"]
+
+    if row.source_table_name == "source.limit_event_v1" and "limit_event_type" in columns:
+        if not payload.get("limit_event_type"):
+            raise RuntimeError("source.limit_event_v1 physical table requires limit_event_type")
+        key_cols = ["symbol", "trade_date", "limit_event_type"]
+
+    if row.source_table_name == "source.event_news_v1" and "event_id" in columns:
+        if row.primary_provider is None:
+            raise RuntimeError("source.event_news_v1 physical table requires provider")
+        payload["event_id"] = row.source_pk
+        payload["provider"] = row.primary_provider.value
+        payload.setdefault("event_time", row.values.get("published_at") or row.available_at or row.captured_at)
+        payload["source_quality_status"] = row.source_quality_status.value
+        key_cols = ["event_id"]
+
+    if row.source_table_name == "source.minute_bar_v1" and {"instrument_id", "bar_time", "provider"} <= set(columns):
+        if instrument_id is None:
+            raise RuntimeError(
+                "source.minute_bar_v1 physical table requires a real core.instrument_master instrument_id; "
+                f"canonical symbol={row.symbol!r} cannot be persisted without master data"
+            )
+        if row.primary_provider is None:
+            raise RuntimeError("source.minute_bar_v1 physical table requires provider")
+        bar_time = _datetime_or_none(values.get("bar_time") or values.get("event_time"))
+        if bar_time is None:
+            raise RuntimeError("source.minute_bar_v1 requires bar_time/event_time")
+        payload["instrument_id"] = instrument_id
+        payload["bar_time"] = bar_time
+        payload["event_time"] = _datetime_or_none(values.get("event_time")) or bar_time
+        payload["provider"] = row.primary_provider.value
+        payload["quality_status"] = row.source_quality_status.value
+        key_cols = ["instrument_id", "bar_time", "provider"]
+
+    if row.source_table_name == "source.realtime_quote_v1" and {"instrument_id", "event_time", "provider"} <= set(columns):
+        if instrument_id is None:
+            raise RuntimeError(
+                "source.realtime_quote_v1 physical table requires a real core.instrument_master instrument_id; "
+                f"canonical symbol={row.symbol!r} cannot be persisted without master data"
+            )
+        if row.primary_provider is None:
+            raise RuntimeError("source.realtime_quote_v1 physical table requires provider")
+        event_time = _datetime_or_none(values.get("event_time")) or row.available_at or row.captured_at
+        payload["instrument_id"] = instrument_id
+        payload["event_time"] = event_time
+        payload["latest_price"] = values.get("latest_price") or values.get("last_price")
+        payload["provider"] = row.primary_provider.value
+        payload["quality_status"] = row.source_quality_status.value
+        key_cols = ["instrument_id", "event_time", "provider"]
+
+    if row.source_table_name == "source.auction_snapshot_v1" and {"instrument_id", "trading_day", "snapshot_time", "provider"} <= set(columns):
+        if instrument_id is None:
+            raise RuntimeError(
+                "source.auction_snapshot_v1 physical table requires a real core.instrument_master instrument_id; "
+                f"canonical symbol={row.symbol!r} cannot be persisted without master data"
+            )
+        if row.primary_provider is None:
+            raise RuntimeError("source.auction_snapshot_v1 physical table requires provider")
+        snapshot_time = _datetime_or_none(values.get("snapshot_time") or values.get("event_time"))
+        if snapshot_time is None:
+            raise RuntimeError("source.auction_snapshot_v1 requires snapshot_time/event_time")
+        payload["instrument_id"] = instrument_id
+        payload["trading_day"] = row.trade_date or snapshot_time.date()
+        payload["snapshot_time"] = snapshot_time
+        payload["event_time"] = _datetime_or_none(values.get("event_time")) or snapshot_time
+        payload["provider"] = row.primary_provider.value
+        payload["quality_status"] = row.source_quality_status.value
+        key_cols = ["instrument_id", "trading_day", "snapshot_time", "provider"]
+
+    if row.source_table_name == "source.trade_tick_v1" and {"symbol", "tick_time", "provider", "provider_sequence"} <= set(columns):
+        tick_time = _datetime_or_none(values.get("tick_time"))
+        if tick_time is None:
+            raise RuntimeError("source.trade_tick_v1 requires tick_time")
+        payload["tick_time"] = tick_time
+        payload["provider"] = row.primary_provider.value if row.primary_provider else None
+        payload["source_quality_status"] = row.source_quality_status.value
+        key_cols = ["symbol", "tick_time", "provider", "provider_sequence"]
+
+    legacy_daily_key = {"instrument_id", "trading_day", "adjustment", "provider"}
+    if row.source_table_name == "source.daily_bar_v1" and legacy_daily_key <= set(columns):
+        if instrument_id is None:
+            raise RuntimeError(
+                "source.daily_bar_v1 physical table requires a real core.instrument_master instrument_id; "
+                f"canonical symbol={row.symbol!r} cannot be persisted without master data"
+            )
+        if row.primary_provider is None:
+            raise RuntimeError("source.daily_bar_v1 physical table requires primary_provider/provider")
+        payload["instrument_id"] = instrument_id
+        payload["trading_day"] = row.trade_date
+        payload.setdefault("trade_date", row.trade_date)
+        payload["adjustment"] = "raw"
+        payload["provider"] = row.primary_provider.value
+        payload["quality_status"] = row.source_quality_status.value
+        payload["event_time"] = _daily_bar_event_time(row.trade_date) or row.available_at or row.captured_at
+        key_cols = ["instrument_id", "trading_day", "adjustment", "provider"]
+
+    return payload, key_cols
+
+
+def _source_identity_from_record(source_table_name: str, data: dict[str, Any]) -> tuple[str, str | None, date | None]:
+    symbol = data.get("symbol")
+    trade_date = data.get("trade_date")
+    if source_table_name == "source.trade_calendar_v1":
+        calendar_date = _date_or_none(data.get("calendar_date") or data.get("trading_day") or trade_date)
+        source_pk = calendar_date.isoformat() if calendar_date else str(data.get("source_pk") or data.get("lineage_id") or "")
+        return source_pk, None, calendar_date
+    if source_table_name == "source.stock_master_v1":
+        source_pk = str(symbol or data.get("source_pk") or data.get("lineage_id") or "")
+        return source_pk, symbol, None
+    if source_table_name == "source.index_daily_bar_v1":
+        symbol = symbol or data.get("index_code")
+    if source_table_name == "source.event_news_v1":
+        source_pk = data.get("event_id") or data.get("source_pk") or data.get("lineage_id") or ""
+        return str(source_pk), symbol, _date_or_none(trade_date)
+    if source_table_name == "source.limit_event_v1":
+        event_type = data.get("limit_event_type")
+        source_pk = f"{symbol}|{trade_date}|{event_type}" if symbol and trade_date and event_type else str(data.get("lineage_id") or "")
+        return source_pk, symbol, _date_or_none(trade_date)
+    if source_table_name == "source.daily_bar_v1":
+        trade_date = trade_date or data.get("trading_day")
+    if source_table_name == "source.minute_bar_v1":
+        bar_time = _datetime_or_none(data.get("bar_time"))
+        source_pk = f"{symbol}|{bar_time.isoformat()}" if symbol and bar_time else str(data.get("source_minute_bar_id") or "")
+        return source_pk, symbol, bar_time.date() if bar_time else _date_or_none(trade_date)
+    if source_table_name == "source.realtime_quote_v1":
+        event_time = _datetime_or_none(data.get("event_time"))
+        source_pk = f"{symbol}|{event_time.isoformat()}" if symbol and event_time else str(data.get("quote_id") or "")
+        return source_pk, symbol, event_time.date() if event_time else _date_or_none(trade_date)
+    if source_table_name == "source.auction_snapshot_v1":
+        snapshot_time = _datetime_or_none(data.get("snapshot_time") or data.get("event_time"))
+        provider = data.get("provider")
+        source_pk = (
+            f"{symbol}|{snapshot_time.isoformat()}|{provider}"
+            if symbol and snapshot_time and provider
+            else str(data.get("auction_snapshot_id") or "")
+        )
+        return source_pk, symbol, _date_or_none(data.get("trading_day")) or (snapshot_time.date() if snapshot_time else _date_or_none(trade_date))
+    if source_table_name == "source.trade_tick_v1":
+        tick_time = _datetime_or_none(data.get("tick_time"))
+        provider_sequence = data.get("provider_sequence")
+        source_pk = f"{symbol}|{tick_time.isoformat()}|{provider_sequence}" if symbol and tick_time else str(data.get("trade_tick_id") or "")
+        return source_pk, symbol, tick_time.date() if tick_time else _date_or_none(trade_date)
+    trade_date_value = _date_or_none(trade_date)
+    if symbol and trade_date_value:
+        return f"{symbol}|{trade_date_value}", symbol, trade_date_value
+    source_pk = data.get("source_pk") or data.get("lineage_id") or ""
+    return str(source_pk), symbol, trade_date_value
+
+
+def _lineage_raw_id(lin: SourceLineageRecordOut) -> int | None:
+    return int(lin.raw_id) if lin.raw_id and str(lin.raw_id).isdigit() else None
+
+
+def _source_lineage_identity(lin: SourceLineageRecordOut) -> tuple[Any, ...]:
+    return (
+        lin.source_table_name,
+        lin.source_pk,
+        lin.canonical_field_name,
+        lin.provider.value,
+        lin.api_name,
+        lin.raw_table_name,
+        _lineage_raw_id(lin),
+        lin.request_hash,
+        lin.response_row_hash,
+    )
+
+
+def _source_lineage_lock_key(identity: tuple[Any, ...]) -> str:
+    return "source_lineage_v1:" + "|".join("" if value is None else str(value) for value in identity)
+
+
+def _select_existing_lineage_id(cur: Any, identity: tuple[Any, ...]) -> str | None:
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s)::bigint)",
+        (_source_lineage_lock_key(identity),),
+    )
+    cur.execute(
+        """
+        SELECT lineage_id
+        FROM governance.source_lineage_v1
+        WHERE source_table_name = %s
+          AND source_pk = %s
+          AND canonical_field_name = %s
+          AND provider = %s
+          AND api_name = %s
+          AND raw_table_name = %s
+          AND raw_id IS NOT DISTINCT FROM %s
+          AND request_hash IS NOT DISTINCT FROM %s
+          AND response_row_hash IS NOT DISTINCT FROM %s
+        ORDER BY created_at ASC, lineage_id ASC
+        LIMIT 1
+        """,
+        identity,
+    )
+    record = cur.fetchone()
+    return str(record[0]) if record else None
+
+
+def _raw_row_matches_requested_identity(raw_symbol: str | None, raw_trade_date: date | None, symbol: str | None, trade_date_value: date | None) -> bool:
+    if symbol and raw_symbol != symbol:
+        return False
+    if trade_date_value and raw_trade_date != trade_date_value:
+        return False
+    return True
 
 
 def _column_value(column: str, *, row: dict[str, Any], request_params: dict[str, Any], common: dict[str, Any]) -> Any:
@@ -139,6 +416,8 @@ def _column_value(column: str, *, row: dict[str, Any], request_params: dict[str,
         return json.loads(_json(row))
     if column in {"trade_date", "day", "calendar_date", "update_date", "effective_date"}:
         return _extract_trade_date(row, request_params)
+    if column in {"bar_time", "event_time", "tick_time"}:
+        return _datetime_or_none(_first(row, column, "datetime", "time"))
     if column == "code":
         return _extract_code(row, request_params)
     if column == "symbol":
@@ -159,6 +438,8 @@ def _column_value(column: str, *, row: dict[str, Any], request_params: dict[str,
         return _num_or_none(_first(row, "preclose", "pre_close", "昨收", "prev_close_price"))
     if column == "last_price":
         return _num_or_none(_first(row, "最新价", "last_price", "close"))
+    if column == "latest_price":
+        return _num_or_none(_first(row, "latest_price", "last_price", "close"))
     if column in {"volume", "vol"}:
         return _num_or_none(_first(row, "volume", "成交量", "vol"))
     if column == "amount":
@@ -167,6 +448,26 @@ def _column_value(column: str, *, row: dict[str, Any], request_params: dict[str,
         return _num_or_none(_first(row, "pctChg", "pct_chg", "涨跌幅", "change_pct"))
     if column in {"change_amount", "change"}:
         return _num_or_none(_first(row, "涨跌额", "change", "change_amount"))
+    if column == "main_net_inflow":
+        return _num_or_none(_first(row, "main_net_inflow", "net_mf_amount", "net_inflow"))
+    if column == "super_large_net_inflow":
+        return _num_or_none(_first(row, "super_large_net_inflow"))
+    if column == "large_net_inflow":
+        return _num_or_none(_first(row, "large_net_inflow"))
+    if column == "medium_net_inflow":
+        return _num_or_none(_first(row, "medium_net_inflow"))
+    if column == "small_net_inflow":
+        return _num_or_none(_first(row, "small_net_inflow"))
+    if column == "provider_definition":
+        return _first(row, "provider_definition") or request_params.get("provider_definition")
+    if column in {"total_market_cap", "float_market_cap"}:
+        return _num_or_none(_first(row, column))
+    if column in {"trade_count", "provider_sequence"}:
+        return _num_or_none(_first(row, column))
+    if column in {"side_code", "side_label"}:
+        return _first(row, column)
+    if column == "price":
+        return _num_or_none(_first(row, "price"))
     if column == "turnover_rate":
         return _num_or_none(_first(row, "turn", "换手率", "turnover_rate"))
     if column == "amplitude":
@@ -175,6 +476,8 @@ def _column_value(column: str, *, row: dict[str, Any], request_params: dict[str,
         return str(_first(row, "adjustflag") or request_params.get("adjustflag") or "3")
     if column == "adjust":
         return str(_first(row, "adjust") or request_params.get("adjust") or "")
+    if column == "adjustment_mode":
+        return str(_first(row, "adjustment_mode") or request_params.get("adjustment") or request_params.get("adjust") or "")
     if column == "trade_status":
         return _first(row, "tradestatus", "tradeStatus", "trade_status")
     if column == "is_st":
@@ -220,6 +523,34 @@ class PostgresRawSourceRepository:
                 (schema, table),
             )
             return [r[0] for r in cur.fetchall()]
+
+    def _instrument_id_for_symbol(self, conn: Any, symbol: str | None) -> int | None:  # pragma: no cover - requires runtime Postgres
+        code, exchange = _split_canonical_symbol(symbol)
+        if not code:
+            return None
+        with conn.cursor() as cur:
+            if exchange:
+                cur.execute(
+                    """
+                    SELECT instrument_id
+                    FROM core.instrument_master
+                    WHERE symbol = %s AND exchange = %s
+                    LIMIT 1
+                    """,
+                    (code, exchange),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT instrument_id
+                    FROM core.instrument_master
+                    WHERE symbol = %s
+                    LIMIT 1
+                    """,
+                    (code,),
+                )
+            found = cur.fetchone()
+        return int(found[0]) if found else None
 
     def insert_raw_result(self, result: RawFetchResult) -> tuple[list[dict[str, Any]], int, int]:  # pragma: no cover - requires runtime Postgres
         if not self.ready:
@@ -270,7 +601,7 @@ class PostgresRawSourceRepository:
                             "response_schema_hash": raw.response_schema_hash or result.response_schema_hash,
                             "response_row_hash": raw.response_row_hash,
                             "row": dict(raw.row),
-                            "symbol": _normalize_symbol(_extract_code(raw.row, request_params)),
+                            "symbol": _normalize_symbol(raw.row.get("symbol") or _extract_code(raw.row, request_params)),
                             "trade_date": str(_extract_trade_date(raw.row, request_params)) if _extract_trade_date(raw.row, request_params) else None,
                             "captured_at": raw.captured_at,
                             "available_at": raw.available_at or raw.captured_at,
@@ -313,44 +644,130 @@ class PostgresRawSourceRepository:
                 )
             conn.commit()
 
+    def read_raw_rows(
+        self,
+        *,
+        provider: Provider,
+        api_name: str,
+        raw_table_name: str,
+        request_hash: str | None = None,
+        symbol: str | None = None,
+        trade_date: str | date | None = None,
+    ) -> list[dict[str, Any]]:  # pragma: no cover - requires runtime Postgres
+        if not self.ready:
+            return []
+        schema, table = _schema_table(raw_table_name)
+        trade_date_value = _date_or_none(trade_date)
+        with self._connect() as conn:
+            cols = self._columns(conn, schema, table)
+            where = []
+            params: list[Any] = []
+            if "provider" in cols:
+                where.append("provider = %s")
+                params.append(provider.value)
+            if "api_name" in cols:
+                where.append("api_name = %s")
+                params.append(api_name)
+            if symbol and "symbol" in cols:
+                where.append("symbol = %s")
+                params.append(symbol)
+            if trade_date_value and "trade_date" in cols:
+                where.append("trade_date = %s")
+                params.append(trade_date_value)
+            elif trade_date_value and "day" in cols:
+                where.append("day = %s")
+                params.append(trade_date_value)
+            if request_hash and "request_hash" in cols and not (symbol or trade_date_value):
+                # The orchestration request_hash and provider/raw request_hash
+                # can differ. Symbol/date scoped source builds must recover by
+                # business identity after process restart, otherwise duplicate
+                # build triggers cannot find already-ingested durable raw rows.
+                where.append("request_hash = %s")
+                params.append(request_hash)
+            sql = f'SELECT * FROM "{schema}"."{table}"'
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY captured_at DESC LIMIT 20000"
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                names = [d.name for d in cur.description]
+        out: list[dict[str, Any]] = []
+        for record in rows:
+            data = dict(zip(names, record))
+            request_params = _json_value(data.get("request_params_json"), {})
+            raw_row = _json_value(data.get("raw_row_json"), {})
+            raw_symbol = _normalize_symbol(data.get("symbol") or _extract_code(raw_row, request_params))
+            raw_trade_date = _extract_trade_date(raw_row, request_params) or _date_or_none(data.get("trade_date") or data.get("day"))
+            if not _raw_row_matches_requested_identity(raw_symbol, raw_trade_date, symbol, trade_date_value):
+                continue
+            out.append(
+                {
+                    "raw_id": str(data.get("raw_id")),
+                    "provider": provider,
+                    "api_name": api_name,
+                    "raw_table_name": raw_table_name,
+                    "request_params": request_params,
+                    "request_hash": data.get("request_hash"),
+                    "response_schema_hash": data.get("response_schema_hash"),
+                    "response_row_hash": data.get("response_row_hash"),
+                    "row": raw_row,
+                    "symbol": raw_symbol,
+                    "trade_date": str(raw_trade_date) if raw_trade_date else None,
+                    "captured_at": data.get("captured_at"),
+                    "available_at": data.get("available_at") or data.get("captured_at"),
+                    "batch_id": data.get("batch_id"),
+                    "biz_key": data.get("biz_key") or (f"{raw_symbol}|{raw_trade_date}" if raw_symbol and raw_trade_date else None),
+                    "quality_status": QualityStatus.USABLE,
+                }
+            )
+        return out
+
     def upsert_source_row(self, row: SourceCanonicalRowOut, lineage: list[SourceLineageRecordOut]) -> None:  # pragma: no cover - requires runtime Postgres
         if not self.ready:
             raise RuntimeError("postgres raw/source repository is not ready")
         schema, table = _schema_table(row.source_table_name)
-        values = dict(row.values)
         with self._connect() as conn:
             columns = self._columns(conn, schema, table)
-            key_cols = [c for c in ["symbol", "trade_date"] if c in columns]
-            if row.source_table_name == "source.adjusted_daily_bar_v1" and "adjustment_mode" in columns:
-                values.setdefault("adjustment_mode", "qfq")
-                key_cols.append("adjustment_mode")
-            base = {
-                "symbol": row.symbol,
-                "trade_date": row.trade_date,
-                "source_quality_status": row.source_quality_status.value,
-                "primary_provider": row.primary_provider.value if row.primary_provider else None,
-                "build_batch_id": row.build_batch_id,
-                "captured_at": row.captured_at,
-                "available_at": row.available_at,
-            }
-            payload: dict[str, Any] = {**base, **values}
-            insert_cols = [c for c in columns if c in payload and c != "lineage_id"]
-            if "lineage_id" in columns and lineage:
-                payload["lineage_id"] = lineage[0].lineage_id
-                insert_cols.append("lineage_id")
-            placeholders = ",".join(["%s"] * len(insert_cols))
-            columns_sql = ",".join(f'"{c}"' for c in insert_cols)
-            update_cols = [c for c in insert_cols if c not in key_cols]
-            update_sql = ",".join(f'"{c}"=EXCLUDED."{c}"' for c in update_cols)
-            conflict_sql = f"({','.join(f'\"{c}\"' for c in key_cols)})" if key_cols else "ON CONSTRAINT does_not_exist"
+            requires_instrument = row.source_table_name in {"source.auction_snapshot_v1", "source.daily_bar_v1", "source.minute_bar_v1", "source.realtime_quote_v1"}
+            instrument_id = self._instrument_id_for_symbol(conn, row.symbol) if requires_instrument else None
+            payload, key_cols = _source_payload_and_key(row, columns, instrument_id=instrument_id)
             qualified = f'"{schema}"."{table}"'
             with conn.cursor() as cur:
+                existing_lineage_ids: dict[int, str] = {}
+                lineage_identity_ids: dict[tuple[Any, ...], str] = {}
+                for idx, lin in enumerate(lineage):
+                    identity = _source_lineage_identity(lin)
+                    if identity in lineage_identity_ids:
+                        existing_lineage_ids[idx] = lineage_identity_ids[identity]
+                        continue
+                    existing_lineage_id = _select_existing_lineage_id(cur, identity)
+                    if existing_lineage_id:
+                        existing_lineage_ids[idx] = existing_lineage_id
+                        lineage_identity_ids[identity] = existing_lineage_id
+                    else:
+                        lineage_identity_ids[identity] = lin.lineage_id
+
+                insert_cols = [c for c in columns if c in payload and c != "lineage_id"]
+                if "lineage_id" in columns and lineage:
+                    payload["lineage_id"] = existing_lineage_ids.get(0, lineage[0].lineage_id)
+                    insert_cols.append("lineage_id")
+                placeholders = ",".join(["%s"] * len(insert_cols))
+                columns_sql = ",".join(f'"{c}"' for c in insert_cols)
+                update_cols = [c for c in insert_cols if c not in key_cols]
+                update_sql = ",".join(f'"{c}"=EXCLUDED."{c}"' for c in update_cols)
+                quoted_key_cols = ",".join(f'"{c}"' for c in key_cols)
+                conflict_sql = f"({quoted_key_cols})" if key_cols else "ON CONSTRAINT does_not_exist"
                 if key_cols:
+                    if not update_sql:
+                        update_sql = f'"{key_cols[0]}"=EXCLUDED."{key_cols[0]}"'
                     cur.execute(
                         f"INSERT INTO {qualified} ({columns_sql}) VALUES ({placeholders}) ON CONFLICT {conflict_sql} DO UPDATE SET {update_sql}",
                         [payload[c] for c in insert_cols],
                     )
-                for lin in lineage:
+                for idx, lin in enumerate(lineage):
+                    if idx in existing_lineage_ids:
+                        continue
                     cur.execute(
                         """
                         INSERT INTO governance.source_lineage_v1 (
@@ -368,7 +785,7 @@ class PostgresRawSourceRepository:
                             lin.provider.value,
                             lin.api_name,
                             lin.raw_table_name,
-                            int(lin.raw_id) if lin.raw_id and str(lin.raw_id).isdigit() else None,
+                            _lineage_raw_id(lin),
                             None,
                             lin.request_hash,
                             lin.response_row_hash,
@@ -403,6 +820,30 @@ class PostgresRawSourceRepository:
                         ),
                     )
             conn.commit()
+
+    def prune_stock_universe_non_a_share_rows(self, trade_date: str | date | None) -> int:  # pragma: no cover - requires runtime Postgres
+        if not self.ready or trade_date in (None, ""):
+            return 0
+        trade_date_value = _date_or_none(trade_date)
+        if trade_date_value is None:
+            return 0
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM source.stock_universe_daily_v1
+                    WHERE trade_date = %s
+                      AND NOT (
+                        (symbol ~ '^[0-9]{6}\\.SH$' AND left(symbol, 2) IN ('60', '68'))
+                        OR (symbol ~ '^[0-9]{6}\\.SZ$' AND left(symbol, 2) IN ('00', '30'))
+                        OR (symbol ~ '^[0-9]{6}\\.BJ$' AND (left(symbol, 1) IN ('4', '8') OR left(symbol, 2) = '92'))
+                      )
+                    """,
+                    (trade_date_value,),
+                )
+                deleted = int(cur.rowcount or 0)
+            conn.commit()
+        return deleted
 
     def insert_build_result(self, result: SourceBuildExecutionResult) -> None:  # pragma: no cover - requires runtime Postgres
         if not self.ready:
@@ -541,8 +982,14 @@ class PostgresRawSourceRepository:
             if symbol and "symbol" in cols:
                 where.append("symbol = %s")
                 params.append(symbol)
+            elif symbol and "index_code" in cols:
+                where.append("index_code = %s")
+                params.append(symbol)
             if trade_date and "trade_date" in cols:
                 where.append("trade_date = %s")
+                params.append(trade_date)
+            elif trade_date and "trading_day" in cols:
+                where.append("trading_day = %s")
                 params.append(trade_date)
             sql = f'SELECT * FROM "{schema}"."{table}"'
             if where:
@@ -555,16 +1002,48 @@ class PostgresRawSourceRepository:
         out: list[SourceCanonicalRowOut] = []
         for record in rows:
             data = dict(zip(names, record))
-            values = {k: v for k, v in data.items() if k not in {"symbol", "trade_date", "source_quality_status", "primary_provider", "backup_provider", "lineage_id", "build_batch_id", "captured_at", "available_at"}}
+            source_pk, canonical_symbol, canonical_trade_date = _source_identity_from_record(source_table_name, data)
+            values = {
+                k: v
+                for k, v in data.items()
+                if k
+                not in {
+                    "source_daily_bar_id",
+                    "auction_snapshot_id",
+                    "source_minute_bar_id",
+                    "quote_id",
+                    "trade_tick_id",
+                    "event_id",
+                    "instrument_id",
+                    "symbol",
+                    "index_code",
+                    "trade_date",
+                    "trading_day",
+                    "adjustment",
+                    "provider",
+                    "quality_status",
+                    "source_quality_status",
+                    "primary_provider",
+                    "provider",
+                    "backup_provider",
+                    "lineage_id",
+                    "build_batch_id",
+                    "captured_at",
+                    "available_at",
+                    "event_time",
+                    "provider_payload_id",
+                    "payload_hash",
+                }
+            }
             out.append(
                 SourceCanonicalRowOut(
                     source_table_name=source_table_name,
-                    source_pk=f"{data.get('symbol')}|{data.get('trade_date')}",
-                    symbol=data.get("symbol"),
-                    trade_date=data.get("trade_date"),
+                    source_pk=source_pk,
+                    symbol=canonical_symbol,
+                    trade_date=canonical_trade_date,
                     values=values,
-                    source_quality_status=QualityStatus(data.get("source_quality_status") or "usable"),
-                    primary_provider=Provider(data["primary_provider"]) if data.get("primary_provider") else None,
+                    source_quality_status=QualityStatus(data.get("source_quality_status") or data.get("quality_status") or "usable"),
+                    primary_provider=Provider(data.get("primary_provider") or data.get("provider")) if data.get("primary_provider") or data.get("provider") else None,
                     build_batch_id=data.get("build_batch_id"),
                     captured_at=data.get("captured_at"),
                     available_at=data.get("available_at"),

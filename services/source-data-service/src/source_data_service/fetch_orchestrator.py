@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from itertools import count
 from uuid import uuid4
 from typing import Any
@@ -9,6 +9,7 @@ from typing import Any
 from source_data_service.adapters.base import stable_json_hash
 from source_data_service.gap_detector import build_repair_plan
 from source_data_service.fetch_persistence import (
+    durable_callback_events_if_enabled,
     durable_build_triggers_if_enabled,
     durable_fetch_batch_if_enabled,
     durable_fetch_job_if_enabled,
@@ -21,6 +22,7 @@ from source_data_service.fetch_persistence import (
     persist_callback_if_enabled,
     persist_job_if_enabled,
     queue_persistence_summary,
+    requeue_expired_leases_if_enabled,
 )
 from source_data_service.models import (
     CallbackEventType,
@@ -50,6 +52,7 @@ from source_data_service.models import (
     FetchSubmitRequest,
     FetchSubmitResult,
     FetchTriggerType,
+    FetchUniverseScope,
     Provider,
     ProviderConcurrencyRuntimeStatus,
     ProviderRateLimitPolicy,
@@ -58,6 +61,7 @@ from source_data_service.models import (
 )
 from source_data_service.provider_registry import get_api_spec, list_source_requirements
 from source_data_service.provider_runtime import list_provider_status
+from source_data_service.symbol_rules import is_a_share_symbol, normalize_symbol
 
 
 # Provider/API-level policies are deliberately conservative for free public data.
@@ -70,13 +74,23 @@ _DEFAULT_PROVIDER_LIMITS: dict[Provider, tuple[int, int, str]] = {
     Provider.TUSHARE: (2, 60, "Tushare depends on token/integral frequency; respect per-account limits."),
     Provider.EASTMONEY: (4, 90, "EastMoney public endpoints should use bounded parallelism."),
     Provider.TENCENT: (3, 90, "Tencent quote endpoints are public; use bounded parallelism."),
+    Provider.SOHU: (2, 60, "Sohu public historical K-line endpoint should use low bounded concurrency."),
+    Provider.BAIDU: (2, 30, "Baidu Finance public news feed should use low concurrency for stable evidence capture."),
     Provider.SINA: (2, 60, "Sina quote endpoints are public; use bounded parallelism."),
+    Provider.THS: (1, 30, "THS public endpoints must be serialized; login cookies are allowed only for paid_limit_up_probability through controlled credentials."),
+    Provider.COINGECKO: (1, 20, "CoinGecko public API is context-only and quota-sensitive; keep probes serialized."),
+    Provider.YAHOO: (1, 30, "Yahoo chart public endpoint is context-only; keep bounded request rate."),
+    Provider.JIN10: (1, 20, "Jin10 public flash endpoint uses static public headers; serialize context probes."),
     Provider.CNINFO: (2, 30, "Announcement APIs favor stability over speed."),
     Provider.INTERNAL: (8, 600, "Internal build tasks can run with higher local concurrency."),
 }
 _API_POLICY_OVERRIDES: dict[tuple[Provider, str], tuple[int, int, str]] = {
     (Provider.AKSHARE, "stock_fund_flow_individual_realtime"): (1, 30, "Moneyflow endpoint is unstable under concurrency; serialize it."),
     (Provider.AKSHARE, "stock_zh_a_disclosure_report_cninfo"): (1, 20, "Disclosure endpoint should be serialized to avoid anti-crawling failures."),
+    (Provider.BAIDU, "finance_news_feed"): (1, 20, "Baidu Finance news feed is a public evidence source; serialize probes and repairs."),
+    (Provider.THS, "limit_up_pool"): (1, 20, "THS limit-up pool is the preferred limit-event fact source; serialize to avoid public endpoint throttling."),
+    (Provider.THS, "paid_limit_up_probability"): (1, 12, "THS paid probability is credentialed and batch-critical; serialize and keep cookie values outside request params/logs."),
+    (Provider.JIN10, "public_flash"): (1, 15, "Jin10 public flash should remain low-frequency research context."),
     (Provider.BAOSTOCK, "query_history_k_data_plus_daily_raw"): (4, 120, "Symbol-level history fetch can use bounded parallelism."),
     (Provider.BAOSTOCK, "query_history_k_data_plus_daily_qfq"): (4, 120, "Adjusted history fetch can use bounded parallelism."),
 }
@@ -107,6 +121,16 @@ _REQUEST_HASH_TO_JOB: dict[str, str] = {}
 _CALLBACKS: list[FetchCallbackEventOut] = []
 _BUILD_TRIGGERS: list[SourceBuildTriggerOut] = []
 _IDEMPOTENCY_TO_BATCH: dict[str, str] = {}
+_SOURCE_BUILD_ALIASES_PARAM = "__source_build_aliases"
+_ACTIVE_DUPLICATE_ALIAS_STATUSES = {
+    FetchJobStatus.QUEUED,
+    FetchJobStatus.LEASED,
+}
+_TERMINAL_DUPLICATE_REPAIR_STATUSES = {
+    FetchJobStatus.FAILED,
+    FetchJobStatus.CANCELLED,
+    FetchJobStatus.DEAD_LETTER,
+}
 
 
 def _utcnow() -> datetime:
@@ -131,7 +155,10 @@ def _hydrate_active_state_from_persistence() -> None:
                 operator_notes=batch.operator_notes,
             )
     for job in jobs:
-        if job.job_item_id not in _JOBS:
+        if job.fetch_batch_id not in _BATCHES:
+            _ensure_batch_record(job.fetch_batch_id)
+        existing_job = _JOBS.get(job.job_item_id)
+        if existing_job is None or job.updated_at >= existing_job.updated_at:
             _JOBS[job.job_item_id] = job
             _REQUEST_HASH_TO_JOB[job.request_hash] = job.job_item_id
 
@@ -199,18 +226,142 @@ def _queue_for(priority: FetchPriority, trigger_type: FetchTriggerType) -> Fetch
     return FetchQueueName.NORMAL_DAILY_INGEST_QUEUE
 
 
-def _strategy_for(request: FetchPlanRequest, job_count: int) -> FetchStrategy:
-    if request.prefer_batch and not request.symbols:
+def _strategy_for(request: FetchPlanRequest, job_count: int, symbols: list[str | None]) -> FetchStrategy:
+    symbol_count = len([symbol for symbol in symbols if symbol])
+    if request.prefer_batch and symbol_count == 0:
         return FetchStrategy.FULL_MARKET_BATCH
     if request.prefer_batch and request.trade_date and job_count == 1:
         return FetchStrategy.API_BATCH_BY_DATE
-    if len(request.symbols) > 1 or job_count > 1:
+    if symbol_count > 1 or job_count > 1:
         return FetchStrategy.SYMBOL_PARALLEL
     return FetchStrategy.SINGLE_REQUEST
 
 
-def _source_date(request: FetchPlanRequest):
-    return request.trade_date or request.start_date
+def _source_date(request: FetchPlanRequest) -> date | None:
+    return request.trade_date or request.start_date or request.end_date
+
+
+def _source_date_text(request: FetchPlanRequest) -> str | None:
+    value = _source_date(request)
+    return value.isoformat() if value else None
+
+
+def _truthy(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "normal", "tradable", "trading", "listed", "l", "正常", "交易"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "suspended", "halted", "delisted", "d", "停牌", "暂停", "退市"}:
+        return False
+    return None
+
+
+def _symbol_from_source_row(row: Any) -> str | None:
+    symbol = getattr(row, "symbol", None)
+    if symbol:
+        return normalize_symbol(symbol)
+    values = getattr(row, "values", None) or {}
+    for key in ("symbol", "code", "ts_code", "stock_code"):
+        value = values.get(key)
+        if value:
+            normalized = normalize_symbol(value)
+            if normalized:
+                return normalized
+    return None
+
+
+def _source_universe_row_usable(row: Any) -> bool:
+    values = getattr(row, "values", None) or {}
+    is_tradable = _truthy(values.get("is_tradable"))
+    is_suspended = _truthy(values.get("is_suspended"))
+    is_delisting_risk = _truthy(values.get("is_delisting_risk"))
+    trade_status_flag = _truthy(values.get("trade_status"))
+    trade_status = str(values.get("trade_status") or "").strip().lower()
+    if is_tradable is False or is_suspended is True or is_delisting_risk is True or trade_status_flag is False:
+        return False
+    if trade_status in {"suspended", "halted", "delisted", "停牌", "暂停", "退市"}:
+        return False
+    return True
+
+
+def _stock_master_row_usable(row: Any, as_of_date: date | None) -> bool:
+    values = getattr(row, "values", None) or {}
+    list_status = str(values.get("list_status") or "").strip().lower()
+    if list_status in {"d", "delisted", "退市", "终止上市"}:
+        return False
+    delist_date = values.get("delist_date")
+    if as_of_date and delist_date:
+        try:
+            if date.fromisoformat(str(delist_date)[:10]) <= as_of_date:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def _list_source_rows(source_table_name: str, trade_date: str | None = None) -> list[Any]:
+    from source_data_service.source_repository import list_source_rows
+
+    return list_source_rows(source_table_name=source_table_name, trade_date=trade_date)
+
+
+def _load_full_a_share_symbols(request: FetchPlanRequest) -> list[str]:
+    source_date = _source_date(request)
+    source_date_text = _source_date_text(request)
+    if source_date_text is None:
+        raise ValueError("full_a_share fetch requires trade_date or date range")
+
+    universe_rows = _list_source_rows(
+        source_table_name="source.stock_universe_daily_v1",
+        trade_date=source_date_text,
+    )
+    symbols = sorted(
+        {
+            symbol
+            for row in universe_rows
+            if _source_universe_row_usable(row)
+            for symbol in [_symbol_from_source_row(row)]
+            if symbol and is_a_share_symbol(symbol)
+        }
+    )
+    if symbols:
+        return symbols
+
+    master_rows = _list_source_rows(source_table_name="source.stock_master_v1")
+    symbols = sorted(
+        {
+            symbol
+            for row in master_rows
+            if _stock_master_row_usable(row, source_date)
+            for symbol in [_symbol_from_source_row(row)]
+            if symbol and is_a_share_symbol(symbol)
+        }
+    )
+    if symbols:
+        return symbols
+
+    raise ValueError("full_a_share universe has no source symbols; fetch source.stock_universe_daily_v1 first")
+
+
+def _symbols_for_request(request: FetchPlanRequest) -> list[str | None]:
+    if request.symbols:
+        return list(request.symbols)
+    if request.universe_scope == FetchUniverseScope.STAGE_CANDIDATES:
+        raise ValueError("stage_candidates fetch requires explicit symbols from a model stage")
+    if request.universe_scope == FetchUniverseScope.FULL_A_SHARE:
+        if request.source_table_name in {
+            "source.limit_event_v1",
+            "source.stock_master_v1",
+            "source.stock_universe_daily_v1",
+        }:
+            return [None]
+        return _load_full_a_share_symbols(request)
+    return [None]
 
 
 def _gap_request_for(request: FetchPlanRequest, field_name: str, symbol: str | None) -> SourceGapRequest:
@@ -237,10 +388,12 @@ def build_fetch_plan(request: FetchPlanRequest) -> FetchPlanOut:
     if not requirements:
         raise KeyError(f"no source requirements for {request.source_table_name} fields={request.canonical_fields}")
 
-    symbols = request.symbols or [None]
+    symbols = _symbols_for_request(request)
     queue_name = _queue_for(request.priority, request.trigger_type)
     grouped: dict[str, FetchPlannedJob] = {}
     field_by_hash: dict[str, set[str]] = {}
+    backup_plan_by_hash: dict[str, dict[str, FetchBackupPlan]] = {}
+    backup_fields_by_hash: dict[str, dict[str, set[str]]] = {}
 
     for requirement in requirements:
         for symbol in symbols:
@@ -265,23 +418,45 @@ def build_fetch_plan(request: FetchPlanRequest) -> FetchPlanOut:
                     priority=request.priority,
                     queue_name=queue_name,
                     estimated_timeout_ms=policy.timeout_ms,
-                    backup_plans=[
-                        FetchBackupPlan(
-                            provider=backup.provider,
-                            api_name=backup.api_name,
-                            raw_table_name=backup.raw_table_name,
-                            request_params=backup.params,
-                            reason=backup.reason,
-                        )
-                        for backup in repair.backup_repairs
-                    ],
+                    backup_plans=[],
                 )
                 field_by_hash[request_hash] = set()
+                backup_plan_by_hash[request_hash] = {}
+                backup_fields_by_hash[request_hash] = {}
             field_by_hash[request_hash].add(requirement.canonical_field_name)
+            for backup in repair.backup_repairs:
+                backup_plan = FetchBackupPlan(
+                    provider=backup.provider,
+                    api_name=backup.api_name,
+                    raw_table_name=backup.raw_table_name,
+                    request_params=backup.params,
+                    reason=backup.reason,
+                )
+                backup_request_hash = _job_hash(
+                    backup_plan.provider,
+                    backup_plan.api_name,
+                    backup_plan.request_params,
+                    backup_plan.raw_table_name,
+                )
+                backup_plan_by_hash[request_hash][backup_request_hash] = backup_plan
+                backup_fields_by_hash[request_hash].setdefault(backup_request_hash, set()).add(
+                    requirement.canonical_field_name
+                )
 
     jobs: list[FetchPlannedJob] = []
     for request_hash, job in grouped.items():
         job.canonical_fields = sorted(field_by_hash[request_hash])
+        job.backup_plans = [
+            backup_plan_by_hash[request_hash][backup_hash]
+            for backup_hash in sorted(
+                backup_plan_by_hash[request_hash],
+                key=lambda item: (
+                    -len(backup_fields_by_hash[request_hash].get(item, set())),
+                    backup_plan_by_hash[request_hash][item].provider.value,
+                    backup_plan_by_hash[request_hash][item].api_name,
+                ),
+            )
+        ]
         jobs.append(job)
 
     policies_by_key: dict[tuple[Provider, str], ProviderRateLimitPolicy] = {}
@@ -292,7 +467,7 @@ def build_fetch_plan(request: FetchPlanRequest) -> FetchPlanOut:
     max_parallel = max((policy.max_concurrency for policy in policies_by_key.values()), default=1)
     estimated_runtime_seconds = round((len(jobs) / max_parallel) * 1.5, 2)
     fetch_plan_id = "plan_" + stable_json_hash(request.model_dump(mode="json"))[:16]
-    strategy = _strategy_for(request, len(jobs))
+    strategy = _strategy_for(request, len(jobs), symbols)
     operator_notes = [
         "Producer-consumer fetch plan only; model services must not call provider APIs directly.",
         "Primary raw-interface jobs are queued first; backup jobs are created only when primary jobs fail.",
@@ -302,6 +477,10 @@ def build_fetch_plan(request: FetchPlanRequest) -> FetchPlanOut:
         operator_notes.append("Symbol-level requests must obey provider/API concurrency limits; never launch unbounded threads.")
     if request.trigger_type == FetchTriggerType.MODEL_RELEASE_PREFLIGHT:
         operator_notes.append("Release preflight P0 fetches must not be delayed behind backfill or research queues.")
+    if request.universe_scope == FetchUniverseScope.FULL_A_SHARE:
+        operator_notes.append("full_a_share scope is resolved from source.stock_universe_daily_v1/source.stock_master_v1; no sample symbol fallback is allowed.")
+    if request.universe_scope == FetchUniverseScope.STAGE_CANDIDATES:
+        operator_notes.append("stage_candidates scope must be supplied by upstream model-stage candidates; source-data-service does not invent candidates.")
 
     return FetchPlanOut(
         fetch_plan_id=fetch_plan_id,
@@ -312,7 +491,7 @@ def build_fetch_plan(request: FetchPlanRequest) -> FetchPlanOut:
         queue_name=queue_name,
         job_count=len(jobs),
         deduplicated_job_count=len(jobs),
-        symbols_count=len(request.symbols),
+        symbols_count=len([symbol for symbol in symbols if symbol]),
         estimated_runtime_seconds=estimated_runtime_seconds,
         jobs=jobs,
         rate_limit_policies=sorted(policies_by_key.values(), key=lambda item: (item.provider.value, item.api_name)),
@@ -341,6 +520,57 @@ def _add_callback(
     )
     _CALLBACKS.append(event)
     persist_callback_if_enabled(event)
+
+
+def _ensure_source_build_trigger(
+    job: FetchJobStatusOut,
+    *,
+    fetch_batch_id: str,
+    source_table_name: str,
+    planned: FetchPlannedJob | None = None,
+) -> SourceBuildTriggerOut | None:
+    trigger_symbol = planned.symbol if planned is not None else job.symbol
+    trigger_trade_date = planned.trade_date if planned is not None else job.trade_date
+    existing_trigger = next(
+        (
+            trigger
+            for trigger in list_source_build_triggers()
+            if trigger.fetch_batch_id == fetch_batch_id
+            and trigger.job_item_id == job.job_item_id
+            and trigger.source_table_name == source_table_name
+            and trigger.symbol == trigger_symbol
+            and trigger.trade_date == trigger_trade_date
+            and trigger.status in {"queued", "running", "succeeded"}
+        ),
+        None,
+    )
+    if existing_trigger is not None:
+        return None
+    now = _utcnow()
+    trigger = SourceBuildTriggerOut(
+        trigger_id=_new_id("source_build_trigger"),
+        fetch_batch_id=fetch_batch_id,
+        job_item_id=job.job_item_id,
+        source_table_name=source_table_name,
+        symbol=trigger_symbol,
+        trade_date=trigger_trade_date,
+        build_scope="symbol_date" if trigger_symbol and trigger_trade_date else "batch",
+        status="queued",
+        quality_check_required=True,
+        lineage_required=True,
+        created_at=now,
+    )
+    _BUILD_TRIGGERS.append(trigger)
+    persist_build_trigger_if_enabled(trigger)
+    callback_url = _BATCHES[fetch_batch_id].callback_url if fetch_batch_id in _BATCHES else None
+    _add_callback(
+        fetch_batch_id=fetch_batch_id,
+        job_item_id=job.job_item_id,
+        event_type=CallbackEventType.SOURCE_BUILD_TRIGGER_CREATED,
+        callback_url=callback_url,
+        payload={"trigger_id": trigger.trigger_id, "source_table_name": trigger.source_table_name, "build_scope": trigger.build_scope},
+    )
+    return trigger
 
 
 def submit_fetch_batch(request: FetchSubmitRequest) -> FetchSubmitResult:
@@ -377,6 +607,7 @@ def submit_fetch_batch(request: FetchSubmitRequest) -> FetchSubmitResult:
     _BATCHES[fetch_batch_id] = batch
     persist_batch_if_enabled(_batch_status_out(fetch_batch_id), request_source=request.request_source)
     skipped = 0
+    submitted = 0
     for planned in plan.jobs:
         existing_job_id = _REQUEST_HASH_TO_JOB.get(planned.request_hash)
         if not existing_job_id:
@@ -388,6 +619,76 @@ def submit_fetch_batch(request: FetchSubmitRequest) -> FetchSubmitResult:
             )
         if existing_job_id:
             _REQUEST_HASH_TO_JOB[planned.request_hash] = existing_job_id
+            try:
+                existing_job = _get_fetch_job_for_update(existing_job_id)
+            except Exception:
+                existing_job = None
+            if existing_job and existing_job.status in {FetchJobStatus.SUCCEEDED, FetchJobStatus.SKIPPED_DUPLICATE}:
+                duplicate_context = _planned_duplicate_job_context(existing_job, planned)
+                if _requires_backup_after_unusable_success(duplicate_context):
+                    backup_job = _queue_backup_job(
+                        duplicate_context,
+                        fetch_batch_id=fetch_batch_id,
+                        now=now,
+                        reason="duplicate_success_without_raw_hash",
+                    )
+                    if backup_job is not None:
+                        submitted += 1
+                        continue
+                else:
+                    _ensure_source_build_trigger(
+                        existing_job,
+                        fetch_batch_id=fetch_batch_id,
+                        source_table_name=planned.source_table_name,
+                        planned=planned,
+                    )
+            elif existing_job and existing_job.status in _ACTIVE_DUPLICATE_ALIAS_STATUSES:
+                _register_source_build_alias(
+                    existing_job,
+                    fetch_batch_id=fetch_batch_id,
+                    source_table_name=planned.source_table_name,
+                )
+            elif existing_job and existing_job.status in _TERMINAL_DUPLICATE_REPAIR_STATUSES:
+                terminal_status = existing_job.status
+                duplicate_context = _planned_duplicate_job_context(existing_job, planned)
+                backup_job = _queue_backup_job(
+                    duplicate_context,
+                    fetch_batch_id=fetch_batch_id,
+                    now=now,
+                    reason=f"duplicate_{terminal_status.value}_existing_job",
+                )
+                if backup_job is not None:
+                    submitted += 1
+                    continue
+                if not _backup_plans_for(duplicate_context):
+                    if existing_job.backup_of_job_item_id and existing_job.source_table_name == planned.source_table_name:
+                        skipped += 1
+                        continue
+                    requeued = _requeue_existing_backup_job(
+                        existing_job,
+                        now=now,
+                        reason=f"duplicate_{terminal_status.value}_existing_job",
+                    )
+                    _register_source_build_alias(
+                        requeued,
+                        fetch_batch_id=fetch_batch_id,
+                        source_table_name=planned.source_table_name,
+                    )
+                    _add_callback(
+                        fetch_batch_id=fetch_batch_id,
+                        job_item_id=requeued.job_item_id,
+                        event_type=CallbackEventType.JOB_REQUEUED,
+                        callback_url=_callback_url_for_batch(fetch_batch_id),
+                        payload={
+                            "job_item_id": requeued.job_item_id,
+                            "reason": f"duplicate_{terminal_status.value}_existing_job",
+                            "reused_existing_job": True,
+                            "existing_fetch_batch_id": requeued.fetch_batch_id,
+                            "source_table_name": planned.source_table_name,
+                        },
+                    )
+                    submitted += 1
+                    continue
             skipped += 1
             continue
         job_item_id = _new_id("fetch_job")
@@ -414,11 +715,12 @@ def submit_fetch_batch(request: FetchSubmitRequest) -> FetchSubmitResult:
         _JOBS[job_item_id].request_params = dict(_JOBS[job_item_id].request_params)
         _JOBS[job_item_id].request_params["__backup_plans"] = [item.model_dump(mode="json") for item in planned.backup_plans]
         persist_job_if_enabled(_JOBS[job_item_id])
+        submitted += 1
     _add_callback(
         fetch_batch_id=fetch_batch_id,
         event_type=CallbackEventType.BATCH_SUBMITTED,
         callback_url=request.callback_url,
-        payload={"fetch_batch_id": fetch_batch_id, "submitted_job_count": len(plan.jobs) - skipped, "skipped_duplicate_count": skipped},
+        payload={"fetch_batch_id": fetch_batch_id, "submitted_job_count": submitted, "skipped_duplicate_count": skipped},
     )
     if request.idempotency_key:
         _IDEMPOTENCY_TO_BATCH[request.idempotency_key] = fetch_batch_id
@@ -430,7 +732,7 @@ def submit_fetch_batch(request: FetchSubmitRequest) -> FetchSubmitResult:
         fetch_plan_id=plan.fetch_plan_id,
         status=final_batch.status,
         queue_name=plan.queue_name,
-        submitted_job_count=len(plan.jobs) - skipped,
+        submitted_job_count=submitted,
         skipped_duplicate_count=skipped,
         callback_registered=bool(request.callback_url),
         producer_ack="accepted_and_persisted_to_queue_contract",
@@ -521,14 +823,266 @@ def get_fetch_job(job_item_id: str) -> FetchJobStatusOut:
 
 
 def _get_fetch_job_for_update(job_item_id: str) -> FetchJobStatusOut:
-    if job_item_id in _JOBS:
-        return _JOBS[job_item_id]
+    existing = _JOBS.get(job_item_id)
     durable = durable_fetch_job_if_enabled(job_item_id)
     if durable is not None:
-        _JOBS[job_item_id] = durable
-        _REQUEST_HASH_TO_JOB[durable.request_hash] = durable.job_item_id
+        if existing is None or durable.updated_at > existing.updated_at:
+            _JOBS[job_item_id] = durable
+            _REQUEST_HASH_TO_JOB[durable.request_hash] = durable.job_item_id
+            return _JOBS[job_item_id]
+    if job_item_id in _JOBS:
         return _JOBS[job_item_id]
     raise KeyError(f"unknown job_item_id: {job_item_id}")
+
+
+def _callback_url_for_batch(fetch_batch_id: str) -> str | None:
+    batch = _BATCHES.get(fetch_batch_id)
+    return batch.callback_url if batch else None
+
+
+def _ensure_batch_record(fetch_batch_id: str) -> BatchRecord | None:
+    if fetch_batch_id in _BATCHES:
+        return _BATCHES[fetch_batch_id]
+    durable = durable_fetch_batch_if_enabled(fetch_batch_id)
+    if durable is None:
+        return None
+    _BATCHES[fetch_batch_id] = BatchRecord(
+        fetch_batch_id=durable.fetch_batch_id,
+        fetch_plan_id=durable.fetch_plan_id,
+        source_table_name=durable.source_table_name,
+        trigger_type=durable.trigger_type,
+        priority=durable.priority,
+        queue_name=durable.queue_name,
+        callback_url=durable.callback_url,
+        status=durable.status,
+        created_at=durable.created_at,
+        updated_at=durable.updated_at,
+        operator_notes=durable.operator_notes,
+    )
+    return _BATCHES[fetch_batch_id]
+
+
+def _backup_plans_for(job: FetchJobStatusOut) -> list[dict]:
+    if not isinstance(job.request_params, dict):
+        return []
+    plans = job.request_params.get("__backup_plans", [])
+    return plans if isinstance(plans, list) else []
+
+
+def _requires_backup_after_unusable_success(job: FetchJobStatusOut) -> bool:
+    if job.status not in {FetchJobStatus.SUCCEEDED, FetchJobStatus.SKIPPED_DUPLICATE}:
+        return False
+    if not _backup_plans_for(job):
+        return False
+    return _job_missing_raw_audit_hashes(job)
+
+
+def _job_missing_raw_audit_hashes(job: FetchJobStatusOut) -> bool:
+    return not job.raw_request_hash or not job.raw_response_schema_hash
+
+
+def _planned_duplicate_job_context(existing_job: FetchJobStatusOut, planned: FetchPlannedJob) -> FetchJobStatusOut:
+    request_params = dict(existing_job.request_params) if isinstance(existing_job.request_params, dict) else {}
+    request_params["__backup_plans"] = [item.model_dump(mode="json") for item in planned.backup_plans]
+    return existing_job.model_copy(
+        update={
+            "request_params": request_params,
+            "source_table_name": planned.source_table_name,
+            "canonical_fields": planned.canonical_fields,
+            "symbol": planned.symbol,
+            "trade_date": planned.trade_date,
+            "priority": planned.priority,
+            "queue_name": planned.queue_name,
+        }
+    )
+
+
+def _register_source_build_alias(
+    job: FetchJobStatusOut,
+    *,
+    fetch_batch_id: str,
+    source_table_name: str,
+) -> None:
+    if not fetch_batch_id or not source_table_name:
+        return
+    request_params = dict(job.request_params) if isinstance(job.request_params, dict) else {}
+    aliases = request_params.get(_SOURCE_BUILD_ALIASES_PARAM, [])
+    if not isinstance(aliases, list):
+        aliases = []
+    alias = {"fetch_batch_id": fetch_batch_id, "source_table_name": source_table_name}
+    if any(item.get("fetch_batch_id") == fetch_batch_id and item.get("source_table_name") == source_table_name for item in aliases if isinstance(item, dict)):
+        return
+    request_params[_SOURCE_BUILD_ALIASES_PARAM] = [*aliases, alias]
+    job.request_params = request_params
+    persist_job_if_enabled(job)
+
+
+def _ensure_source_build_alias_triggers(job: FetchJobStatusOut) -> None:
+    if not isinstance(job.request_params, dict):
+        return
+    aliases = job.request_params.get(_SOURCE_BUILD_ALIASES_PARAM, [])
+    if not isinstance(aliases, list):
+        return
+    for alias in aliases:
+        if not isinstance(alias, dict):
+            continue
+        fetch_batch_id = alias.get("fetch_batch_id")
+        source_table_name = alias.get("source_table_name")
+        if not isinstance(fetch_batch_id, str) or not isinstance(source_table_name, str):
+            continue
+        _ensure_batch_record(fetch_batch_id)
+        _ensure_source_build_trigger(job, fetch_batch_id=fetch_batch_id, source_table_name=source_table_name)
+
+
+def _requeue_existing_backup_job(
+    backup_job: FetchJobStatusOut,
+    *,
+    now: datetime,
+    reason: str,
+) -> FetchJobStatusOut:
+    previous_status = backup_job.status
+    _ensure_batch_record(backup_job.fetch_batch_id)
+    backup_job.status = FetchJobStatus.QUEUED
+    backup_job.worker_id = None
+    backup_job.lease_expires_at = None
+    backup_job.next_retry_at = now
+    backup_job.updated_at = now
+    persist_job_if_enabled(backup_job)
+    _add_callback(
+        fetch_batch_id=backup_job.fetch_batch_id,
+        job_item_id=backup_job.job_item_id,
+        event_type=CallbackEventType.JOB_REQUEUED,
+        callback_url=_callback_url_for_batch(backup_job.fetch_batch_id),
+        payload={
+            "job_item_id": backup_job.job_item_id,
+            "reason": reason,
+            "requeued_from_status": previous_status.value,
+        },
+    )
+    if backup_job.fetch_batch_id in _BATCHES:
+        _refresh_batch_status(backup_job.fetch_batch_id)
+    return backup_job
+
+
+def _queue_backup_job(
+    job: FetchJobStatusOut,
+    *,
+    fetch_batch_id: str,
+    now: datetime,
+    reason: str,
+) -> FetchJobStatusOut | None:
+    backup_plans_raw = _backup_plans_for(job)
+    if not backup_plans_raw:
+        return None
+    backup = backup_plans_raw[0]
+    remaining_backup_plans = backup_plans_raw[1:]
+    backup_request_hash = _job_hash(
+        Provider(backup["provider"]),
+        backup["api_name"],
+        backup["request_params"],
+        backup["raw_table_name"],
+    )
+    backup_job_id = _REQUEST_HASH_TO_JOB.get(backup_request_hash) or find_existing_job_item_id_if_enabled(
+        Provider(backup["provider"]),
+        backup["api_name"],
+        backup["raw_table_name"],
+        backup_request_hash,
+    )
+    if backup_job_id:
+        _REQUEST_HASH_TO_JOB[backup_request_hash] = backup_job_id
+        try:
+            backup_job = _get_fetch_job_for_update(backup_job_id)
+        except Exception:
+            return None
+        if remaining_backup_plans:
+            backup_job.request_params = dict(backup_job.request_params)
+            backup_job.request_params["__backup_plans"] = remaining_backup_plans
+            persist_job_if_enabled(backup_job)
+        if backup_job.status in {FetchJobStatus.QUEUED, FetchJobStatus.LEASED}:
+            _register_source_build_alias(
+                backup_job,
+                fetch_batch_id=fetch_batch_id,
+                source_table_name=job.source_table_name,
+            )
+            return None
+        if backup_job.status in {FetchJobStatus.SUCCEEDED, FetchJobStatus.SKIPPED_DUPLICATE} and not _job_missing_raw_audit_hashes(backup_job):
+            _ensure_source_build_trigger(
+                backup_job,
+                fetch_batch_id=fetch_batch_id,
+                source_table_name=job.source_table_name,
+            )
+            return None
+        if backup_job.status in {
+            FetchJobStatus.SUCCEEDED,
+            FetchJobStatus.FAILED,
+            FetchJobStatus.SKIPPED_DUPLICATE,
+            FetchJobStatus.CANCELLED,
+            FetchJobStatus.DEAD_LETTER,
+        }:
+            if (
+                backup_job.status in {FetchJobStatus.FAILED, FetchJobStatus.CANCELLED, FetchJobStatus.DEAD_LETTER}
+                and backup_job.backup_of_job_item_id
+                and backup_job.source_table_name == job.source_table_name
+            ):
+                return None
+            requeued = _requeue_existing_backup_job(
+                backup_job,
+                now=now,
+                reason=f"{reason}:existing_backup_requeued",
+            )
+            _register_source_build_alias(
+                requeued,
+                fetch_batch_id=fetch_batch_id,
+                source_table_name=job.source_table_name,
+            )
+            _add_callback(
+                fetch_batch_id=fetch_batch_id,
+                job_item_id=backup_job.job_item_id,
+                event_type=CallbackEventType.BACKUP_JOB_QUEUED,
+                callback_url=_callback_url_for_batch(fetch_batch_id),
+                payload={
+                    "backup_job_item_id": backup_job.job_item_id,
+                    "failed_job_item_id": job.job_item_id,
+                    "reason": reason,
+                    "reused_existing_job": True,
+                    "existing_fetch_batch_id": backup_job.fetch_batch_id,
+                },
+            )
+            return requeued
+
+    backup_job_id = _new_id("fetch_job")
+    _REQUEST_HASH_TO_JOB[backup_request_hash] = backup_job_id
+    backup_request_params = dict(backup["request_params"])
+    if remaining_backup_plans:
+        backup_request_params["__backup_plans"] = remaining_backup_plans
+    _JOBS[backup_job_id] = FetchJobStatusOut(
+        job_item_id=backup_job_id,
+        fetch_batch_id=fetch_batch_id,
+        provider=Provider(backup["provider"]),
+        api_name=backup["api_name"],
+        raw_table_name=backup["raw_table_name"],
+        request_params=backup_request_params,
+        request_hash=backup_request_hash,
+        source_table_name=job.source_table_name,
+        canonical_fields=job.canonical_fields,
+        symbol=job.symbol,
+        trade_date=job.trade_date,
+        priority=job.priority,
+        queue_name=job.queue_name,
+        status=FetchJobStatus.QUEUED,
+        backup_of_job_item_id=job.job_item_id,
+        created_at=now,
+        updated_at=now,
+    )
+    persist_job_if_enabled(_JOBS[backup_job_id])
+    _add_callback(
+        fetch_batch_id=fetch_batch_id,
+        job_item_id=backup_job_id,
+        event_type=CallbackEventType.BACKUP_JOB_QUEUED,
+        callback_url=_callback_url_for_batch(fetch_batch_id),
+        payload={"backup_job_item_id": backup_job_id, "failed_job_item_id": job.job_item_id, "reason": reason},
+    )
+    return _JOBS[backup_job_id]
 
 
 def lease_fetch_jobs(request: FetchJobLeaseRequest) -> FetchJobLeaseOut:
@@ -554,6 +1108,14 @@ def lease_fetch_jobs(request: FetchJobLeaseRequest) -> FetchJobLeaseOut:
             continue
         if job.next_retry_at and job.next_retry_at > now:
             continue
+        batch = _ensure_batch_record(job.fetch_batch_id)
+        if batch is None:
+            job.status = FetchJobStatus.DEAD_LETTER
+            job.last_error_code = "fetch_batch_missing"
+            job.last_error_message = f"fetch batch {job.fetch_batch_id} is missing while leasing"
+            job.updated_at = now
+            persist_job_if_enabled(job)
+            continue
         policy = _policy_for(job.provider, job.api_name)
         key = (job.provider, job.api_name)
         if inflight_by_key.get(key, 0) >= policy.max_concurrency:
@@ -570,7 +1132,7 @@ def lease_fetch_jobs(request: FetchJobLeaseRequest) -> FetchJobLeaseOut:
             fetch_batch_id=job.fetch_batch_id,
             job_item_id=job.job_item_id,
             event_type=CallbackEventType.JOB_LEASED,
-            callback_url=_BATCHES[job.fetch_batch_id].callback_url,
+            callback_url=_callback_url_for_batch(job.fetch_batch_id),
             payload={"job_item_id": job.job_item_id, "worker_id": request.worker_id},
         )
     for job in leased:
@@ -584,90 +1146,35 @@ def complete_fetch_job(job_item_id: str, request: FetchJobCompleteRequest) -> Fe
         raise ValueError("worker_id does not own this job lease")
     now = _utcnow()
     job.updated_at = now
+    job.worker_id = None
     job.lease_expires_at = None
     if request.success:
         job.status = FetchJobStatus.SUCCEEDED
+        job.raw_request_hash = request.raw_request_hash
+        job.raw_response_schema_hash = request.raw_response_schema_hash
         event_type = CallbackEventType.JOB_SUCCEEDED
-        payload = {"job_item_id": job_item_id, "row_count": request.row_count, "request_hash": request.raw_request_hash or job.request_hash}
-        existing_trigger = next(
-            (
-                trigger
-                for trigger in list_source_build_triggers(job.fetch_batch_id)
-                if trigger.job_item_id == job.job_item_id
-                and trigger.source_table_name == job.source_table_name
-                and trigger.symbol == job.symbol
-                and trigger.trade_date == job.trade_date
-                and trigger.status in {"queued", "running", "succeeded"}
-            ),
-            None,
-        )
-        if existing_trigger is None:
-            trigger = SourceBuildTriggerOut(
-                trigger_id=_new_id("source_build_trigger"),
-                fetch_batch_id=job.fetch_batch_id,
-                job_item_id=job.job_item_id,
-                source_table_name=job.source_table_name,
-                symbol=job.symbol,
-                trade_date=job.trade_date,
-                build_scope="symbol_date" if job.symbol and job.trade_date else "batch",
-                status="queued",
-                quality_check_required=True,
-                lineage_required=True,
-                created_at=now,
-            )
-            _BUILD_TRIGGERS.append(trigger)
-            persist_build_trigger_if_enabled(trigger)
-            _add_callback(
-                fetch_batch_id=job.fetch_batch_id,
-                job_item_id=job.job_item_id,
-                event_type=CallbackEventType.SOURCE_BUILD_TRIGGER_CREATED,
-                callback_url=_BATCHES[job.fetch_batch_id].callback_url,
-                payload={"trigger_id": trigger.trigger_id, "source_table_name": trigger.source_table_name, "build_scope": trigger.build_scope},
-            )
+        payload = {
+            "job_item_id": job_item_id,
+            "row_count": request.row_count,
+            "request_hash": request.raw_request_hash or job.request_hash,
+            "raw_request_hash": request.raw_request_hash,
+            "raw_response_schema_hash": request.raw_response_schema_hash,
+        }
+        _ensure_source_build_trigger(job, fetch_batch_id=job.fetch_batch_id, source_table_name=job.source_table_name)
+        _ensure_source_build_alias_triggers(job)
     else:
         job.status = FetchJobStatus.FAILED
         job.last_error_code = request.error_code or "provider_fetch_failed"
         job.last_error_message = request.error_message
         event_type = CallbackEventType.JOB_FAILED
         payload = {"job_item_id": job_item_id, "error_code": job.last_error_code, "error_message": job.last_error_message}
-        backup_plans_raw = job.request_params.get("__backup_plans", []) if isinstance(job.request_params, dict) else []
-        if backup_plans_raw:
-            backup = backup_plans_raw[0]
-            backup_request_hash = _job_hash(Provider(backup["provider"]), backup["api_name"], backup["request_params"], backup["raw_table_name"])
-            backup_job_id = _new_id("fetch_job")
-            _JOBS[backup_job_id] = FetchJobStatusOut(
-                job_item_id=backup_job_id,
-                fetch_batch_id=job.fetch_batch_id,
-                provider=Provider(backup["provider"]),
-                api_name=backup["api_name"],
-                raw_table_name=backup["raw_table_name"],
-                request_params=backup["request_params"],
-                request_hash=backup_request_hash,
-                source_table_name=job.source_table_name,
-                canonical_fields=job.canonical_fields,
-                symbol=job.symbol,
-                trade_date=job.trade_date,
-                priority=job.priority,
-                queue_name=job.queue_name,
-                status=FetchJobStatus.QUEUED,
-                backup_of_job_item_id=job.job_item_id,
-                created_at=now,
-                updated_at=now,
-            )
-            persist_job_if_enabled(_JOBS[backup_job_id])
-            _add_callback(
-                fetch_batch_id=job.fetch_batch_id,
-                job_item_id=backup_job_id,
-                event_type=CallbackEventType.BACKUP_JOB_QUEUED,
-                callback_url=_BATCHES[job.fetch_batch_id].callback_url,
-                payload={"backup_job_item_id": backup_job_id, "failed_job_item_id": job.job_item_id},
-            )
+        _queue_backup_job(job, fetch_batch_id=job.fetch_batch_id, now=now, reason=job.last_error_code)
     persist_job_if_enabled(job)
     _add_callback(
         fetch_batch_id=job.fetch_batch_id,
         job_item_id=job.job_item_id,
         event_type=event_type,
-        callback_url=_BATCHES[job.fetch_batch_id].callback_url,
+        callback_url=_callback_url_for_batch(job.fetch_batch_id),
         payload=payload,
     )
     _refresh_batch_status(job.fetch_batch_id)
@@ -675,6 +1182,9 @@ def complete_fetch_job(job_item_id: str, request: FetchJobCompleteRequest) -> Fe
 
 
 def list_callback_events(fetch_batch_id: str | None = None) -> list[FetchCallbackEventOut]:
+    durable = durable_callback_events_if_enabled(fetch_batch_id)
+    if durable is not None:
+        return durable
     rows = _CALLBACKS
     if fetch_batch_id:
         rows = [event for event in rows if event.fetch_batch_id == fetch_batch_id]
@@ -782,6 +1292,25 @@ def queue_summary() -> FetchQueueSummaryOut:
 
 def requeue_expired_leases() -> FetchLeaseMaintenanceResult:
     now = _utcnow()
+    durable_requeued = requeue_expired_leases_if_enabled(now)
+    if durable_requeued is not None:
+        expired: list[str] = []
+        for job in durable_requeued:
+            _ensure_batch_record(job.fetch_batch_id)
+            _JOBS[job.job_item_id] = job
+            _REQUEST_HASH_TO_JOB[job.request_hash] = job.job_item_id
+            expired.append(job.job_item_id)
+            _add_callback(
+                fetch_batch_id=job.fetch_batch_id,
+                job_item_id=job.job_item_id,
+                event_type=CallbackEventType.JOB_REQUEUED,
+                callback_url=_callback_url_for_batch(job.fetch_batch_id),
+                payload={"job_item_id": job.job_item_id, "reason": "lease_expired"},
+            )
+            if job.fetch_batch_id in _BATCHES:
+                _refresh_batch_status(job.fetch_batch_id)
+        return FetchLeaseMaintenanceResult(requeued_count=len(expired), expired_job_ids=expired, checked_at=now)
+
     expired: list[str] = []
     for job in _JOBS.values():
         if job.status == FetchJobStatus.LEASED and job.lease_expires_at and job.lease_expires_at <= now:
@@ -796,7 +1325,7 @@ def requeue_expired_leases() -> FetchLeaseMaintenanceResult:
                 fetch_batch_id=job.fetch_batch_id,
                 job_item_id=job.job_item_id,
                 event_type=CallbackEventType.JOB_REQUEUED,
-                callback_url=_BATCHES[job.fetch_batch_id].callback_url,
+                callback_url=_callback_url_for_batch(job.fetch_batch_id),
                 payload={"job_item_id": job.job_item_id, "reason": "lease_expired"},
             )
             _refresh_batch_status(job.fetch_batch_id)
@@ -905,7 +1434,8 @@ def list_source_build_triggers(fetch_batch_id: str | None = None) -> list[Source
 def dispatch_callback_events(request: FetchCallbackDispatchRequest) -> FetchCallbackDispatchResult:
     # DS-5 implements an outbox contract. Real callback delivery is intentionally
     # behind a dry_run flag until downstream services expose stable callback APIs.
-    pending = [event for event in _CALLBACKS if event.delivery_status == "pending"][: request.max_events]
+    durable_pending = durable_callback_events_if_enabled(pending_only=True, limit=request.max_events)
+    pending = durable_pending if durable_pending is not None else [event for event in _CALLBACKS if event.delivery_status == "pending"][: request.max_events]
     delivered = 0
     skipped = 0
     failed = 0

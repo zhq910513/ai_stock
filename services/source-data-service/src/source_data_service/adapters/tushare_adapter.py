@@ -33,6 +33,8 @@ class TushareAdapter(ProviderAdapter):
             frame = pro.adj_factor(**params)
         elif api_name == "moneyflow":
             frame = pro.moneyflow(**params)
+        elif api_name == "daily_basic":
+            frame = pro.daily_basic(**params)
         elif api_name == "stk_limit":
             frame = pro.stk_limit(**params)
         else:

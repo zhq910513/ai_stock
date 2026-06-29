@@ -16,9 +16,64 @@ _OPTIONAL_PACKAGE_BY_PROVIDER: dict[Provider, str] = {
     Provider.BAOSTOCK: "baostock",
     Provider.AKSHARE: "akshare",
     Provider.TUSHARE: "tushare",
+    Provider.EASTMONEY: "requests",
+    Provider.TENCENT: "requests",
+    Provider.SOHU: "requests",
+    Provider.BAIDU: "requests",
+    Provider.SINA: "requests",
+    Provider.THS: "requests",
+    Provider.COINGECKO: "requests",
+    Provider.YAHOO: "requests",
+    Provider.JIN10: "requests",
 }
 
-_IMPLEMENTED_ADAPTERS = {Provider.BAOSTOCK, Provider.AKSHARE, Provider.TUSHARE}
+_IMPLEMENTED_ADAPTER_APIS: dict[Provider, set[str] | None] = {
+    Provider.BAOSTOCK: None,
+    Provider.AKSHARE: None,
+    Provider.TUSHARE: None,
+    Provider.EASTMONEY: {
+        "stock_universe",
+        "quote_snapshot",
+        "auction_snapshot",
+        "daily_bars",
+        "minute_bars",
+        "trade_details",
+        "moneyflow_stock_series",
+        "moneyflow_stock_rank",
+        "moneyflow_board_rank",
+        "stock_board_profile",
+        "theme_memberships",
+        "billboard_trades",
+        "northbound_summary",
+        "lpr_rates",
+    },
+    Provider.TENCENT: {"daily_bars", "quote_snapshot", "minute_bars", "auction_snapshot"},
+    Provider.SOHU: {"daily_bars"},
+    Provider.BAIDU: {"finance_news_feed"},
+    Provider.SINA: {"auction_snapshot"},
+    Provider.THS: {
+        "limit_up_pool",
+        "trade_status",
+        "zhangting5_reasons",
+        "market_state_overview",
+        "wind_vane_stock",
+        "hot_block_list",
+        "market_capital",
+        "stock_concepts",
+        "stock_focusday",
+        "paid_limit_up_probability",
+    },
+    Provider.COINGECKO: {"simple_price", "global_market"},
+    Provider.YAHOO: {"chart"},
+    Provider.JIN10: {"public_flash"},
+}
+
+
+def adapter_implemented(provider: Provider, api_name: str) -> bool:
+    supported = _IMPLEMENTED_ADAPTER_APIS.get(provider)
+    if supported is None:
+        return provider in _IMPLEMENTED_ADAPTER_APIS
+    return api_name in supported
 
 
 def provider_runtime_key(provider: Provider, api_name: str) -> str:
@@ -108,7 +163,7 @@ def list_provider_status(provider: Provider | None = None) -> list[ProviderRunti
             ProviderRuntimeStatus(
                 provider=spec.provider,
                 api_name=spec.api_name,
-                adapter_implemented=spec.provider in _IMPLEMENTED_ADAPTERS,
+                adapter_implemented=adapter_implemented(spec.provider, spec.api_name),
                 optional_package_available=optional_package_available(spec.provider),
                 circuit_state="open" if breaker.opened_at is not None else "closed",
                 failure_count=breaker.failure_count,

@@ -39,6 +39,38 @@ def test_missing_available_at_blocks_official_release_gate() -> None:
     assert result["research_sample_pool"]["include_in_official_success_rate"] is False
 
 
+def test_missing_optional_context_does_not_trigger_available_at_lineage_block() -> None:
+    row = _row()
+    row.pop("auction_snapshot")
+    row.pop("stock_rank")
+    row.pop("market_regime_context")
+
+    response = TestClient(app).post("/production/scores/compute", json={"as_of_time_utc": "2026-06-08T01:26:00Z", "payload": {"row": row}})
+
+    assert response.status_code == 200
+    result = response.json()["structured_output"]["score_compute"]
+    audit = result["source_visibility_audit"]
+    assert audit["status"] == "usable"
+    assert "missing_available_at_lineage" not in audit["hard_block_codes"]
+    assert result["score_state"] != "blocked"
+    assert result["stage_scores"]["auction_confirmed_score"] is None
+    assert result["stage_scores"]["pre_auction_score"] is not None
+
+
+def test_present_optional_context_missing_available_at_still_blocks_lineage() -> None:
+    row = _row()
+    row["auction_snapshot"].pop("available_at")
+
+    response = TestClient(app).post("/production/scores/compute", json={"as_of_time_utc": "2026-06-08T01:26:00Z", "payload": {"row": row}})
+
+    assert response.status_code == 200
+    result = response.json()["structured_output"]["score_compute"]
+    audit = result["source_visibility_audit"]
+    assert audit["status"] == "blocked_missing_available_at_lineage"
+    assert "missing_available_at_lineage" in audit["hard_block_codes"]
+    assert result["score_state"] == "blocked"
+
+
 def test_buy_point_does_not_freeze_from_latest_or_previous_close() -> None:
     row = _row()
     row.pop("auction_snapshot")

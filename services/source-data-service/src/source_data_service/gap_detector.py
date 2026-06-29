@@ -4,6 +4,14 @@ from source_data_service.models import Provider, RepairApiPlan, SourceGapRepairP
 from source_data_service.provider_registry import build_provider_code, format_date_for_provider, get_api_spec, get_requirement
 
 
+def _require_symbol(provider: Provider, api_name: str, request: SourceGapRequest) -> str:
+    if request.symbol:
+        return request.symbol
+    raise ValueError(
+        f"{provider.value}.{api_name} requires symbol; use universe_scope=full_a_share to expand symbols first"
+    )
+
+
 def _date_range_params(request: SourceGapRequest, provider: Provider) -> dict[str, str]:
     start = request.start_date or request.trade_date
     end = request.end_date or request.trade_date or request.start_date
@@ -15,8 +23,8 @@ def _date_range_params(request: SourceGapRequest, provider: Provider) -> dict[st
 
 
 def _build_params(provider: Provider, api_name: str, request: SourceGapRequest) -> dict[str, object]:
-    symbol = request.symbol or "000759.SZ"
-    code = build_provider_code(symbol, provider)
+    symbol = request.symbol
+    code = build_provider_code(symbol, provider) if symbol else ""
     date_params = _date_range_params(request, provider)
     if provider == Provider.BAOSTOCK:
         if api_name == "query_stock_basic":
@@ -26,6 +34,8 @@ def _build_params(provider: Provider, api_name: str, request: SourceGapRequest) 
         if api_name == "query_trade_dates":
             return date_params
         if api_name == "query_history_k_data_plus_daily_qfq":
+            symbol = _require_symbol(provider, api_name, request)
+            code = build_provider_code(symbol, provider)
             return {
                 "code": code,
                 "fields": "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST",
@@ -34,32 +44,171 @@ def _build_params(provider: Provider, api_name: str, request: SourceGapRequest) 
                 "adjustflag": "2",
             }
         if api_name == "query_history_k_data_plus_daily_raw":
+            if request.source_table_name == "source.index_daily_bar_v1" and not request.symbol:
+                symbol = "399006.SZ"
+            else:
+                symbol = _require_symbol(provider, api_name, request)
+            code = build_provider_code(symbol, provider)
+            fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST"
+            if request.source_table_name == "source.index_daily_bar_v1":
+                fields = "date,code,open,high,low,close,preclose,volume,amount,pctChg"
             return {
                 "code": code,
-                "fields": "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST",
+                "fields": fields,
                 **date_params,
                 "frequency": "d",
                 "adjustflag": "3",
             }
         if api_name == "query_adjust_factor":
+            symbol = _require_symbol(provider, api_name, request)
+            code = build_provider_code(symbol, provider)
             return {"code": code, **date_params}
         if api_name == "query_stock_industry":
             return {"date": request.trade_date.isoformat() if request.trade_date else None}
     if provider == Provider.AKSHARE:
-        ak_code = build_provider_code(symbol, provider)
         if api_name == "stock_zh_a_hist_daily_qfq":
+            symbol = _require_symbol(provider, api_name, request)
+            ak_code = build_provider_code(symbol, provider)
             return {"symbol": ak_code, "period": "daily", **date_params, "adjust": "qfq"}
         if api_name == "stock_zh_a_hist_daily_raw":
+            symbol = _require_symbol(provider, api_name, request)
+            ak_code = build_provider_code(symbol, provider)
             return {"symbol": ak_code, "period": "daily", **date_params, "adjust": ""}
         if api_name == "stock_fund_flow_individual_realtime":
             return {"symbol": "即时"}
         if api_name == "stock_zh_a_disclosure_report_cninfo":
+            symbol = _require_symbol(provider, api_name, request)
+            ak_code = build_provider_code(symbol, provider)
             return {"symbol": ak_code, "market": "沪深京", **date_params}
         if api_name == "stock_board_industry_hist_em":
             return {"symbol": "行业待映射", "adjust": ""}
+    if provider == Provider.TENCENT:
+        if request.source_table_name == "source.index_daily_bar_v1" and not request.symbol:
+            tencent_symbol = "399006.SZ"
+        else:
+            tencent_symbol = _require_symbol(provider, api_name, request)
+        provider_code = build_provider_code(tencent_symbol, provider)
+        adjustment = "qfq" if request.source_table_name == "source.adjusted_daily_bar_v1" else "raw"
+        return {
+            "provider_code": provider_code,
+            "period": "day",
+            **date_params,
+            "count": 10,
+            "adjustment": adjustment,
+        }
+    if provider == Provider.SOHU:
+        symbol = _require_symbol(provider, api_name, request)
+        provider_code = build_provider_code(symbol, provider)
+        return {
+            "provider_code": provider_code,
+            **date_params,
+            "period": "d",
+        }
+    if provider == Provider.EASTMONEY:
+        if api_name == "stock_universe":
+            if not symbol:
+                return {"pageSize": 200, "pageNumber": 1, "max_pages_per_segment": 20}
+            code6 = symbol.split(".", 1)[0]
+            segment_name = "main_sz"
+            if symbol.endswith(".SH"):
+                segment_name = "star" if code6.startswith("688") else "main_sh"
+            elif symbol.endswith(".BJ") or code6.startswith(("8", "4")):
+                segment_name = "bse"
+            elif code6.startswith("3"):
+                segment_name = "chinext"
+            return {"segment_name": segment_name, "pageSize": 200, "pageNumber": 1, "max_pages_per_segment": 20}
+        if api_name == "moneyflow_stock_series":
+            symbol = _require_symbol(provider, api_name, request)
+            secid = build_provider_code(symbol, provider)
+            params: dict[str, object] = {"secid": secid, "lmt": 120}
+            params.update(date_params)
+            return params
+        if api_name == "minute_bars":
+            symbol = _require_symbol(provider, api_name, request)
+            secid = build_provider_code(symbol, provider)
+            params = {"secid": secid, "ndays": 1}
+            params.update(date_params)
+            if request.trade_date:
+                params["trade_date"] = request.trade_date.isoformat()
+            return params
+        if api_name == "trade_details":
+            symbol = _require_symbol(provider, api_name, request)
+            secid = build_provider_code(symbol, provider)
+            params = {"secid": secid, "pos": "-0"}
+            params.update(date_params)
+            if request.trade_date:
+                params["trade_date"] = request.trade_date.isoformat()
+            return params
+        if api_name == "quote_snapshot":
+            symbol = _require_symbol(provider, api_name, request)
+            secid = build_provider_code(symbol, provider)
+            params = {"secid": secid}
+            params.update(date_params)
+            if request.trade_date:
+                params["trade_date"] = request.trade_date.isoformat()
+            return params
+        if api_name == "auction_snapshot":
+            symbol = _require_symbol(provider, api_name, request)
+            secid = build_provider_code(symbol, provider)
+            params = {"secid": secid}
+            params.update(date_params)
+            if request.trade_date:
+                params["trade_date"] = request.trade_date.isoformat()
+            return params
+        if api_name == "daily_bars":
+            symbol = _require_symbol(provider, api_name, request)
+            secid = build_provider_code(symbol, provider)
+            start = request.start_date or request.trade_date
+            end = request.end_date or request.trade_date or request.start_date
+            return {
+                "secid": secid,
+                "beg": start.strftime("%Y%m%d") if start else "20260612",
+                "end": end.strftime("%Y%m%d") if end else "20260612",
+                "klt": "101",
+                "fqt": "0",
+            }
+        if api_name in {"northbound_summary", "lpr_rates"}:
+            return {"pageSize": 20, "pageNumber": 1}
+        symbol = _require_symbol(provider, api_name, request)
+        secid = build_provider_code(symbol, provider)
+        return {"secid": secid, **date_params}
+    if provider == Provider.THS:
+        if api_name == "paid_limit_up_probability":
+            from source_data_service.ths_paid_credentials import active_credential_version
+
+            symbol = _require_symbol(provider, api_name, request)
+            trade_date = request.trade_date or request.start_date
+            return {
+                "date": trade_date.strftime("%Y%m%d") if trade_date else None,
+                "stock_code": symbol[:6],
+                "credential_version": active_credential_version() or "missing_credential",
+            }
+        if api_name == "limit_up_pool":
+            params: dict[str, object] = {"limit": 50, "fetch_all_pages": True}
+            if request.trade_date:
+                params["trade_date"] = request.trade_date.isoformat()
+            return params
+        if api_name in {"market_state_overview", "wind_vane_stock"}:
+            params = {}
+            if request.trade_date:
+                params["trade_date"] = request.trade_date.isoformat()
+            return params
+        if api_name in {"stock_concepts", "stock_focusday"}:
+            symbol = _require_symbol(provider, api_name, request)
+            return {"symbol": symbol[:6]}
+        return {}
+    if provider == Provider.BAIDU:
+        return {"rn": 20, "pn": 0, "type": "all", "tag": "all"}
+    if provider == Provider.JIN10:
+        return {"channel": "-8200", "vip": 0}
+    if provider == Provider.COINGECKO:
+        return {"ids": "bitcoin,ethereum", "vs_currency": "usd"}
+    if provider == Provider.YAHOO:
+        return {"symbols": "^NDX,^HSI,^SOX,^VIX,USDCNH=X", "range": "1mo", "interval": "1d"}
     if provider == Provider.TUSHARE:
-        ts_code = build_provider_code(symbol, provider)
-        if api_name in {"daily", "adj_factor", "moneyflow"}:
+        if api_name in {"daily", "adj_factor", "moneyflow", "daily_basic"}:
+            symbol = _require_symbol(provider, api_name, request)
+            ts_code = build_provider_code(symbol, provider)
             return {"ts_code": ts_code, **date_params}
         if api_name == "stock_basic":
             return {"exchange": "", "list_status": "L", "fields": "ts_code,symbol,name,area,industry,market,exchange,list_status,list_date,delist_date,is_hs"}
@@ -89,16 +238,20 @@ def build_repair_plan(request: SourceGapRequest) -> SourceGapRepairPlan:
     backups: list[RepairApiPlan] = []
     if req.backup_provider and req.backup_api_name:
         spec = get_api_spec(req.backup_provider, req.backup_api_name) if req.backup_provider != Provider.INTERNAL else None
-        backups.append(
-            RepairApiPlan(
-                provider=req.backup_provider,
-                api_name=req.backup_api_name,
-                raw_table_name=spec.raw_table_name if spec else f"source_build.{req.backup_api_name}",
-                params=_build_params(req.backup_provider, req.backup_api_name, request),
-                reason=f"backup repair for {request.source_table_name}.{request.canonical_field_name}",
-                priority=20,
+        try:
+            backups.append(
+                RepairApiPlan(
+                    provider=req.backup_provider,
+                    api_name=req.backup_api_name,
+                    raw_table_name=spec.raw_table_name if spec else f"source_build.{req.backup_api_name}",
+                    params=_build_params(req.backup_provider, req.backup_api_name, request),
+                    reason=f"backup repair for {request.source_table_name}.{request.canonical_field_name}",
+                    priority=20,
+                )
             )
-        )
+        except ValueError as exc:
+            if "requires symbol" not in str(exc):
+                raise
     return SourceGapRepairPlan(
         source_table_name=request.source_table_name,
         canonical_field_name=request.canonical_field_name,

@@ -27,22 +27,22 @@ HOT_CANDIDATES_TASKS: tuple[ScheduledTask, ...] = (
     ScheduledTask(
         task_code="source.auction.collect.0915_0925",
         task_kind="source_collect",
-        owner_service="market-data-service",
+        owner_service="source-data-service",
         schedule_hint="09:15-09:25 every 15-30 seconds",
         frequency_hint="15-30s",
-        reads_from=["provider.sina_auction", "provider.tencent_auction"],
+        reads_from=["source-data-service:/source/fetch/plan", "source-data-service:/source/fetch/submit"],
         writes_to=["source.auction_snapshot_v1"],
-        notes="High frequency source fact only; never publishes model conclusions.",
+        notes="Submit high-frequency auction fetch work through source-data-service orchestration; never calls providers directly.",
     ),
     ScheduledTask(
         task_code="source.auction.freeze.092505_092530",
         task_kind="source_collect",
-        owner_service="market-data-service",
+        owner_service="source-data-service",
         schedule_hint="09:25:05,09:25:30",
         frequency_hint="fixed_time",
-        reads_from=["provider.sina_auction", "provider.tencent_auction"],
+        reads_from=["source-data-service:/source/fetch/plan", "source-data-service:/source/fetch/submit"],
         writes_to=["source.auction_snapshot_v1"],
-        notes="Frozen auction evidence for decision_time lineage.",
+        notes="Submit auction freeze fetch work through source-data-service orchestration for decision-time lineage.",
     ),
     ScheduledTask(
         task_code="hot.score.auction_confirmed",
@@ -50,7 +50,17 @@ HOT_CANDIDATES_TASKS: tuple[ScheduledTask, ...] = (
         owner_service="hot-candidates-service",
         schedule_hint="09:26:00,09:28:00,09:29:30",
         frequency_hint="fixed_time",
-        reads_from=["source.*", "decision_hot.hot_decision_case_v1"],
+        reads_from=[
+            "source.stock_master_v1",
+            "source.trade_status_v1",
+            "source.daily_bar_v1",
+            "source.adjusted_daily_bar_v1",
+            "source.stock_moneyflow_daily_v1",
+            "source.event_news_v1",
+            "source.realtime_quote_v1",
+            "source.minute_bar_v1",
+            "decision_hot.hot_decision_case_v1",
+        ],
         writes_to=["decision_hot.hot_feature_matrix_v1", "decision_hot.hot_score_fact_v1"],
         notes="Computes stage scores; does not itself create official signals.",
     ),
@@ -68,22 +78,27 @@ HOT_CANDIDATES_TASKS: tuple[ScheduledTask, ...] = (
     ScheduledTask(
         task_code="source.open_5m.collect",
         task_kind="source_collect",
-        owner_service="market-data-service",
+        owner_service="source-data-service",
         schedule_hint="09:30-09:36 every 30-60 seconds",
         frequency_hint="30-60s",
-        reads_from=["provider.minute", "provider.realtime_quote"],
+        reads_from=["source-data-service:/source/fetch/plan", "source-data-service:/source/fetch/submit"],
         writes_to=["source.minute_bar_v1", "source.realtime_quote_v1"],
-        notes="Open 5m VWAP evidence for buy point and execution risk.",
+        notes="Submit open-window minute/quote fetch work through source-data-service orchestration.",
     ),
     ScheduledTask(
         task_code="hot.buy_point.open_5m",
         task_kind="buy_point",
-        owner_service="execution-timing-service",
+        owner_service="hot-candidates-service",
         schedule_hint="09:30-09:36 every 30-60 seconds; fixed 09:35,09:45,10:00",
         frequency_hint="30-60s in opening window",
-        reads_from=["decision_hot.hot_signal_fact_v1", "source.minute_bar_v1", "source.auction_snapshot_v1"],
+        reads_from=[
+            "decision_hot.hot_decision_case_v1",
+            "decision_hot.hot_score_fact_v1",
+            "source.minute_bar_v1",
+            "source.auction_snapshot_v1",
+        ],
         writes_to=["decision_hot.hot_buy_point_v1"],
-        notes="Freezes first valid reference entry price; later versions are diagnostics only.",
+        notes="Freezes first evaluation reference price from scored hot cases; release audit/signal are not hard prerequisites, and blocked rows remain explicit diagnostics, not trading instructions.",
     ),
     ScheduledTask(
         task_code="hot.observe.intraday",
@@ -91,7 +106,14 @@ HOT_CANDIDATES_TASKS: tuple[ScheduledTask, ...] = (
         owner_service="hot-candidates-service",
         schedule_hint="09:30-10:00 every 60s; 10:00-14:30 every 300s; 14:30-15:00 every 60-180s",
         frequency_hint="60s/300s dynamic",
-        reads_from=["decision_hot.hot_signal_fact_v1", "decision_hot.hot_buy_point_v1", "source.realtime_quote_v1", "source.minute_bar_v1", "source.sector_snapshot_v1", "source.market_regime_snapshot_v1"],
+        reads_from=[
+            "decision_hot.hot_signal_fact_v1",
+            "decision_hot.hot_buy_point_v1",
+            "source.realtime_quote_v1",
+            "source.minute_bar_v1",
+            "source.daily_bar_v1",
+            "source.adjusted_daily_bar_v1",
+        ],
         writes_to=["decision_hot.hot_observation_snapshot_v1"],
         notes="Append-only second and later observations; never overwrites initial decision.",
     ),
@@ -150,6 +172,30 @@ def validate_hot_plan_contract() -> dict:
         for task in tasks
         if task.task_kind == "source_collect" and task.is_official_publish
     ]
+    provider_read_violations = [
+        task.task_code
+        for task in tasks
+        if any(source.startswith("provider.") for source in task.reads_from)
+    ]
+    raw_read_violations = [
+        task.task_code
+        for task in tasks
+        if any(source.startswith("raw.") or source.startswith("raw_") for source in task.reads_from)
+    ]
+    source_wildcard_violations = [
+        task.task_code
+        for task in tasks
+        if any(source == "source.*" for source in task.reads_from)
+    ]
+    source_orchestration_violations = [
+        task.task_code
+        for task in tasks
+        if task.task_code.startswith("source.")
+        and (
+            task.owner_service != "source-data-service"
+            or "source-data-service:/source/fetch/submit" not in task.reads_from
+        )
+    ]
     return {
         "contract_kind": "hot_scheduler_plan_validation_v1",
         "order_ok": order_ok,
@@ -157,8 +203,16 @@ def validate_hot_plan_contract() -> dict:
         "official_publish_tasks": official_publish_tasks,
         "append_only_violations": append_only_violations,
         "source_publish_violations": source_publish_violations,
+        "provider_read_violations": provider_read_violations,
+        "raw_read_violations": raw_read_violations,
+        "source_wildcard_violations": source_wildcard_violations,
+        "source_orchestration_violations": source_orchestration_violations,
         "valid": order_ok
         and official_publish_tasks == ["hot.release_gate.preopen"]
         and not append_only_violations
-        and not source_publish_violations,
+        and not source_publish_violations
+        and not provider_read_violations
+        and not raw_read_violations
+        and not source_wildcard_violations
+        and not source_orchestration_violations,
     }

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>神策中心</title>
+    <link rel="stylesheet" href="/app.css?v=20260615-source-model-list-v4" />
+  </head>
+  <body data-auth-state="booting">
+    <div id="app-root"></div>
+    <main id="login-root" class="login-shell" aria-labelledby="login-title">
+      <section class="login-panel">
+        <div class="login-brand">
+          <div class="brand-mark" aria-hidden="true"><span></span><span></span></div>
+          <p>神策中心</p>
+          <h1 id="login-title">欢迎来到AI神策中心</h1>
+        </div>
+        <form id="login-form" class="login-card" autocomplete="on">
+          <label>
+            <span>账号</span>
+            <input id="login-username" name="username" type="text" autocomplete="username" />
+          </label>
+          <label>
+            <span>密码</span>
+            <input id="login-password" name="password" type="password" autocomplete="current-password" />
+          </label>
+          <button class="primary-button" type="submit">登录</button>
+          <p id="login-message" class="login-message" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+    </main>
+    <div id="toast-root" class="toast-root" aria-live="polite"></div>
+    <script type="module" src="/app.js?v=20260621-candidate-cookie-v1"></script>
+  </body>
+</html>

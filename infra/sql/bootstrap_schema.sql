@@ -1,4 +1,4 @@
-﻿BEGIN;
+BEGIN;
 
 CREATE TABLE alembic_version (
     version_num VARCHAR(32) NOT NULL, 
@@ -4979,6 +4979,37 @@ BEGIN
     END IF;
 END $$;
 
+CREATE SCHEMA IF NOT EXISTS raw_baidu;
+
+CREATE TABLE IF NOT EXISTS raw_baidu.finance_news_feed_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'baidu',
+    api_name TEXT NOT NULL DEFAULT 'finance_news_feed',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    provider_news_id TEXT,
+    symbol TEXT,
+    title TEXT NOT NULL,
+    source_name TEXT,
+    published_at TIMESTAMPTZ,
+    event_type TEXT,
+    url TEXT,
+    tags_json JSONB,
+    stock_refs_json JSONB,
+    raw_row_json JSONB NOT NULL,
+    UNIQUE (provider_news_id, batch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_raw_baidu_news_symbol_time ON raw_baidu.finance_news_feed_v1 (symbol, published_at);
+CREATE INDEX IF NOT EXISTS idx_raw_baidu_news_id ON raw_baidu.finance_news_feed_v1 (provider_news_id);
+CREATE INDEX IF NOT EXISTS idx_raw_baidu_news_request_hash ON raw_baidu.finance_news_feed_v1 (request_hash);
+
 DO $$
 BEGIN
     IF to_regclass('governance.source_build_trigger_v1') IS NOT NULL
@@ -4997,7 +5028,1357 @@ BEGIN
     END IF;
 END $$;
 
+CREATE SCHEMA IF NOT EXISTS raw_eastmoney;
+
+CREATE TABLE IF NOT EXISTS raw_eastmoney.trade_details_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'eastmoney',
+    api_name TEXT NOT NULL DEFAULT 'trade_details',
+    request_params_json JSONB NOT NULL,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    symbol TEXT,
+    trade_date DATE,
+    tick_time TIMESTAMPTZ NOT NULL,
+    price NUMERIC,
+    volume NUMERIC,
+    amount NUMERIC,
+    trade_count NUMERIC,
+    side_code TEXT,
+    side_label TEXT,
+    provider_sequence INTEGER,
+    raw_row_json JSONB NOT NULL,
+    request_hash TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_eastmoney_trade_details_hash
+    ON raw_eastmoney.trade_details_v1(provider, api_name, request_hash, response_row_hash);
+CREATE INDEX IF NOT EXISTS idx_raw_eastmoney_trade_details_symbol_time
+    ON raw_eastmoney.trade_details_v1(symbol, tick_time);
+CREATE INDEX IF NOT EXISTS idx_raw_eastmoney_trade_details_request_hash
+    ON raw_eastmoney.trade_details_v1(request_hash);
+
+ALTER TABLE IF EXISTS raw_eastmoney.quote_snapshot_v1
+    ADD COLUMN IF NOT EXISTS total_market_cap NUMERIC,
+    ADD COLUMN IF NOT EXISTS float_market_cap NUMERIC,
+    ADD COLUMN IF NOT EXISTS symbol TEXT,
+    ADD COLUMN IF NOT EXISTS trade_date DATE,
+    ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ;
+
+ALTER TABLE IF EXISTS raw_eastmoney.minute_bars_v1
+    ADD COLUMN IF NOT EXISTS trade_date DATE;
+
+ALTER TABLE IF EXISTS source.realtime_quote_v1
+    ADD COLUMN IF NOT EXISTS trade_date DATE,
+    ADD COLUMN IF NOT EXISTS open_price NUMERIC,
+    ADD COLUMN IF NOT EXISTS prev_close_price NUMERIC,
+    ADD COLUMN IF NOT EXISTS turnover_rate NUMERIC,
+    ADD COLUMN IF NOT EXISTS change_amount NUMERIC,
+    ADD COLUMN IF NOT EXISTS change_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS total_market_cap NUMERIC,
+    ADD COLUMN IF NOT EXISTS float_market_cap NUMERIC,
+    ADD COLUMN IF NOT EXISTS source_quality_status TEXT NOT NULL DEFAULT 'usable',
+    ADD COLUMN IF NOT EXISTS primary_provider TEXT,
+    ADD COLUMN IF NOT EXISTS backup_provider TEXT,
+    ADD COLUMN IF NOT EXISTS lineage_id TEXT,
+    ADD COLUMN IF NOT EXISTS build_batch_id TEXT;
+
+DO $$
+BEGIN
+    IF to_regclass('source.realtime_quote_v1') IS NOT NULL THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_source_realtime_quote_symbol_time_provider
+            ON source.realtime_quote_v1(instrument_id, event_time, provider);
+    END IF;
+    IF to_regclass('source.minute_bar_v1') IS NOT NULL THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_source_minute_bar_symbol_time_provider
+            ON source.minute_bar_v1(instrument_id, bar_time, provider);
+    END IF;
+END $$;
+
+ALTER TABLE IF EXISTS source.limit_event_v1
+    ADD COLUMN IF NOT EXISTS close_on_limit_flag BOOLEAN,
+    ADD COLUMN IF NOT EXISTS limit_open_count NUMERIC;
+
+CREATE TABLE IF NOT EXISTS source.trade_tick_v1 (
+    trade_tick_id BIGSERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    trade_date DATE,
+    tick_time TIMESTAMPTZ NOT NULL,
+    price NUMERIC,
+    volume NUMERIC,
+    amount NUMERIC,
+    trade_count NUMERIC,
+    side_code TEXT,
+    side_label TEXT,
+    provider_sequence INTEGER NOT NULL DEFAULT 0,
+    source_quality_status TEXT NOT NULL DEFAULT 'usable',
+    primary_provider TEXT,
+    backup_provider TEXT,
+    provider TEXT NOT NULL,
+    lineage_id TEXT,
+    build_batch_id TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(symbol, tick_time, provider, provider_sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_trade_tick_symbol_time
+    ON source.trade_tick_v1(symbol, tick_time);
+CREATE INDEX IF NOT EXISTS idx_source_trade_tick_trade_date
+    ON source.trade_tick_v1(trade_date);
+
+CREATE SCHEMA IF NOT EXISTS decision_t_relay;
+CREATE SCHEMA IF NOT EXISTS research_t_relay;
+
+CREATE TABLE IF NOT EXISTS decision_t_relay.t_board_day1_candidate_v1 (
+    day1_candidate_pk BIGSERIAL PRIMARY KEY,
+    day1_candidate_id TEXT NOT NULL,
+    canonical_symbol TEXT,
+    stock_name TEXT,
+    trade_date DATE,
+    candidate_status TEXT NOT NULL,
+    reject_reason TEXT,
+    is_t_board BOOLEAN,
+    float_market_cap NUMERIC,
+    float_market_cap_pass BOOLEAN,
+    seal_commitment_score NUMERIC,
+    disagreement_absorption_score NUMERIC,
+    fake_seal_trap_risk_score NUMERIC,
+    source_gap_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    run_id TEXT,
+    model_version TEXT NOT NULL,
+    feature_version TEXT,
+    rule_version TEXT,
+    request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result_payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_t_board_day1_candidate_symbol_day
+    ON decision_t_relay.t_board_day1_candidate_v1(canonical_symbol, trade_date);
+CREATE INDEX IF NOT EXISTS idx_t_board_day1_candidate_status
+    ON decision_t_relay.t_board_day1_candidate_v1(candidate_status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS decision_t_relay.t_board_day2_watch_snapshot_v1 (
+    day2_watch_pk BIGSERIAL PRIMARY KEY,
+    day2_watch_snapshot_id TEXT NOT NULL,
+    day1_candidate_id TEXT,
+    canonical_symbol TEXT,
+    day2_trade_date DATE,
+    as_of_time TIMESTAMPTZ,
+    watch_status TEXT NOT NULL,
+    near_limit_flag BOOLEAN,
+    distance_to_up_limit_pct NUMERIC,
+    market_context_status TEXT,
+    dynamic_feature_run_id TEXT,
+    source_gap_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    run_id TEXT,
+    model_version TEXT NOT NULL,
+    feature_version TEXT,
+    request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result_payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_t_board_day2_watch_symbol_day
+    ON decision_t_relay.t_board_day2_watch_snapshot_v1(canonical_symbol, day2_trade_date, as_of_time);
+
+CREATE TABLE IF NOT EXISTS decision_t_relay.t_board_day2_entry_trigger_v1 (
+    entry_trigger_pk BIGSERIAL PRIMARY KEY,
+    entry_trigger_id TEXT NOT NULL,
+    day1_candidate_id TEXT,
+    canonical_symbol TEXT,
+    day2_trade_date DATE,
+    trigger_time TEXT,
+    entry_trigger_status TEXT NOT NULL,
+    not_trigger_reason TEXT,
+    near_limit_flag BOOLEAN,
+    order_consumption_side TEXT,
+    order_consumption_amount NUMERIC,
+    near_limit_order_absorption_score NUMERIC,
+    relay_consensus_score NUMERIC,
+    market_context_status TEXT,
+    dynamic_feature_run_id TEXT,
+    source_gap_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    run_id TEXT,
+    model_version TEXT NOT NULL,
+    feature_version TEXT,
+    request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result_payload JSONB NOT NULL,
+    game_hypothesis_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_t_board_day2_trigger_symbol_day
+    ON decision_t_relay.t_board_day2_entry_trigger_v1(canonical_symbol, day2_trade_date, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_t_board_day2_trigger_status
+    ON decision_t_relay.t_board_day2_entry_trigger_v1(entry_trigger_status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS decision_t_relay.t_board_post_entry_monitor_v1 (
+    post_entry_monitor_pk BIGSERIAL PRIMARY KEY,
+    post_entry_monitor_id TEXT NOT NULL,
+    entry_trigger_id TEXT,
+    canonical_symbol TEXT,
+    day2_trade_date DATE,
+    post_entry_status TEXT NOT NULL,
+    outcome_label TEXT,
+    post_entry_board_opened BOOLEAN,
+    close_on_limit_flag BOOLEAN,
+    control_failure_score NUMERIC,
+    source_gap_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    run_id TEXT,
+    model_version TEXT NOT NULL,
+    feature_version TEXT,
+    request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result_payload JSONB NOT NULL,
+    game_hypothesis_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_t_board_post_entry_symbol_day
+    ON decision_t_relay.t_board_post_entry_monitor_v1(canonical_symbol, day2_trade_date, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS decision_t_relay.t_board_day3_exit_decision_v1 (
+    day3_decision_pk BIGSERIAL PRIMARY KEY,
+    day3_decision_id TEXT NOT NULL,
+    entry_trigger_id TEXT,
+    canonical_symbol TEXT,
+    day3_trade_date DATE,
+    day3_action TEXT NOT NULL,
+    action_reason TEXT,
+    day3_open_limit_up_flag BOOLEAN,
+    tail_limit_up_flag BOOLEAN,
+    source_gap_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    run_id TEXT,
+    model_version TEXT NOT NULL,
+    feature_version TEXT,
+    request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result_payload JSONB NOT NULL,
+    game_hypothesis_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_t_board_day3_exit_symbol_day
+    ON decision_t_relay.t_board_day3_exit_decision_v1(canonical_symbol, day3_trade_date, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS decision_t_relay.t_board_outcome_label_v1 (
+    outcome_label_pk BIGSERIAL PRIMARY KEY,
+    outcome_label_id TEXT NOT NULL,
+    entry_trigger_id TEXT,
+    day1_candidate_id TEXT,
+    canonical_symbol TEXT,
+    day1_trade_date DATE,
+    day2_trade_date DATE,
+    day3_trade_date DATE,
+    outcome_label TEXT NOT NULL,
+    label_reason TEXT,
+    label_version TEXT NOT NULL,
+    source_gap_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    run_id TEXT,
+    model_version TEXT NOT NULL,
+    feature_version TEXT,
+    request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result_payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_t_board_outcome_symbol_day
+    ON decision_t_relay.t_board_outcome_label_v1(canonical_symbol, day2_trade_date, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS decision_t_relay.t_board_game_hypothesis_snapshot_v1 (
+    game_hypothesis_pk BIGSERIAL PRIMARY KEY,
+    game_hypothesis_id TEXT NOT NULL,
+    canonical_symbol TEXT,
+    trade_date DATE,
+    stage TEXT NOT NULL,
+    related_entity_id TEXT,
+    dominant_capital_intent TEXT,
+    game_state_label TEXT,
+    confidence_level TEXT,
+    evidence_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    related_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    run_id TEXT,
+    model_version TEXT NOT NULL,
+    feature_version TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_t_board_game_hypothesis_symbol_day
+    ON decision_t_relay.t_board_game_hypothesis_snapshot_v1(canonical_symbol, trade_date, stage, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS decision_t_relay.t_board_observation_monitor_snapshot_v1 (
+    observation_snapshot_pk BIGSERIAL PRIMARY KEY,
+    observation_snapshot_id TEXT NOT NULL,
+    day1_candidate_id TEXT,
+    entry_trigger_id TEXT,
+    canonical_symbol TEXT,
+    stock_name TEXT,
+    trade_date DATE,
+    day_index INTEGER,
+    as_of_time TIMESTAMPTZ,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    monitor_interval_minutes INTEGER NOT NULL DEFAULT 5,
+    observation_status TEXT NOT NULL,
+    current_stage TEXT,
+    current_conclusion TEXT,
+    key_reason TEXT,
+    risk_tip TEXT,
+    next_observation TEXT,
+    model_score NUMERIC,
+    model_score_label TEXT,
+    score_state TEXT,
+    model_score_version TEXT,
+    relay_strength_label TEXT,
+    day1_trade_date DATE,
+    day2_trade_date DATE,
+    day2_trigger_time TEXT,
+    day3_trade_date DATE,
+    latest_snapshot_time TIMESTAMPTZ,
+    last_monitor_at TEXT,
+    monitoring_summary TEXT,
+    data_gap_count INTEGER NOT NULL DEFAULT 0,
+    data_gap_labels JSONB NOT NULL DEFAULT '[]'::jsonb,
+    warning_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    run_id TEXT,
+    model_version TEXT NOT NULL,
+    score_version TEXT,
+    request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_t_board_observation_monitor_symbol_time
+    ON decision_t_relay.t_board_observation_monitor_snapshot_v1(canonical_symbol, trade_date, as_of_time DESC);
+CREATE INDEX IF NOT EXISTS idx_t_board_observation_monitor_candidate_time
+    ON decision_t_relay.t_board_observation_monitor_snapshot_v1(day1_candidate_id, captured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_t_board_observation_monitor_score
+    ON decision_t_relay.t_board_observation_monitor_snapshot_v1(model_score DESC, captured_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_t_relay.t_board_research_sample_v1 (
+    research_sample_pk BIGSERIAL PRIMARY KEY,
+    sample_id TEXT NOT NULL,
+    canonical_symbol TEXT,
+    trade_date DATE,
+    stage TEXT NOT NULL,
+    sample_status TEXT NOT NULL,
+    source_gap_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    decision_ref JSONB NOT NULL DEFAULT '{}'::jsonb,
+    research_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_t_board_research_sample_symbol_day
+    ON research_t_relay.t_board_research_sample_v1(canonical_symbol, trade_date, stage, created_at DESC);
+
+CREATE SCHEMA IF NOT EXISTS raw_sohu;
+
+CREATE TABLE IF NOT EXISTS raw_sohu.daily_bars_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'sohu',
+    api_name TEXT NOT NULL DEFAULT 'daily_bars',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    symbol TEXT,
+    trade_date DATE NOT NULL,
+    adjustment_mode TEXT,
+    open_price NUMERIC,
+    close_price NUMERIC,
+    high_price NUMERIC,
+    low_price NUMERIC,
+    volume NUMERIC,
+    amount NUMERIC,
+    pct_chg NUMERIC,
+    change_amount NUMERIC,
+    turnover_rate NUMERIC,
+    provider_definition TEXT,
+    raw_row_json JSONB NOT NULL,
+    UNIQUE (symbol, trade_date, adjustment_mode, batch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_raw_sohu_daily_symbol_date
+    ON raw_sohu.daily_bars_v1 (symbol, trade_date, adjustment_mode);
+CREATE INDEX IF NOT EXISTS idx_raw_sohu_daily_request_hash
+    ON raw_sohu.daily_bars_v1 (request_hash);
+
+CREATE SCHEMA IF NOT EXISTS raw_ths;
+CREATE SCHEMA IF NOT EXISTS raw_coingecko;
+CREATE SCHEMA IF NOT EXISTS raw_yahoo;
+CREATE SCHEMA IF NOT EXISTS raw_jin10;
+CREATE SCHEMA IF NOT EXISTS raw_tencent;
+CREATE SCHEMA IF NOT EXISTS raw_eastmoney;
+
+ALTER TABLE IF EXISTS raw_eastmoney.quote_snapshot_v1 ADD COLUMN IF NOT EXISTS request_hash TEXT;
+ALTER TABLE IF EXISTS raw_eastmoney.daily_bars_v1 ADD COLUMN IF NOT EXISTS request_hash TEXT;
+ALTER TABLE IF EXISTS raw_eastmoney.minute_bars_v1 ADD COLUMN IF NOT EXISTS request_hash TEXT;
+ALTER TABLE IF EXISTS raw_tencent.auction_snapshot_v1 ADD COLUMN IF NOT EXISTS request_hash TEXT;
+ALTER TABLE IF EXISTS raw_tencent.daily_bars_v1 ADD COLUMN IF NOT EXISTS request_hash TEXT;
+ALTER TABLE IF EXISTS raw_sina.auction_snapshot_v1 ADD COLUMN IF NOT EXISTS request_hash TEXT;
+
+CREATE TABLE IF NOT EXISTS raw_eastmoney.stock_universe_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'eastmoney',
+    api_name TEXT NOT NULL DEFAULT 'stock_universe',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    symbol TEXT,
+    code TEXT,
+    name TEXT,
+    stock_name TEXT,
+    secid TEXT,
+    provider_symbol TEXT,
+    provider_market TEXT,
+    exchange TEXT,
+    board TEXT,
+    segment_name TEXT,
+    trade_date DATE,
+    list_date DATE,
+    ipo_date DATE,
+    list_status TEXT,
+    delist_date DATE,
+    rank_no INTEGER,
+    provider_definition TEXT,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_eastmoney.auction_snapshot_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'eastmoney',
+    api_name TEXT NOT NULL DEFAULT 'auction_snapshot',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    symbol TEXT,
+    trade_date DATE,
+    event_time TIMESTAMPTZ,
+    secid TEXT,
+    provider_symbol TEXT,
+    provider_market TEXT,
+    price NUMERIC,
+    volume NUMERIC,
+    amount NUMERIC,
+    prev_close_price NUMERIC,
+    best_bid_price NUMERIC,
+    best_bid_volume NUMERIC,
+    best_ask_price NUMERIC,
+    best_ask_volume NUMERIC,
+    provider_definition TEXT,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_tencent.quote_snapshot_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'tencent',
+    api_name TEXT NOT NULL DEFAULT 'quote_snapshot',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    symbol TEXT,
+    trade_date DATE,
+    event_time TIMESTAMPTZ,
+    provider_code TEXT,
+    name TEXT,
+    last_price NUMERIC,
+    open_price NUMERIC,
+    high_price NUMERIC,
+    low_price NUMERIC,
+    prev_close_price NUMERIC,
+    volume NUMERIC,
+    amount NUMERIC,
+    turnover_rate NUMERIC,
+    change_amount NUMERIC,
+    change_pct NUMERIC,
+    response_field_count INTEGER,
+    raw_text TEXT,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_tencent.minute_bars_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'tencent',
+    api_name TEXT NOT NULL DEFAULT 'minute_bars',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    symbol TEXT,
+    trade_date DATE,
+    bar_time TIMESTAMPTZ,
+    event_time TIMESTAMPTZ,
+    provider_code TEXT,
+    open NUMERIC,
+    high NUMERIC,
+    low NUMERIC,
+    close NUMERIC,
+    volume NUMERIC,
+    amount NUMERIC,
+    provider_native_amount NUMERIC,
+    provider_definition TEXT,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_eastmoney.northbound_summary_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'eastmoney',
+    api_name TEXT NOT NULL DEFAULT 'northbound_summary',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    trade_date DATE,
+    mutual_type TEXT,
+    deal_amount NUMERIC,
+    net_buy_amount NUMERIC,
+    buy_amount NUMERIC,
+    sell_amount NUMERIC,
+    quota_balance_text TEXT,
+    raw_provider_row JSONB,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_eastmoney.lpr_rates_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'eastmoney',
+    api_name TEXT NOT NULL DEFAULT 'lpr_rates',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    asset_code TEXT,
+    asset_name TEXT,
+    trade_date DATE,
+    last_price NUMERIC,
+    rate_1y NUMERIC,
+    rate_5y NUMERIC,
+    extra_metrics_json JSONB,
+    raw_provider_row JSONB,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_ths.limit_up_pool_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'ths',
+    api_name TEXT NOT NULL DEFAULT 'limit_up_pool',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    symbol TEXT,
+    trade_date DATE,
+    code TEXT,
+    provider_market TEXT,
+    name TEXT,
+    rank_no INTEGER,
+    latest_price NUMERIC,
+    change_pct NUMERIC,
+    turnover_rate NUMERIC,
+    limit_up_type TEXT,
+    reason_type TEXT,
+    first_limit_up_time TIMESTAMPTZ,
+    last_limit_up_time TIMESTAMPTZ,
+    limit_open_count NUMERIC,
+    order_volume NUMERIC,
+    order_amount NUMERIC,
+    float_market_cap NUMERIC,
+    total_market_cap NUMERIC,
+    is_again_limit BOOLEAN,
+    is_new BOOLEAN,
+    high_days TEXT,
+    high_days_value NUMERIC,
+    limit_up_stage NUMERIC,
+    close_on_limit_flag BOOLEAN,
+    is_one_word_board BOOLEAN,
+    is_break_limit BOOLEAN,
+    limit_event_type TEXT,
+    raw_row_json JSONB NOT NULL,
+    UNIQUE (symbol, trade_date, limit_event_type, batch_id)
+);
+
+CREATE TABLE IF NOT EXISTS raw_ths.trade_status_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'ths',
+    api_name TEXT NOT NULL DEFAULT 'trade_status',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    trade_date DATE,
+    endpoint TEXT,
+    payload_status TEXT,
+    payload_json JSONB,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_ths.zhangting5_reasons_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'ths',
+    api_name TEXT NOT NULL DEFAULT 'zhangting5_reasons',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    symbol TEXT,
+    trade_date DATE,
+    code TEXT,
+    provider_market TEXT,
+    name TEXT,
+    rank_no INTEGER,
+    reason_title TEXT,
+    reason_summary TEXT,
+    published_at_text TEXT,
+    event_type TEXT,
+    url TEXT,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_ths.market_state_overview_v1 (LIKE raw_ths.trade_status_v1 INCLUDING ALL);
+ALTER TABLE IF EXISTS raw_ths.market_state_overview_v1 ALTER COLUMN api_name SET DEFAULT 'market_state_overview';
+
+CREATE TABLE IF NOT EXISTS raw_ths.market_capital_v1 (LIKE raw_ths.trade_status_v1 INCLUDING ALL);
+ALTER TABLE IF EXISTS raw_ths.market_capital_v1 ALTER COLUMN api_name SET DEFAULT 'market_capital';
+
+CREATE TABLE IF NOT EXISTS raw_ths.wind_vane_stock_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'ths',
+    api_name TEXT NOT NULL DEFAULT 'wind_vane_stock',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    symbol TEXT,
+    trade_date DATE,
+    code TEXT,
+    tab_name TEXT,
+    rank_no INTEGER,
+    name TEXT,
+    price NUMERIC,
+    change_pct NUMERIC,
+    reason TEXT,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_ths.hot_block_list_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'ths',
+    api_name TEXT NOT NULL DEFAULT 'hot_block_list',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    trade_date DATE,
+    block_code TEXT,
+    block_name TEXT,
+    block_type TEXT,
+    provider_market TEXT,
+    rank_no INTEGER,
+    change_pct NUMERIC,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_ths.stock_concepts_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'ths',
+    api_name TEXT NOT NULL DEFAULT 'stock_concepts',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    symbol TEXT,
+    code TEXT,
+    concept_id TEXT,
+    concept_name TEXT,
+    rank_no INTEGER,
+    provider_market TEXT,
+    concept_explain TEXT,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_ths.stock_focusday_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'ths',
+    api_name TEXT NOT NULL DEFAULT 'stock_focusday',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    symbol TEXT,
+    code TEXT,
+    rank NUMERIC,
+    total NUMERIC,
+    description TEXT,
+    payload_json JSONB,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_coingecko.simple_price_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'coingecko',
+    api_name TEXT NOT NULL DEFAULT 'simple_price',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    asset_id TEXT,
+    asset_code TEXT,
+    asset_name TEXT,
+    asset_class TEXT,
+    quote_currency TEXT,
+    last_price NUMERIC,
+    change_pct_24h NUMERIC,
+    market_cap NUMERIC,
+    volume_24h NUMERIC,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_coingecko.global_market_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'coingecko',
+    api_name TEXT NOT NULL DEFAULT 'global_market',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    metric_code TEXT,
+    asset_code TEXT,
+    asset_class TEXT,
+    quote_currency TEXT,
+    last_price NUMERIC,
+    market_cap NUMERIC,
+    volume_24h NUMERIC,
+    change_pct_24h NUMERIC,
+    dominance_pct NUMERIC,
+    updated_at TEXT,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_yahoo.chart_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'yahoo',
+    api_name TEXT NOT NULL DEFAULT 'chart',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    provider_symbol TEXT,
+    asset_code TEXT,
+    asset_name TEXT,
+    asset_class TEXT,
+    quote_currency TEXT,
+    observed_at TIMESTAMPTZ,
+    last_price NUMERIC,
+    change_pct NUMERIC,
+    previous_close NUMERIC,
+    exchange_name TEXT,
+    market_state TEXT,
+    instrument_type TEXT,
+    raw_row_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_jin10.public_flash_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'jin10',
+    api_name TEXT NOT NULL DEFAULT 'public_flash',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    provider_news_id TEXT,
+    symbol TEXT,
+    title TEXT NOT NULL,
+    body TEXT,
+    source_name TEXT,
+    published_at TIMESTAMPTZ,
+    event_type TEXT,
+    url TEXT,
+    tags_json JSONB,
+    stock_refs_json JSONB,
+    raw_row_json JSONB NOT NULL,
+    UNIQUE (provider_news_id, batch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_raw_ths_limit_up_symbol_date ON raw_ths.limit_up_pool_v1 (symbol, trade_date, limit_event_type);
+CREATE INDEX IF NOT EXISTS idx_raw_ths_limit_up_request_hash ON raw_ths.limit_up_pool_v1 (request_hash);
+CREATE INDEX IF NOT EXISTS idx_raw_ths_zt5_symbol ON raw_ths.zhangting5_reasons_v1 (symbol, trade_date);
+CREATE INDEX IF NOT EXISTS idx_raw_eastmoney_stock_universe_symbol ON raw_eastmoney.stock_universe_v1 (symbol, trade_date);
+CREATE INDEX IF NOT EXISTS idx_raw_eastmoney_stock_universe_request_hash ON raw_eastmoney.stock_universe_v1 (request_hash);
+CREATE INDEX IF NOT EXISTS idx_raw_eastmoney_auction_symbol_time ON raw_eastmoney.auction_snapshot_v1 (symbol, event_time);
+CREATE INDEX IF NOT EXISTS idx_raw_eastmoney_auction_request_hash ON raw_eastmoney.auction_snapshot_v1 (request_hash);
+CREATE INDEX IF NOT EXISTS idx_raw_tencent_quote_symbol_time ON raw_tencent.quote_snapshot_v1 (symbol, event_time);
+CREATE INDEX IF NOT EXISTS idx_raw_tencent_quote_request_hash ON raw_tencent.quote_snapshot_v1 (request_hash);
+CREATE INDEX IF NOT EXISTS idx_raw_tencent_minute_symbol_time ON raw_tencent.minute_bars_v1 (symbol, bar_time);
+CREATE INDEX IF NOT EXISTS idx_raw_tencent_minute_request_hash ON raw_tencent.minute_bars_v1 (request_hash);
+CREATE INDEX IF NOT EXISTS idx_raw_eastmoney_northbound_date ON raw_eastmoney.northbound_summary_v1 (trade_date);
+CREATE INDEX IF NOT EXISTS idx_raw_eastmoney_lpr_date ON raw_eastmoney.lpr_rates_v1 (trade_date, asset_code);
+CREATE INDEX IF NOT EXISTS idx_raw_coingecko_asset ON raw_coingecko.simple_price_v1 (asset_code, captured_at);
+CREATE INDEX IF NOT EXISTS idx_raw_yahoo_asset ON raw_yahoo.chart_v1 (asset_code, observed_at);
+CREATE INDEX IF NOT EXISTS idx_raw_jin10_news_time ON raw_jin10.public_flash_v1 (published_at);
+CREATE INDEX IF NOT EXISTS idx_raw_jin10_news_request_hash ON raw_jin10.public_flash_v1 (request_hash);
+
+CREATE SCHEMA IF NOT EXISTS research_ambush;
+
+CREATE TABLE IF NOT EXISTS research_ambush.ambush_valley_chart_case_v1 (
+    chart_case_id TEXT PRIMARY KEY,
+    canonical_symbol TEXT NOT NULL,
+    stock_name TEXT,
+    case_trade_date DATE NOT NULL,
+    case_source TEXT NOT NULL,
+    case_status TEXT NOT NULL DEFAULT 'pending_labeling',
+    label_mode_allowed TEXT NOT NULL DEFAULT 'both',
+    as_of_date DATE,
+    valley_low_date DATE,
+    turn_anchor_date DATE,
+    source_data_version TEXT,
+    model_version TEXT,
+    feature_version TEXT,
+    source_gap_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    dynamic_gap_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    daily_bar_payload JSONB NOT NULL DEFAULT '[]'::jsonb,
+    weekly_bar_payload JSONB NOT NULL DEFAULT '[]'::jsonb,
+    automatic_feature_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    decision_ref JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_by TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_ambush_valley_chart_case_status_v1 CHECK (
+        case_status IN ('pending_labeling','labeled','review_required','approved','archived','data_blocked')
+    ),
+    CONSTRAINT ck_ambush_valley_chart_label_mode_allowed_v1 CHECK (
+        label_mode_allowed IN ('as_of','outcome_review','both')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_ambush_valley_chart_case_symbol_day_v1
+    ON research_ambush.ambush_valley_chart_case_v1(canonical_symbol, case_trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_ambush_valley_chart_case_status_v1
+    ON research_ambush.ambush_valley_chart_case_v1(case_status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_ambush.ambush_valley_manual_label_v1 (
+    manual_label_id TEXT PRIMARY KEY,
+    chart_case_id TEXT NOT NULL REFERENCES research_ambush.ambush_valley_chart_case_v1(chart_case_id) ON DELETE CASCADE,
+    labeler_id TEXT NOT NULL,
+    labeler_role TEXT,
+    label_mode TEXT NOT NULL,
+    valley_structure_label TEXT,
+    turn_timing_label TEXT,
+    sample_role_label TEXT,
+    outcome_label TEXT,
+    manual_label_confidence TEXT NOT NULL DEFAULT 'medium',
+    manual_label_note TEXT,
+    visible_feature_boundary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    label_version TEXT NOT NULL DEFAULT 'ambush_valley_manual_label_v1',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_ambush_valley_manual_label_mode_v1 CHECK (label_mode IN ('as_of','outcome_review')),
+    CONSTRAINT ck_ambush_valley_manual_confidence_v1 CHECK (manual_label_confidence IN ('high','medium','low')),
+    CONSTRAINT ck_ambush_valley_manual_as_of_no_outcome_v1 CHECK (
+        label_mode <> 'as_of' OR outcome_label IS NULL
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_ambush_valley_manual_label_case_v1
+    ON research_ambush.ambush_valley_manual_label_v1(chart_case_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ambush_valley_manual_label_mode_v1
+    ON research_ambush.ambush_valley_manual_label_v1(label_mode, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_ambush.ambush_valley_manual_label_tag_v1 (
+    manual_label_tag_id TEXT PRIMARY KEY,
+    manual_label_id TEXT NOT NULL REFERENCES research_ambush.ambush_valley_manual_label_v1(manual_label_id) ON DELETE CASCADE,
+    tag_group TEXT NOT NULL,
+    tag_code TEXT NOT NULL,
+    tag_value TEXT NOT NULL DEFAULT 'true',
+    tag_note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ambush_valley_manual_label_tag_label_v1
+    ON research_ambush.ambush_valley_manual_label_tag_v1(manual_label_id, tag_group, tag_code);
+
+CREATE TABLE IF NOT EXISTS research_ambush.ambush_valley_label_taxonomy_v1 (
+    taxonomy_id TEXT PRIMARY KEY,
+    tag_group TEXT NOT NULL,
+    tag_code TEXT NOT NULL,
+    tag_name TEXT NOT NULL,
+    tag_description TEXT,
+    allowed_label_mode TEXT NOT NULL DEFAULT 'both',
+    is_positive_signal BOOLEAN NOT NULL DEFAULT false,
+    is_negative_signal BOOLEAN NOT NULL DEFAULT false,
+    is_hard_negative_signal BOOLEAN NOT NULL DEFAULT false,
+    is_training_eligible BOOLEAN NOT NULL DEFAULT false,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    display_order INTEGER NOT NULL DEFAULT 100,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_ambush_valley_label_taxonomy_code_v1 UNIQUE(tag_group, tag_code),
+    CONSTRAINT ck_ambush_valley_label_taxonomy_mode_v1 CHECK (allowed_label_mode IN ('as_of','outcome_review','both'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ambush_valley_label_taxonomy_enabled_v1
+    ON research_ambush.ambush_valley_label_taxonomy_v1(enabled, display_order, tag_group);
+
+CREATE TABLE IF NOT EXISTS research_ambush.ambush_valley_label_review_v1 (
+    review_id TEXT PRIMARY KEY,
+    chart_case_id TEXT NOT NULL REFERENCES research_ambush.ambush_valley_chart_case_v1(chart_case_id) ON DELETE CASCADE,
+    manual_label_id TEXT REFERENCES research_ambush.ambush_valley_manual_label_v1(manual_label_id) ON DELETE SET NULL,
+    reviewer_id TEXT NOT NULL,
+    review_status TEXT NOT NULL,
+    review_comment TEXT,
+    final_sample_role_label TEXT,
+    final_outcome_label TEXT,
+    final_label_confidence TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_ambush_valley_label_review_status_v1 CHECK (review_status IN ('approved','rejected','needs_discussion')),
+    CONSTRAINT ck_ambush_valley_label_review_confidence_v1 CHECK (
+        final_label_confidence IS NULL OR final_label_confidence IN ('high','medium','low')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_ambush_valley_label_review_case_v1
+    ON research_ambush.ambush_valley_label_review_v1(chart_case_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_ambush.ambush_valley_pattern_library_member_v1 (
+    library_member_id TEXT PRIMARY KEY,
+    chart_case_id TEXT NOT NULL REFERENCES research_ambush.ambush_valley_chart_case_v1(chart_case_id) ON DELETE CASCADE,
+    manual_label_id TEXT REFERENCES research_ambush.ambush_valley_manual_label_v1(manual_label_id) ON DELETE SET NULL,
+    library_role TEXT NOT NULL,
+    pattern_family TEXT,
+    training_split TEXT NOT NULL DEFAULT 'review_only',
+    approved_by TEXT,
+    approved_at TIMESTAMPTZ,
+    shape_signature_id TEXT,
+    feature_snapshot_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_ambush_valley_library_role_v1 CHECK (
+        library_role IN ('positive_prototype','hard_negative','missed_opportunity','control','research_only')
+    ),
+    CONSTRAINT ck_ambush_valley_training_split_v1 CHECK (
+        training_split IN ('train','validation','test','review_only')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_ambush_valley_library_member_case_v1
+    ON research_ambush.ambush_valley_pattern_library_member_v1(chart_case_id, library_role);
+
+INSERT INTO research_ambush.ambush_valley_label_taxonomy_v1 (
+    taxonomy_id, tag_group, tag_code, tag_name, tag_description,
+    allowed_label_mode, is_positive_signal, is_negative_signal,
+    is_hard_negative_signal, is_training_eligible, display_order
+) VALUES
+    ('taxonomy:structure:mature_valley', 'structure', 'MATURE_VALLEY', '低谷成熟', '回撤、缩量和支撑状态已经具备低谷样本价值。', 'both', true, false, false, true, 10),
+    ('taxonomy:structure:immature_valley', 'structure', 'IMMATURE_VALLEY', '低谷未成熟', '下跌或整理仍未充分，暂不适合进入正样本库。', 'both', false, true, false, false, 20),
+    ('taxonomy:support:support_intact', 'support', 'SUPPORT_INTACT', '支撑未破', '关键低点或箱体支撑保持有效。', 'as_of', true, false, false, true, 30),
+    ('taxonomy:support:support_broken', 'support', 'SUPPORT_BROKEN', '支撑破坏', '关键支撑被有效跌破，需要进入风险或负样本观察。', 'both', false, true, true, true, 40),
+    ('taxonomy:compression:box_compression', 'compression', 'BOX_COMPRESSION', '横盘压缩', '低点后进入窄幅横盘压缩，具备后续重启研究价值。', 'both', true, false, false, true, 50),
+    ('taxonomy:turn:day1_day2_turn', 'turn', 'DAY1_DAY2_TURN', '刚抬头', '低谷后的第一天或第二天出现有效抬头。', 'as_of', true, false, false, true, 60),
+    ('taxonomy:turn:late_rebound', 'turn', 'LATE_REBOUND', '抬头偏晚', '低点后已经反弹多日，不能冒充刚抬头。', 'both', false, true, false, false, 70),
+    ('taxonomy:risk:false_rebound', 'risk', 'FALSE_REBOUND', '假反弹', '形态像抬头但后续承接不足或回落明显。', 'outcome_review', false, true, true, true, 80),
+    ('taxonomy:risk:hard_negative', 'risk', 'HARD_NEGATIVE', '硬负样本', '数值或形态接近正样本但结果失败，需要单独沉淀。', 'outcome_review', false, true, true, true, 90),
+    ('taxonomy:entry:entry_window_clear', 'entry', 'ENTRY_WINDOW_CLEAR', '买点窗口清晰', '存在可解释且可交易的观察窗口。', 'outcome_review', true, false, false, true, 100),
+    ('taxonomy:entry:price_success_untradable', 'entry', 'PRICE_SUCCESS_UNTRADABLE', '涨了但不好买', '价格结果成功，但可交易窗口不足。', 'outcome_review', false, true, false, true, 110)
+ON CONFLICT (tag_group, tag_code) DO UPDATE SET
+    tag_name = EXCLUDED.tag_name,
+    tag_description = EXCLUDED.tag_description,
+    allowed_label_mode = EXCLUDED.allowed_label_mode,
+    is_positive_signal = EXCLUDED.is_positive_signal,
+    is_negative_signal = EXCLUDED.is_negative_signal,
+    is_hard_negative_signal = EXCLUDED.is_hard_negative_signal,
+    is_training_eligible = EXCLUDED.is_training_eligible,
+    enabled = true,
+    display_order = EXCLUDED.display_order;
+
+-- 0025_source_data_foundation_indexes_v1.sql
+-- First-launch source foundation read-path indexes. These indexes do not
+-- change source facts, provider contracts, model scores, release gates or
+-- scheduler behavior.
+
+ALTER TABLE source.trade_calendar_v1 ADD COLUMN IF NOT EXISTS calendar_date DATE;
+ALTER TABLE source.trade_calendar_v1 ADD COLUMN IF NOT EXISTS is_trading_day BOOLEAN;
+ALTER TABLE source.trade_calendar_v1 ADD COLUMN IF NOT EXISTS exchange TEXT DEFAULT 'SSE_SZSE';
+ALTER TABLE source.trade_calendar_v1 ADD COLUMN IF NOT EXISTS pretrade_date DATE;
+ALTER TABLE source.trade_calendar_v1 ADD COLUMN IF NOT EXISTS source_quality_status TEXT NOT NULL DEFAULT 'usable';
+ALTER TABLE source.trade_calendar_v1 ADD COLUMN IF NOT EXISTS primary_provider TEXT;
+ALTER TABLE source.trade_calendar_v1 ADD COLUMN IF NOT EXISTS backup_provider TEXT;
+ALTER TABLE source.trade_calendar_v1 ADD COLUMN IF NOT EXISTS lineage_id TEXT;
+ALTER TABLE source.trade_calendar_v1 ADD COLUMN IF NOT EXISTS build_batch_id TEXT;
+ALTER TABLE source.trade_calendar_v1 ADD COLUMN IF NOT EXISTS captured_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE source.trade_calendar_v1 ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+CREATE INDEX IF NOT EXISTS idx_source_trade_calendar_open_pretrade_v1
+    ON source.trade_calendar_v1 (is_trading_day, calendar_date, pretrade_date);
+CREATE INDEX IF NOT EXISTS idx_source_stock_master_exchange_status_v1
+    ON source.stock_master_v1 (exchange, list_status, symbol);
+CREATE INDEX IF NOT EXISTS idx_source_stock_master_provider_symbol_v1
+    ON source.stock_master_v1 (provider_symbol)
+    WHERE provider_symbol IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_source_stock_universe_symbol_day_v1
+    ON source.stock_universe_daily_v1 (symbol, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_source_stock_universe_day_status_v1
+    ON source.stock_universe_daily_v1 (trade_date, is_tradable, trade_status, symbol);
+CREATE INDEX IF NOT EXISTS idx_source_daily_bar_day_quality_v1
+    ON source.daily_bar_v1 (trade_date, source_quality_status, symbol);
+CREATE INDEX IF NOT EXISTS idx_source_daily_bar_available_v1
+    ON source.daily_bar_v1 (available_at DESC, trade_date, symbol);
+CREATE INDEX IF NOT EXISTS idx_source_adjusted_daily_day_quality_v1
+    ON source.adjusted_daily_bar_v1 (trade_date, adjustment_mode, source_quality_status, symbol);
+CREATE INDEX IF NOT EXISTS idx_source_trade_status_day_flags_v1
+    ON source.trade_status_v1 (trade_date, is_tradable, is_suspended, is_st, symbol);
+CREATE INDEX IF NOT EXISTS idx_source_limit_price_day_quality_v1
+    ON source.limit_price_v1 (trade_date, source_quality_status, symbol);
+CREATE INDEX IF NOT EXISTS idx_source_limit_event_day_type_close_v1
+    ON source.limit_event_v1 (trade_date, limit_event_type, close_on_limit_flag, symbol);
+CREATE INDEX IF NOT EXISTS idx_source_limit_event_symbol_day_v1
+    ON source.limit_event_v1 (symbol, trade_date DESC, limit_event_type);
+CREATE INDEX IF NOT EXISTS idx_source_realtime_quote_symbol_day_time_v1
+    ON source.realtime_quote_v1 (symbol, trade_date, event_time DESC)
+    WHERE trade_date IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_source_minute_bar_symbol_time_latest_v1
+    ON source.minute_bar_v1 (symbol, bar_time DESC);
+CREATE INDEX IF NOT EXISTS idx_source_trade_tick_symbol_day_time_v1
+    ON source.trade_tick_v1 (symbol, trade_date, tick_time DESC);
+CREATE INDEX IF NOT EXISTS idx_source_moneyflow_day_quality_v1
+    ON source.stock_moneyflow_daily_v1 (trade_date, source_quality_status, symbol);
+CREATE INDEX IF NOT EXISTS idx_source_event_news_symbol_available_v1
+    ON source.event_news_v1 (symbol, available_at DESC)
+    WHERE symbol IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_source_event_news_type_time_v1
+    ON source.event_news_v1 (event_type, published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_source_lineage_duplicate_audit_v1
+    ON governance.source_lineage_v1 (
+        source_table_name,
+        source_pk,
+        canonical_field_name,
+        provider,
+        api_name,
+        raw_table_name,
+        raw_id
+    );
+CREATE INDEX IF NOT EXISTS idx_source_lineage_build_batch_v1
+    ON governance.source_lineage_v1 (build_batch_id, source_table_name)
+    WHERE build_batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_raw_fetch_job_release_due_v1
+    ON governance.raw_fetch_job_item_v1 (queue_name, status, priority, created_at)
+    WHERE queue_name = 'urgent_release_gate_queue';
+CREATE INDEX IF NOT EXISTS idx_source_build_trigger_symbol_day_v1
+    ON governance.source_build_trigger_v1 (source_table_name, symbol, trade_date, status);
+CREATE INDEX IF NOT EXISTS idx_source_canonical_write_symbol_day_v1
+    ON governance.source_canonical_write_audit_v1 (source_table_name, symbol, trade_date, created_at DESC);
+
+COMMENT ON INDEX source.idx_source_trade_calendar_open_pretrade_v1 IS
+'First-launch P0 calendar path for scheduler materialization, T+N labels and previous-trading-day lookup.';
+COMMENT ON INDEX source.idx_source_limit_event_day_type_close_v1 IS
+'Candidate-page and T-board relay day scan path for close-on-limit limit_up/t_board_limit_up events.';
+COMMENT ON INDEX governance.idx_source_lineage_duplicate_audit_v1 IS
+'Data-inspector source_lineage duplicate audit path; preserves append-only lineage while making duplicate observation cheap.';
+
+CREATE TABLE IF NOT EXISTS governance.research_model_payload_assembly_audit_v1 (
+    assembly_id TEXT PRIMARY KEY,
+    task_code TEXT NOT NULL,
+    owner_service TEXT NOT NULL,
+    model_code TEXT NOT NULL,
+    model_phase TEXT,
+    symbol TEXT,
+    trade_date DATE NOT NULL,
+    payload_assembly_contract TEXT NOT NULL DEFAULT 'research_model_payload_assembler_v1',
+    payload_assembly_status TEXT NOT NULL,
+    gap_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    source_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    upstream_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    payload_hash TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_research_payload_assembly_contract_v1 CHECK (
+        payload_assembly_contract = 'research_model_payload_assembler_v1'
+    ),
+    CONSTRAINT ck_research_payload_assembly_status_v1 CHECK (
+        payload_assembly_status IN ('assembled_research_payload', 'blocked_data_gap')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_payload_assembly_task_day_v1
+    ON governance.research_model_payload_assembly_audit_v1 (task_code, trade_date DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_research_payload_assembly_symbol_day_v1
+    ON governance.research_model_payload_assembly_audit_v1 (symbol, trade_date DESC, created_at DESC)
+    WHERE symbol IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_research_payload_assembly_status_v1
+    ON governance.research_model_payload_assembly_audit_v1 (payload_assembly_status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_research_payload_assembly_hash_v1
+    ON governance.research_model_payload_assembly_audit_v1 (payload_hash);
+
+COMMENT ON TABLE governance.research_model_payload_assembly_audit_v1 IS
+'Append-only audit for research-service model owner payload assembly; not a model fact or source fact table.';
+COMMENT ON COLUMN governance.research_model_payload_assembly_audit_v1.payload IS
+'Assembled owner business payload or blocked gap payload. Must not contain raw provider rows or sample payload substitutions.';
+
+ALTER TABLE IF EXISTS decision_memory.memory_entity_v1
+    ALTER COLUMN memory_age_days DROP NOT NULL,
+    ALTER COLUMN memory_age_days DROP DEFAULT;
+
+CREATE TABLE IF NOT EXISTS governance.research_model_execution_audit_v1 (
+    execution_id TEXT PRIMARY KEY,
+    assembly_id TEXT,
+    task_code TEXT NOT NULL,
+    owner_service TEXT NOT NULL,
+    model_code TEXT NOT NULL,
+    model_phase TEXT,
+    symbol TEXT,
+    trade_date DATE NOT NULL,
+    run_id TEXT NOT NULL,
+    execution_contract TEXT NOT NULL DEFAULT 'research_model_execution_v1',
+    payload_hash TEXT,
+    owner_endpoint TEXT,
+    owner_status_code INTEGER,
+    execution_status TEXT NOT NULL,
+    accepted BOOLEAN NOT NULL DEFAULT false,
+    dispatch_allowed BOOLEAN NOT NULL DEFAULT false,
+    owner_called BOOLEAN NOT NULL DEFAULT false,
+    materialization_attempted BOOLEAN NOT NULL DEFAULT false,
+    gap_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    error_code TEXT,
+    error_message TEXT,
+    owner_request JSONB NOT NULL DEFAULT '{}'::jsonb,
+    owner_response JSONB NOT NULL DEFAULT '{}'::jsonb,
+    materialized_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_research_model_execution_contract_v1 CHECK (
+        execution_contract = 'research_model_execution_v1'
+    ),
+    CONSTRAINT ck_research_model_execution_status_v1 CHECK (
+        execution_status IN (
+            'blocked_data_gap',
+            'owner_failed',
+            'materialization_failed',
+            'materialized',
+            'materialized_with_gaps',
+            'materialization_skipped'
+        )
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_model_execution_task_day_v1
+    ON governance.research_model_execution_audit_v1 (task_code, trade_date DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_research_model_execution_owner_status_v1
+    ON governance.research_model_execution_audit_v1 (owner_service, execution_status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_research_model_execution_symbol_day_v1
+    ON governance.research_model_execution_audit_v1 (symbol, trade_date DESC, created_at DESC)
+    WHERE symbol IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_research_model_execution_payload_hash_v1
+    ON governance.research_model_execution_audit_v1 (payload_hash)
+    WHERE payload_hash IS NOT NULL;
+
+COMMENT ON TABLE governance.research_model_execution_audit_v1 IS
+'Append-only audit for research-service owner execution and materialization; score computation remains in model owner services.';
+COMMENT ON COLUMN governance.research_model_execution_audit_v1.materialized_counts IS
+'Decision/source table write counts by table name plus materializer gap codes when present.';
+
+CREATE TABLE IF NOT EXISTS governance.ths_paid_probability_cookie_v1 (
+    credential_id BIGSERIAL PRIMARY KEY,
+    credential_version TEXT NOT NULL UNIQUE,
+    user_cookie TEXT NOT NULL,
+    userid_cookie TEXT NOT NULL,
+    user_masked TEXT NOT NULL,
+    userid_masked TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending_probe',
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    updated_by TEXT,
+    last_checked_at TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    last_failure_at TIMESTAMPTZ,
+    failure_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_ths_paid_probability_cookie_status_v1 CHECK (
+        status IN ('pending_probe','valid','expired','invalid')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_ths_paid_probability_cookie_active_v1
+    ON governance.ths_paid_probability_cookie_v1 (is_active, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS raw_ths.paid_limit_up_probability_v1 (
+    raw_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'ths',
+    api_name TEXT NOT NULL DEFAULT 'paid_limit_up_probability',
+    request_params_json JSONB NOT NULL,
+    request_hash TEXT,
+    response_schema_hash TEXT,
+    response_row_hash TEXT,
+    batch_id TEXT,
+    biz_key TEXT,
+    trade_date DATE NOT NULL,
+    code TEXT,
+    stock_code TEXT,
+    symbol TEXT NOT NULL,
+    paid_limit_up_probability NUMERIC(12,6),
+    status_code INTEGER,
+    status_msg TEXT,
+    credential_version TEXT,
+    endpoint TEXT,
+    available_at TIMESTAMPTZ,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    raw_provider_row JSONB NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT ck_raw_ths_paid_probability_range_v1 CHECK (
+        paid_limit_up_probability IS NULL
+        OR (paid_limit_up_probability >= 0 AND paid_limit_up_probability <= 100)
+    ),
+    CONSTRAINT ck_raw_ths_paid_probability_no_cookie_params_v1 CHECK (
+        NOT (
+            request_params_json ? 'user'
+            OR request_params_json ? 'userid'
+            OR request_params_json ? 'cookie'
+            OR request_params_json ? 'cookies'
+        )
+    ),
+    CONSTRAINT ck_raw_ths_paid_probability_no_cookie_payload_v1 CHECK (
+        NOT (
+            raw_provider_row ? 'user'
+            OR raw_provider_row ? 'userid'
+            OR raw_provider_row ? 'cookie'
+            OR raw_provider_row ? 'cookies'
+        )
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_ths_paid_probability_response_hash_v1
+    ON raw_ths.paid_limit_up_probability_v1 (request_hash, response_row_hash)
+    WHERE request_hash IS NOT NULL AND response_row_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_raw_ths_paid_probability_symbol_day_v1
+    ON raw_ths.paid_limit_up_probability_v1 (symbol, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_raw_ths_paid_probability_request_hash_v1
+    ON raw_ths.paid_limit_up_probability_v1 (request_hash);
+
+CREATE TABLE IF NOT EXISTS source.ths_paid_limit_up_probability_v1 (
+    symbol TEXT NOT NULL,
+    trade_date DATE NOT NULL,
+    paid_limit_up_probability NUMERIC(12,6) NOT NULL,
+    source_quality_status TEXT NOT NULL DEFAULT 'usable',
+    primary_provider TEXT NOT NULL DEFAULT 'ths',
+    build_batch_id TEXT,
+    captured_at TIMESTAMPTZ,
+    available_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_ths_paid_limit_up_probability_v1 PRIMARY KEY (symbol, trade_date),
+    CONSTRAINT ck_ths_paid_limit_up_probability_range_v1 CHECK (
+        paid_limit_up_probability >= 0 AND paid_limit_up_probability <= 100
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_ths_paid_probability_day_quality_v1
+    ON source.ths_paid_limit_up_probability_v1 (trade_date DESC, source_quality_status, symbol);
+
+CREATE TABLE IF NOT EXISTS governance.ths_paid_probability_batch_status_v1 (
+    trade_date DATE PRIMARY KEY,
+    status TEXT NOT NULL,
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    fetched_count INTEGER NOT NULL DEFAULT 0,
+    missing_symbols JSONB NOT NULL DEFAULT '[]'::jsonb,
+    deadline_at TIMESTAMPTZ,
+    next_trade_date DATE,
+    cookie_status TEXT NOT NULL DEFAULT 'missing',
+    message TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_ths_paid_probability_batch_status_v1 CHECK (
+        status IN (
+            'no_candidates',
+            'pending_cookie',
+            'fetching',
+            'partial',
+            'ready',
+            'cookie_expired',
+            'abandoned_no_probability_before_deadline'
+        )
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_ths_paid_probability_batch_status_updated_v1
+    ON governance.ths_paid_probability_batch_status_v1 (status, updated_at DESC);
+
+COMMENT ON TABLE governance.ths_paid_probability_cookie_v1 IS
+'Active THS paid probability cookies. Values are DB/runtime-only secrets and are masked in every API/frontend response.';
+COMMENT ON TABLE raw_ths.paid_limit_up_probability_v1 IS
+'Raw THS paid next-day probability response. request_params_json stores only date, stock_code and credential_version reference, never cookie values.';
+COMMENT ON TABLE source.ths_paid_limit_up_probability_v1 IS
+'Canonical source fact for THS paid next-day limit-up probability. Missing facts block or abandon candidate batches after the next trading day 09:00 deadline.';
+COMMENT ON TABLE governance.ths_paid_probability_batch_status_v1 IS
+'Per candidate trade_date paid probability closure status and next-trading-day 09:00 abandonment guard.';
+
 INSERT INTO alembic_version (version_num) VALUES ('0001_current_baseline') RETURNING alembic_version.version_num;
 
 COMMIT;
-

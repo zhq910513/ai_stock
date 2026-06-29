@@ -29,6 +29,8 @@ from source_data_service.models import (
     HealthOut,
     LineageResolveRequest,
     LineageResolveResult,
+    MultiSourceQualityCheckRequest,
+    MultiSourceQualityCheckResult,
     ProbeRequest,
     ProbeResult,
     Provider,
@@ -68,6 +70,13 @@ from source_data_service.models import (
     ReleasePreflightRequest,
     ReleasePreflightResult,
     ProductionReadinessReport,
+    ThsPaidProbabilityBatchStatus,
+    ThsPaidProbabilityCookieStatus,
+    ThsPaidProbabilityCookieUpdateRequest,
+    ThsPaidProbabilityFetchCurrentBatchRequest,
+    ThsPaidProbabilityFetchCurrentBatchResult,
+    ThsPaidProbabilityProbeRequest,
+    ThsPaidProbabilityProbeResult,
 )
 from source_data_service.acceptance_evidence import (
     get_acceptance_run,
@@ -107,6 +116,7 @@ from source_data_service.source_build import (
     build_source_plan,
     validate_raw_rows,
 )
+from source_data_service.multi_source_quality import check_multi_source_quality
 from source_data_service.fetch_orchestrator import (
     build_fetch_plan,
     cancel_fetch_batch,
@@ -127,6 +137,8 @@ from source_data_service.fetch_orchestrator import (
     submit_fetch_batch,
 )
 from source_data_service.worker_executor import run_worker_once
+from source_data_service.ths_paid_credentials import cookie_status, save_active_cookie
+from source_data_service.ths_paid_probability import deadline_check, evaluate_batch_status, fetch_current_batch, probe_cookie
 
 app = FastAPI(
     title="ai_stock source-data-service",
@@ -177,6 +189,50 @@ def get_registered_api(provider: str, api_name: str):
         return get_api_spec(Provider(provider), api_name)
     except Exception as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/source/ths/paid-probability/cookie/status", response_model=ThsPaidProbabilityCookieStatus)
+def ths_paid_probability_cookie_status() -> ThsPaidProbabilityCookieStatus:
+    return cookie_status()
+
+
+@app.put("/source/ths/paid-probability/cookie", response_model=ThsPaidProbabilityCookieStatus)
+def ths_paid_probability_cookie_update(
+    request: ThsPaidProbabilityCookieUpdateRequest,
+) -> ThsPaidProbabilityCookieStatus:
+    return save_active_cookie(user=request.user, userid=request.userid, updated_by=request.updated_by)
+
+
+@app.post("/source/ths/paid-probability/probe", response_model=ThsPaidProbabilityProbeResult)
+def ths_paid_probability_probe(request: ThsPaidProbabilityProbeRequest) -> ThsPaidProbabilityProbeResult:
+    return probe_cookie(request)
+
+
+@app.post("/source/ths/paid-probability/fetch-current-batch", response_model=ThsPaidProbabilityFetchCurrentBatchResult)
+def ths_paid_probability_fetch_current_batch(
+    request: ThsPaidProbabilityFetchCurrentBatchRequest,
+) -> ThsPaidProbabilityFetchCurrentBatchResult:
+    return fetch_current_batch(request)
+
+
+@app.get("/source/ths/paid-probability/batch-status", response_model=ThsPaidProbabilityBatchStatus)
+def ths_paid_probability_batch_status(trade_date: str | None = None) -> ThsPaidProbabilityBatchStatus:
+    parsed_trade_date = None
+    if trade_date:
+        try:
+            from datetime import date
+
+            parsed_trade_date = date.fromisoformat(trade_date[:10])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="trade_date must be YYYY-MM-DD") from exc
+    return evaluate_batch_status(parsed_trade_date, mark_deadline=True)
+
+
+@app.post("/source/ths/paid-probability/deadline-check", response_model=ThsPaidProbabilityBatchStatus)
+def ths_paid_probability_deadline_check(
+    request: ThsPaidProbabilityFetchCurrentBatchRequest | None = None,
+) -> ThsPaidProbabilityBatchStatus:
+    return deadline_check(request.trade_date if request else None)
 
 
 @app.get("/source/providers/status", response_model=list[ProviderRuntimeStatus])
@@ -442,6 +498,15 @@ def validate_raw_quality(request: QualityValidationRequest) -> QualityValidation
         return validate_raw_rows(request)
     except Exception as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/source/quality/multi-source/check", response_model=MultiSourceQualityCheckResult)
+def validate_multi_source_quality(request: MultiSourceQualityCheckRequest) -> MultiSourceQualityCheckResult:
+    try:
+        return check_multi_source_quality(request)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
 
 @app.get("/source/freshness/sla", response_model=list[SourceFreshnessSla])
 def source_freshness_sla(source_table_name: str | None = None) -> list[SourceFreshnessSla]:

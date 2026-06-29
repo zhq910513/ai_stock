@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from source_data_service.models import (
+    CallbackEventType,
     FetchBatchStatus,
     FetchBatchStatusOut,
     FetchCallbackEventOut,
@@ -196,8 +197,10 @@ class PostgresQueuePersistence:
             lease_expires_at=row[18],
             last_error_code=row[19],
             last_error_message=row[20],
-            created_at=row[21],
-            updated_at=row[22],
+            raw_request_hash=row[21],
+            raw_response_schema_hash=row[22],
+            created_at=row[23],
+            updated_at=row[24],
         )
 
     def upsert_batch(self, batch: FetchBatchStatusOut, *, request_source: str = "source-data-service") -> None:
@@ -244,8 +247,9 @@ class PostgresQueuePersistence:
                         request_params_json, request_hash, source_table_name, canonical_fields,
                         symbol, trade_date, priority, queue_name, status, worker_id,
                         attempt_count, backup_of_job_item_id, next_retry_at, lease_expires_at,
-                        last_error_code, last_error_message, created_at, updated_at
-                    ) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        last_error_code, last_error_message, raw_request_hash, raw_response_schema_hash,
+                        created_at, updated_at
+                    ) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (job_item_id) DO UPDATE SET
                         status = EXCLUDED.status,
                         worker_id = EXCLUDED.worker_id,
@@ -254,8 +258,12 @@ class PostgresQueuePersistence:
                         lease_expires_at = EXCLUDED.lease_expires_at,
                         last_error_code = EXCLUDED.last_error_code,
                         last_error_message = EXCLUDED.last_error_message,
+                        raw_request_hash = COALESCE(EXCLUDED.raw_request_hash, governance.raw_fetch_job_item_v1.raw_request_hash),
+                        raw_response_schema_hash = COALESCE(EXCLUDED.raw_response_schema_hash, governance.raw_fetch_job_item_v1.raw_response_schema_hash),
                         updated_at = EXCLUDED.updated_at,
                         finished_at = CASE WHEN EXCLUDED.status IN ('succeeded','failed','cancelled','dead_letter','skipped_duplicate') THEN EXCLUDED.updated_at ELSE governance.raw_fetch_job_item_v1.finished_at END
+                    WHERE governance.raw_fetch_job_item_v1.updated_at IS NULL
+                       OR EXCLUDED.updated_at >= governance.raw_fetch_job_item_v1.updated_at
                     """,
                     (
                         job.job_item_id,
@@ -279,8 +287,50 @@ class PostgresQueuePersistence:
                         job.lease_expires_at,
                         job.last_error_code,
                         job.last_error_message,
+                        job.raw_request_hash,
+                        job.raw_response_schema_hash,
                         job.created_at,
                         job.updated_at,
+                    ),
+                )
+            conn.commit()
+
+    def upsert_worker_heartbeat(
+        self,
+        *,
+        worker_id: str,
+        worker_role: str = "source-fetch-worker",
+        queue_names: list[str] | None = None,
+        providers: list[str] | None = None,
+        current_job_item_id: str | None = None,
+        status: str = "alive",
+        note: str | None = None,
+    ) -> None:
+        with self._connect() as conn:  # pragma: no cover
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO governance.raw_fetch_worker_heartbeat_v1 (
+                        worker_id, worker_role, queue_names, providers,
+                        current_job_item_id, last_seen_at, status, note
+                    ) VALUES (%s,%s,%s,%s,%s,now(),%s,%s)
+                    ON CONFLICT (worker_id) DO UPDATE SET
+                        worker_role = EXCLUDED.worker_role,
+                        queue_names = EXCLUDED.queue_names,
+                        providers = EXCLUDED.providers,
+                        current_job_item_id = EXCLUDED.current_job_item_id,
+                        last_seen_at = EXCLUDED.last_seen_at,
+                        status = EXCLUDED.status,
+                        note = EXCLUDED.note
+                    """,
+                    (
+                        worker_id,
+                        worker_role,
+                        queue_names or [],
+                        providers or [],
+                        current_job_item_id,
+                        status,
+                        note,
                     ),
                 )
             conn.commit()
@@ -294,7 +344,19 @@ class PostgresQueuePersistence:
                         callback_event_id, fetch_batch_id, job_item_id, event_type,
                         callback_url, payload_json, delivery_status, created_at
                     ) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s)
-                    ON CONFLICT (callback_event_id) DO NOTHING
+                    ON CONFLICT (callback_event_id) DO UPDATE SET
+                        payload_json = EXCLUDED.payload_json,
+                        delivery_status = EXCLUDED.delivery_status,
+                        last_attempted_at = CASE
+                            WHEN EXCLUDED.delivery_status IN ('delivered','failed','skipped_no_callback')
+                            THEN now()
+                            ELSE governance.raw_fetch_callback_event_v1.last_attempted_at
+                        END,
+                        delivered_at = CASE
+                            WHEN EXCLUDED.delivery_status = 'delivered'
+                            THEN now()
+                            ELSE governance.raw_fetch_callback_event_v1.delivered_at
+                        END
                     """,
                     (
                         event.callback_event_id,
@@ -308,6 +370,41 @@ class PostgresQueuePersistence:
                     ),
                 )
             conn.commit()
+
+    def read_callbacks(self, fetch_batch_id: str | None = None, *, pending_only: bool = False, limit: int = 1000) -> list[FetchCallbackEventOut]:
+        with self._connect() as conn:  # pragma: no cover
+            where: list[str] = []
+            params: list[Any] = []
+            if fetch_batch_id:
+                where.append("fetch_batch_id = %s")
+                params.append(fetch_batch_id)
+            if pending_only:
+                where.append("delivery_status = 'pending'")
+            sql = """
+                SELECT callback_event_id, fetch_batch_id, job_item_id, event_type,
+                       callback_url, payload_json, delivery_status, created_at
+                FROM governance.raw_fetch_callback_event_v1
+            """
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY created_at ASC, callback_event_id ASC LIMIT %s"
+            params.append(limit)
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        return [
+            FetchCallbackEventOut(
+                callback_event_id=row[0],
+                fetch_batch_id=row[1],
+                job_item_id=row[2],
+                event_type=CallbackEventType(row[3]),
+                callback_url=row[4],
+                payload=self._json_value(row[5], {}),
+                delivery_status=row[6],
+                created_at=row[7],
+            )
+            for row in rows
+        ]
 
     def insert_build_trigger(self, trigger: SourceBuildTriggerOut) -> None:
         with self._connect() as conn:  # pragma: no cover
@@ -512,6 +609,8 @@ class PostgresQueuePersistence:
                         lease_expires_at,
                         last_error_code,
                         last_error_message,
+                        raw_request_hash,
+                        raw_response_schema_hash,
                         created_at,
                         updated_at
                     FROM governance.raw_fetch_job_item_v1
@@ -521,6 +620,74 @@ class PostgresQueuePersistence:
                 )
                 row = cur.fetchone()
         return self._job_out_from_row(row) if row else None
+
+    def requeue_expired_leases(self, now: datetime) -> list[FetchJobStatusOut]:
+        with self._connect() as conn:  # pragma: no cover
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        job_item_id,
+                        fetch_batch_id,
+                        provider,
+                        api_name,
+                        raw_table_name,
+                        request_params_json,
+                        request_hash,
+                        source_table_name,
+                        canonical_fields,
+                        symbol,
+                        trade_date,
+                        priority,
+                        queue_name,
+                        status,
+                        worker_id,
+                        attempt_count,
+                        backup_of_job_item_id,
+                        next_retry_at,
+                        lease_expires_at,
+                        last_error_code,
+                        last_error_message,
+                        raw_request_hash,
+                        raw_response_schema_hash,
+                        created_at,
+                        updated_at
+                    FROM governance.raw_fetch_job_item_v1
+                    WHERE status = 'leased'
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at <= %s
+                    ORDER BY lease_expires_at ASC, created_at ASC
+                    FOR UPDATE
+                    """,
+                    (now,),
+                )
+                jobs = [self._job_out_from_row(row) for row in cur.fetchall()]
+                for job in jobs:
+                    cur.execute(
+                        """
+                        UPDATE governance.raw_fetch_job_item_v1
+                        SET status = 'queued',
+                            worker_id = NULL,
+                            lease_expires_at = NULL,
+                            next_retry_at = %s,
+                            updated_at = %s
+                        WHERE job_item_id = %s
+                        """,
+                        (now, now, job.job_item_id),
+                    )
+            conn.commit()
+        return [
+            job.model_copy(
+                update={
+                    "status": FetchJobStatus.QUEUED,
+                    "worker_id": None,
+                    "lease_expires_at": None,
+                    "next_retry_at": now,
+                    "updated_at": now,
+                }
+            )
+            for job in jobs
+        ]
 
     def repair_batch_status(self, batch: FetchBatchStatusOut) -> None:
         with self._connect() as conn:  # pragma: no cover
@@ -665,6 +832,8 @@ class PostgresQueuePersistence:
                         lease_expires_at,
                         last_error_code,
                         last_error_message,
+                        raw_request_hash,
+                        raw_response_schema_hash,
                         created_at,
                         updated_at
                     FROM governance.raw_fetch_job_item_v1
@@ -694,10 +863,40 @@ def persist_job_if_enabled(job: FetchJobStatusOut) -> None:
         _PG.upsert_job(job)
 
 
+def persist_worker_heartbeat_if_enabled(
+    *,
+    worker_id: str,
+    worker_role: str = "source-fetch-worker",
+    queue_names: list[str] | None = None,
+    providers: list[str] | None = None,
+    current_job_item_id: str | None = None,
+    status: str = "alive",
+    note: str | None = None,
+) -> None:
+    summary = queue_persistence_summary()
+    if summary.backend == "postgres" and summary.ready_for_production_queue:
+        _PG.upsert_worker_heartbeat(
+            worker_id=worker_id,
+            worker_role=worker_role,
+            queue_names=queue_names,
+            providers=providers,
+            current_job_item_id=current_job_item_id,
+            status=status,
+            note=note,
+        )
+
+
 def persist_callback_if_enabled(event: FetchCallbackEventOut) -> None:
     summary = queue_persistence_summary()
     if summary.backend == "postgres" and summary.ready_for_production_queue:
         _PG.insert_callback(event)
+
+
+def durable_callback_events_if_enabled(fetch_batch_id: str | None = None, *, pending_only: bool = False, limit: int = 1000) -> list[FetchCallbackEventOut] | None:
+    summary = queue_persistence_summary()
+    if summary.backend == "postgres" and summary.ready_for_production_queue:
+        return _PG.read_callbacks(fetch_batch_id, pending_only=pending_only, limit=limit)
+    return None
 
 
 def persist_build_trigger_if_enabled(trigger: SourceBuildTriggerOut) -> None:
@@ -753,6 +952,13 @@ def durable_fetch_job_if_enabled(job_item_id: str) -> FetchJobStatusOut | None:
     summary = queue_persistence_summary()
     if summary.backend == "postgres" and summary.ready_for_production_queue:
         return _PG.get_job(job_item_id)
+    return None
+
+
+def requeue_expired_leases_if_enabled(now: datetime) -> list[FetchJobStatusOut] | None:
+    summary = queue_persistence_summary()
+    if summary.backend == "postgres" and summary.ready_for_production_queue:
+        return _PG.requeue_expired_leases(now)
     return None
 
 

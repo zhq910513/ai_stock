@@ -1,0 +1,16 @@
+[project]
+name = "ai-stock-t-board-relay-model-service"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "ai-stock-common",
+  "fastapi>=0.115",
+  "httpx2>=0.28",
+  "pydantic>=2",
+  "pydantic-settings>=2.3",
+  "psycopg[binary]>=3.2,<4.0",
+  "uvicorn[standard]>=0.30",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

@@ -1,12 +1,14 @@
-# packages 当前说明
+# packages README
 
-`packages` 存放跨服务共享代码。
+本文件是 `packages` 目录唯一当前 MD。全局硬约束以项目根目录 `AGENTS.md` 为准；子包细节以各子包根目录唯一 README 为准。
 
-## 包
+## 当前包
 
-- `common`：通用设置、健康检查、时间、序列化等基础能力。
-- `clients`：服务间 HTTP client，当前包含三大模型、research-data-mart 等调用封装。
-- `contracts`：跨服务 Pydantic 契约。
-- `db-schema`：SQLAlchemy metadata、Alembic 当前基线、schema bootstrap。
+- `common`：轻量通用工具，当前提供健康检查 payload helper 和包版本。
+- `db-schema`：当前 Docker schema-bootstrap 工具和 Alembic 当前基线入口。
 
-共享包变更会影响多服务镜像，必须同步对应服务 README 和数据库/契约说明。
+当前仓库没有 `packages/clients` 或 `packages/contracts` 目录，不能把它们写成已存在事实源。
+
+## 变更规则
+
+共享包变更会影响多个服务镜像。涉及共享包代码、依赖、数据库 bootstrap 或基线入口时，必须同步更新本 README、对应子包 README，以及受影响服务或基础设施目录的唯一当前 MD。

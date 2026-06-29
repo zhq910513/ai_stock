@@ -1,0 +1,170 @@
+# shence-frontend-service DATA_ASSETS
+
+本文件是 `shence-frontend-service` 的数据资产账本，不替代本目录 `README.md`。
+
+## 服务定位
+
+前端负责只读展示候选输入、四模型列表、研究中心低谷图库和轻量代理。除研究中心低谷图库受控 POST 外，不写模型事实、source/raw、调度、交易、release gate、买点、outcome 或学习权重。
+
+## 读取数据
+
+| 代理 | 后端资产 | 用途 | 边界 |
+|---|---|---|---|
+| `/api/backend/source/*` | `source.*`、source readiness/preflight | 候选页、候选记忆/潜伏抬头过渡 universe、健康信号 | 只读 |
+| `/api/source/ths/paid-probability/*` | source-data-service 付费概率 Cookie 状态、批次状态和受控抓取入口 | 候选页 Cookie 配置、立即抓取、批次状态提示 | 仅允许 cookie/status、cookie、probe、fetch-current-batch、batch-status、deadline-check；不放开通用 source 写代理 |
+| `/api/model-list/hot` | `research-service /research/model-list/hot`、`decision_hot.*` 只读投影、`source.stock_master_v1`、`source.daily_bar_v1`、`source.ths_paid_limit_up_probability_v1` 展示上下文、`hot_model_data_readiness_v1` 准备度字段 | 热点模型页；只展示已落库模型结果，按模型分降序，并展示准备度、缺失分、P0 阻断和维度明细 | 只读；不回退 source universe，不触发 owner，不计算分数，不补买点/概率/行情；保留准备度合同字段，剥离审计大字段 |
+| `/api/backend/tboard/*` | `decision_t_relay.*`、`research_t_relay.*` owner GET | 模型四 owner 只读事实 | 只读 |
+| `/api/model-list/tboard` | `t-board-relay-service /t-board-relay/observation-board`、repository status 和 `/t-board-relay/day1/candidates` | 模型四 T 字接力观察台；普通用户列为股票、模型分、Day1、Day2、监测时间、当前判断、接力强度、关键依据、风险结论、更新；顶部显示今日 Day1 扫描汇总 | 只读；只消费 Day1 合格观察对象和 owner `model_score`；Day1 candidates 只在最新交易日内按股票去重并保留最新行后生成汇总计数和白话原因，不返回 rejected/data_blocked 明细；按模型分降序展示；剥离审计大字段，不改后端事实；普通用户列表不展示 `current_stage`、`day3_trade_date`、`next_observation`、`data_notice`、`data_gap_labels`、`ASK` 或 `BID` |
+| `/api/backend/data-inspector/*` | 巡检摘要 | 健康/缺口展示 | 只读 |
+| `/api/backend/scheduler/*` | scheduler status/sample | 调度状态展示 | 只读 |
+| `/api/research/*` | `research_ambush.*` | 低谷图库研究资产写入 | 只允许研究中心合同 POST |
+
+## 写入数据
+
+| 写入 | 表 | 边界 |
+|---|---|---|
+| 付费概率 Cookie 表单 | `governance.ths_paid_probability_cookie_v1` | 只通过 source-data-service 受控 API 替换运行库 Cookie；前端不保存 Cookie，不写 raw/source/model 事实 |
+| 低谷图库 POST | `research_ambush.*` | 研究资产，不是模型生产事实 |
+
+候选输入页不再手动写入同花顺概率，不生成本地随机概率测试 payload，不显示“已提交生产”。页面只读展示 `source.ths_paid_limit_up_probability_v1`；数据库已有留存 Cookie 且未被真实接口探测判定失败时，页面只展示脱敏状态并隐藏编辑入口。Cookie 缺失或真实探测失败后才展示配置表单，提交后会触发 source-data-service 受控抓取当前批次。
+
+## 调度频率
+
+热点模型页无后台调度；浏览器首屏只读调用 `/api/model-list/hot?limit=20`，前端服务再只读调用 `research-service /research/model-list/hot`。20 行只是普通用户首屏读取规模，用于保证准备度逐行真实验证后页面可及时展示，不改变后端接口 `limit` 参数能力，也不截断或删除任何已落库模型事实；该首屏真实准备度链路使用 24.0 秒浏览器预算和 30.0 秒服务端代理预算，避免 20 行逐条准备度验证在 12 秒边界误判为空态。该路径只读取已落库 `decision_hot.*` 投影、必要 source 展示上下文和 `hot_model_data_readiness_v1` 准备度合同，不触发 owner、scheduler、source fetch 或 provider 请求；无结果时显示空态/缺口，不回退到 source universe。准备度 KPI、准备度列和维度矩阵只消费后端返回的 `readiness_score_pct`、`missing_points`、`blocked_points`、`readiness_state`、`top_missing_dimension`、`readiness_gap_codes`、`readiness_dimensions` 和 `readiness_summary`；KPI 固定展示数据准备度、P0 阻断、已有模型分、概率覆盖和数据缺口，维度矩阵展示优先级、权重、覆盖和缺失分；字段覆盖矩阵的事实来源只展示中文业务来源，不展示服务名、schema/table、`source_gap:*` 原码、raw/provider/internal 文本或接口路径；没有真实行或没有准备度数值时显示“暂无”或“待评估”，不得把空态显示成 0% 或 100%。
+
+前端无后台调度。浏览器请求使用短超时，只读拉取当前页面所需数据；失败时显示中文空态，不补事实。模型四列表通过 `/api/model-list/tboard` 读取 owner `observation-board`、repository status 和 Day1 candidates；Day1 candidates 只在前端服务内按最新 `trade_date` 聚合，并在该交易日内按 `canonical_symbol`、`symbol`、`stock.symbol` 或 `instrument_id` 去重，保留 `updated_at` / `created_at` 最新行后统计今日扫描数、严格 Day1 合格数、未通过主因和更新时间，不把候选明细或审计字段返回浏览器。compact 响应在前端服务内剥离 `request_payload`、`result_payload`、`game_hypothesis_payload`、`evidence_json`、`related_payload` 后再返回浏览器，避免审计 / 证据大字段影响页面读取。模型四 `model_score` 只来自 owner 投影，页面按分数由高到低展示，缺关键事实时保持空态，不补 0、不自行评分。模型四 `day2_trigger_time` 仅展示 Day2 开盘后五分钟滚动监测中首次接近条件的检查时间，不代表前端写入交易、买点或 official signal。普通用户列表不展示“观察阶段”“Day3”“下一步”“数据提示”列；缺口只允许通过 owner 已投影的当前判断、关键依据或风险结论白话呈现。用户停留在 `#/model-tboard` 且已登录时，浏览器按 `TBOARD_AUTO_REFRESH_MS=60000` 每 60 秒重新读取 `/api/model-list/tboard?limit=100`；页面隐藏、切走路由或登出时清理 timer，这只是只读刷新节奏，不是 scheduler/source/model 写入调度。模型四已有可见数据时，自动刷新只 patch 表格 body、Day1 扫描汇总、错误提示和不占布局的刷新角标，不重建页面壳、筛选区或固定表头，不重置横向滚动，也不重复绑定表格 chrome；后台失败时保留上次可见内容。
+
+候选页付费概率依赖 scheduler/source-data-service 调度：15:20、16:05、18:00、20:30 抓取当前候选批次；09:01 执行 deadline guard。前端只展示后端批次状态，不自行放弃候选批次；未到下一交易日 09:00 前只显示阻断/等待/部分入库。
+
+## 禁止事项
+
+- 不直接访问 provider。
+- 不直接读 raw。
+- 不把后端错误或空态改成 ready/passed。
+- 不显示程序字段名、raw JSON、schema 名作为操作员事实。
+- 不保存或回显同花顺 Cookie 明文；除受控 `/api/source/ths/paid-probability/*` 外不允许前端触发 source 写操作。
+
+## 模型四语义翻译边界
+
+`/api/model-list/tboard` 仍是模型四前端唯一普通用户列表入口，数据资产来自 owner `observation-board` 和 repository status。默认 compact 响应不主动返回 `observation_status=stopped` 且按 Asia/Shanghai 自然日计算已超过 3 天的失效对象；过滤锚点优先使用 `day3_trade_date`，其次 `day2_trade_date`、`day1_trade_date`、`latest_snapshot_time` / `updated_at`。该过滤只影响普通用户默认列表，不删除、不改写、不截断 owner `decision_t_relay.*` 或 monitor snapshot 事实；排查历史失效样本可显式读取 `GET /api/model-list/tboard?include_stale_stopped=true`。前端不写入 `decision_t_relay.*`、`research_t_relay.*`、source/raw、scheduler、release gate、交易、买点、outcome 或学习权重。
+
+模型四页面允许把 owner 已返回的终止态和关键依据翻译成更直白的展示词：封板维护失败展示为“封板失败 / 已开板，停止观察”，卖压占优展示为“卖压占优 / 卖盘往下砸，买入确认失败”，滚动监测未接近涨停展示为“未触发 / 5 分钟监测未接近涨停”，买盘主动扫掉卖盘展示为“已触发，继续看封板 / 接近涨停，买盘扫掉卖盘”。该翻译只影响浏览器展示和前端排序阅读体验，不修改 `model_score`、`score_state`、`current_conclusion`、`relay_strength_label`、`key_reason`、`risk_tip` 的后端事实来源。
+
+`model_score=0` 是 owner 明确给出的硬失败综合分，前端可以展示并按分数排序；缺关键事实时必须保持 `model_score=NULL` 或空态，不得补 0。风险结论必须来自 owner 已投影的盘口方向、成交强度、封板维护、Day3 去留或事实缺口结论，不展示空泛免责提示。
+
+## 数据资产冻结记录
+
+### shence-frontend-service -> model-hot -> readonly decision-hot list
+
+- 冻结时间：2026-06-25 Asia/Shanghai。
+- 拍板人 / 确认来源：用户批准热点候选/热点模型链路精修，要求打通真实模型输出到前端只读展示。
+- 锁定范围：模型一前端只读读取 `/api/model-list/hot`，该 compact 入口代理 `research-service /research/model-list/hot` 并消费 `decision_hot.*` 已落库模型结果；同花顺概率、股票名和同日行情仅作为展示上下文，只读来自后端投影；Cookie 状态和批次状态仍只通过 `/api/source/ths/paid-probability/*` 受控代理展示。
+- 当前运行事实：`#/model-hot` 不再从 `source.limit_event_v1`、固定旧日期或前端 source universe 拼热点模型行；无已落库模型结果、缺概率、缺行情、缺买点、缺评估基准价或缺验证时，页面显示空态/中文缺口，不补 0、不显示模拟分数、不把 source 候选冒充为模型产出。
+- 允许的只读验收：读取模型一页面、`/api/model-list/hot`、`research-service /research/model-list/hot`、hot readyz/healthz、付费概率 cookie/status 与 batch-status、运行前端合同测试、截图和可见文本检查。
+- 禁止修改项：未经解锁不得新增 provider/raw 读取，不得让模型一前端写 source、decision_hot、scheduler、release gate、买点、outcome、交易或学习权重；不得恢复 source-universe 伪模型行、手动概率输入、随机概率、旧样例数据或前端推断补值。
+- 解锁条件：用户明确批准本冻结对象解锁；若需要改变 research-service 热点投影、模型 owner 逻辑、source 付费概率合同或调整 scheduler/source 调度，必须另行解锁对应服务。
+- 回滚方式：回退模型一页面读取和展示合同相关变更，恢复上一版只读展示口径；回滚后重新验证页面不反写后端、不显示模拟数据。
+- 验证清单：`python -m pytest -q services/shence-frontend-service/tests/test_frontend_contract.py`；`GET /api/model-list/hot` 返回 `read_only=true` 且不含审计 payload；`#/model-hot` 显示真实只读行或中文空态；可见文本不含 `source_gap:*`、接口路径、schema/table/raw/provider 程序文本；相关后端服务 ready。
+
+### shence-frontend-service -> model-hot -> data readiness display
+
+- 冻结时间：2026-06-27 Asia/Shanghai。
+- 拍板人 / 确认来源：用户明确回复“拍板”，并要求“继续完成拍板”。
+- 数据资产范围：`/api/model-list/hot?limit=20` 只读代理 `research-service /research/model-list/hot`，返回浏览器前剥离审计 payload；`#/model-hot` 只消费 `hot_model.data.items`、`readiness_summary` 和 `readiness_dimensions`。页面展示顶部准备度 KPI、行级准备度列和准备度维度矩阵；KPI 包含数据准备度、P0 阻断、已有模型分、概率覆盖和数据缺口，维度矩阵展示优先级、权重、覆盖和缺失分。
+- 当前验收事实：登录后 compact API 返回 `read_only=true`、`compact_audit_payloads=true`、`hot_model_data_readiness_v1`、总权重 `100`、13 个维度、20 条真实行、平均准备度 `69.0%`、平均缺 `31.0` 分、P0 阻断 `20`；首行 `600367.SH` 准备度 `69`、状态 `blocked`、缺 `31` 分、最大缺口 `open_5m_reference_path`。Playwright DOM 验收显示 20 行真实列表、13 列、数据准备度 KPI、准备度维度矩阵、字段覆盖矩阵、权重、覆盖和缺失分；可见文本不含 `source_gap:*`、接口路径、服务名、schema/table、`decision_hot`、raw、provider、repository 或审计 payload。
+- 数据边界：前端只读展示，不写 `decision_hot.*`、source/raw、scheduler、release gate、交易、买点、outcome 或学习权重；不调用 provider，不触发 source fetch，不计算模型分、不生成买点、不改 release gate。无真实行或无准备度数值时显示“暂无”或“待评估”，不得把空态显示成 0% 或 100%，不得把缺失概率、缺失买点、缺失验证或缺失维度补成 0/mock/示例 payload/前端推断。
+- 允许的只读验收：访问 `#/model-hot`、读取 `/api/model-list/hot?limit=20`、读取 `research-service /research/model-list/hot?limit=20`、frontend `/readyz`、运行前端合同测试、Python 编译检查、JS 语法检查和 Playwright DOM/截图检查。
+- 禁止修改项：未经解锁不得改变准备度 KPI、维度矩阵、默认 20 行首屏读取、24.0 秒浏览器预算、30.0 秒服务端代理预算、compact 字段剥离、空态显示或前端只读边界；不得将准备度展示变成后端事实写入、source/scheduler 动作、模型评分修改或数据库清理。
+- 解锁条件：用户明确批准本冻结对象解锁；若要改变 research-service 准备度维度/权重/P0 语义、source/scheduler/owner 模型逻辑或付费概率合同，必须另行解锁对应服务。
+- 回滚方式：回退本对象对应的前端展示、代理超时、合同测试和文档变更，重新运行前端合同测试、Python 编译检查、JS 语法检查和 Playwright 页面验收；不清库、不重启 `source-data-service`，也不修改 `decision_hot.*` 或模型 owner 数据。
+- 验证清单：前端合同测试通过；Python 编译检查通过；JS 语法检查通过；`git diff --check` 通过；frontend/research/hot owner/scheduler/data-inspector/source 健康；`#/model-hot` 可见准备度 KPI、P0 阻断、20 行真实列表、准备度维度矩阵、字段覆盖矩阵和缺失分，且可见文本不含内部服务、schema/table、接口路径、raw/provider/repository 或审计 payload。
+
+### shence-frontend-service -> model-tboard -> observation board readonly list
+
+- 冻结时间：2026-06-21 Asia/Shanghai。
+- 拍板人 / 确认来源：用户确认模型四前端后端整改任务书并要求普通用户观察台口径；本轮按确认范围解锁并完成整改。
+- 锁定范围：模型四前端只读读取 `t-board-relay-service /t-board-relay/observation-board`；`/api/model-list/tboard` compact 聚合；剥离 `request_payload`、`result_payload`、`game_hypothesis_payload`、`evidence_json`、`related_payload` 后返回浏览器；页面仅展示 Day1 合格观察对象和 10 个核心列：股票、模型分、Day1、Day2、监测时间、当前判断、接力强度、关键依据、风险结论、更新；按 owner `model_score` 降序展示；不展示“观察阶段”“Day3”“下一步”“数据提示”列。
+- 允许的只读验收：读取 `/api/model-list/tboard`、读取 `/api/backend/tboard/t-board-relay/observation-board`、截图 `#/model-tboard`、检查可见文本、运行前端测试、检查服务 ready。
+- 禁止修改项：未经解锁不得新增 provider/raw 读取，不得让模型四前端写 `decision_t_relay.*`、`research_t_relay.*`、source/raw、scheduler、release gate、买点、outcome、交易或学习权重；不得把 Day1 未通过对象放入普通用户观察台；不得把缺失事实补成 0、mock、示例 payload 或前端推断。
+- 解锁条件：用户明确批准本冻结对象解锁；若需要改变 owner `observation-board` 返回字段或纳入规则，必须另行解锁 `t-board-relay-service`。
+- 回滚方式：回退 `/api/model-list/tboard` 与页面调用改动，恢复解锁前只读列表；回滚后重新验证页面空态、只读边界和中文缺口。
+- 验证清单：compact 响应不含审计 / 证据大字段；页面只显示 Day1 合格观察对象；可见文本不含 `source_gap:*`、接口路径、schema/table/raw/provider 程序文本；前端合同测试通过；相关后端服务 ready。
+
+### shence-frontend-service -> candidates -> ths paid probability cookie config
+
+- 冻结时间：2026-06-20。
+- 拍板人 / 确认来源：用户要求候选股增加自动抓取同花顺次日概率程序，并补充 Cookie 失效或取不到时下一交易日 09:00 后才放弃该批候选。
+- 锁定范围：候选页 Cookie 状态小区域、只读 `source.ths_paid_limit_up_probability_v1` 概率展示、批次状态中文提示、`/api/source/ths/paid-probability/*` 受控代理 allowlist、浏览器 Cookie 剥离、无手动概率输入/无随机测试概率；Cookie 表单仅在缺失或真实探测失败后显示；日线/涨停价/资金流/概率 source 辅助读取超时只进入辅助降级，不得覆盖候选主事实读取和 Cookie 状态。
+- 允许的只读验收：打开 `#/candidates`、读取 cookie/status、batch-status、source 概率行、运行前端合同测试、检查页面无旧手填控件或旧测试入口。
+- 禁止修改项：未经解锁不得恢复手动概率输入、随机概率测试包、通用 source 写代理、浏览器 Cookie 转发、前端自行放弃批次、前端补概率事实，或因读取超时把已留存 Cookie 显示成未配置/失效。
+- 解锁条件：source-data-service 付费概率合同变化、候选服务提交合同变化、用户明确批准调整候选页写边界。
+- 回滚方式：回退候选页 Cookie 配置与受控代理，保留 source-data-service 付费概率事实和 Cookie 审计，不清库。
+- 验证清单：前端合同测试通过；Cookie 明文不出现在源码/README 响应示例；候选页只读概率来自 source 表；`pending_probe/valid` 显示 Cookie 可用且隐藏编辑入口；下一交易日 09:00 前未显示已放弃。
+
+### shence-frontend-service -> model-tboard -> live readonly observation board
+
+- 冻结时间：2026-06-24 Asia/Shanghai。
+- 数据资产范围：`/api/model-list/tboard` 只读聚合 owner `GET /t-board-relay/observation-board`；返回浏览器前剥离 `request_payload`、`result_payload`、`game_hypothesis_payload`、`evidence_json`、`related_payload`；页面只消费 10 个用户列，按 owner `model_score` 降序展示，并按 60 秒只读刷新。默认列表不主动展示超过 3 天的 `stopped` 失效对象，历史失效事实仍保留在 owner 和 append-only 快照中。
+- 当前运行事实：compact 响应 `read_only=true`，且 `observation_board.data.items` 为 4 条 Day1 合格对象；`600172.SH` 已随 post-entry monitor 更新为“触发后开板，停止观察”；截图留存在 `services/shence-frontend-service/playwright-artifacts/model-tboard-20260624-final-validation.png`。
+- 数据边界：前端不写 `decision_t_relay.*`、`research_t_relay.*`、source/raw、scheduler、release gate、交易、买点、outcome 或学习权重；不把缺口补成 0/mock/示例 payload/前端推断；不直接展示 `ASK` / `BID` 或 `source_gap:*`。
+- 解锁条件：用户明确批准本子对象解锁；若 owner projection 合同变化，必须另行解锁 `t-board-relay-service`。
+
+### shence-frontend-service -> model-tboard -> snapshot refresh acceptance
+
+- 冻结时间：2026-06-24 Asia/Shanghai。
+- 拍板人 / 确认来源：用户授权 Codex 判断模型四链路是否可拍板，并在本轮回复“批准”；Codex 基于登录会话、compact API 和 Playwright DOM 验收判定普通用户可读目标已达成。
+- 数据资产范围：`/api/model-list/tboard` 只读聚合 owner repository status 和 `observation-board`，返回浏览器前剥离审计 payload；`#/model-tboard` 只消费 `stock.symbol/name`、owner `model_score`、阶段日期、当前判断、接力强度、关键依据、风险结论和更新时间。
+- 当前验收事实：compact API 返回 `read_only=true`、`compact_audit_payloads=true`、4 条 Day1 合格对象、股票名完整、模型分排序 15/12/12/0、更新时间 `2026-06-24 09:50:48`；Playwright DOM 显示 4 行和 10 个核心列，不显示“数据提示”“不自动下单”“接力机会提示仅作观察”。
+- 数据边界：前端不写 `decision_t_relay.*`、`research_t_relay.*`、source/raw、scheduler、release gate、交易、买点、outcome 或学习权重；不补股票名、模型分、盘口方向或风险结论；`model_score=0` 仅展示 owner 明确给出的硬失败综合分。
+- 只读验收：frontend readyz、登录 session、`/api/model-list/tboard`、owner observation-board、Playwright DOM、前端合同测试。
+- 解锁条件：owner `observation-board` 字段、compact 聚合合同、列定义、排序口径、自动刷新语义、股票名来源或用户明确批准解锁。
+
+### shence-frontend-service -> model-tboard -> plain user semantics
+
+- 冻结时间：2026-06-24 Asia/Shanghai。
+- 拍板人 / 确认来源：用户确认当前版本不错，并授权 Codex 判断模型四链路是否可拍板；Codex 基于前端合同测试、compact 只读接口、Playwright DOM 和截图验收判定可以拍板，用户随后明确回复“可以  继续”确认冻结。
+- 数据资产范围：只冻结 `/api/model-list/tboard` 到 `#/model-tboard` 的普通用户语义翻译层；数据事实仍只来自 owner `observation-board` 和 repository status。页面按 owner `model_score` 降序展示，`model_score=0` 表示 owner 明确给出的硬失败综合分；缺关键事实时必须保持空态，不得补 0。页面主体标题条只说明当前是“T 字接力观察台”和首日/次日/停止原因口径，不读取或写入额外事实。
+- 锁定文案：封板维护失败展示为“封板失败 / 已开板，停止观察 / 触发后开板，封板没守住 / 封板没守住，次日退出风险高”；卖压占优展示为“卖压占优 / 卖盘往下砸，买入确认失败”；滚动监测未接近涨停展示为“未触发 / 5 分钟监测未接近涨停 / 没有接近涨停，接力不足”；买盘主动扫掉卖盘且触发接力展示为“已触发，继续看封板 / 接近涨停，买盘扫掉卖盘 / 已触发，重点看收盘前能否封住”。
+- 允许的只读验收：访问 `#/model-tboard`、读取 `/readyz`、读取 `/api/model-list/tboard`、读取 owner `/t-board-relay/observation-board`、运行前端合同测试、运行 `node --check`、执行 Playwright DOM 可见文本检查和截图。
+- 禁止修改项：未经解锁不得恢复“观察阶段”“Day3”“下一步”“数据提示”列，不得展示 `ASK` / `BID`、`source_gap:*`、repository/schema/provider/raw/internal 文本，不得恢复“可买入观察”“接力机会提示仅作观察”“不自动下单”等空泛提示，不得让前端触发模型评分、scheduler dispatch、source fetch、provider 请求、raw 读取、official signal、交易、买点、outcome 或学习权重写入。
+- 解锁条件：用户明确批准 `shence-frontend-service -> model-tboard -> plain user semantics` 解锁；若需要改变 owner `observation-board` 字段、状态机、评分或纳入规则，必须另行解锁 `t-board-relay-service`。
+- 回滚方式：回退本冻结对象对应的前端语义翻译、测试和文档变更，重新运行前端合同测试、JS 语法检查和页面验收；不清库、不重启 `source-data-service`，也不修改模型四 owner 数据。
+- 验证清单：compact 返回 `read_only=true` 且只包含 Day1 合格观察对象；页面显示“T 字接力观察台”标题条、10 个核心列和真实观察行；可见文本不含“数据提示”“下一步”“观察阶段”“ASK”“BID”“source_gap:*”“不自动下单”“接力机会提示仅作观察”“可买入观察”；开板失败风险使用“次日退出风险高”白话表达；前端合同测试、Python 编译检查和 JS 语法检查通过。
+
+### shence-frontend-service -> model-tboard -> stale stopped default visibility
+
+- 冻结时间：2026-06-26 Asia/Shanghai。
+- 拍板人 / 确认来源：用户授权 Codex 判断是否拍板；Codex 基于前端合同测试、Python 编译、JS 语法检查、重启后 `/readyz` 和 `/api/model-list/tboard` 只读验收，判定可拍板。
+- 数据资产范围：`/api/model-list/tboard` 默认只读聚合 owner `observation-board` 后，不主动返回 `observation_status=stopped` 且超过 3 个 Asia/Shanghai 自然日的失效对象；`#/model-tboard` 页面同规则兜底过滤。失效日期锚点优先取 `day3_trade_date`，其次 `day2_trade_date`、`day1_trade_date`、`latest_snapshot_time` / `updated_at`。`include_stale_stopped=true` 只作为历史失效对象只读排查参数，不改变 owner 事实。
+- 数据边界：过滤只影响普通用户默认列表，不删除、不改写、不截断 `decision_t_relay.*`、`research_t_relay.*`、owner `observation-board`、monitor snapshot 或 append-only 审计事实；前端不写 source/raw、scheduler、release gate、交易、买点、outcome 或学习权重。
+- 允许的只读验收：读取 `/api/model-list/tboard`、读取 `/api/model-list/tboard?include_stale_stopped=true`、读取 owner `/t-board-relay/observation-board`、访问 `#/model-tboard`、检查 frontend `/readyz`、运行前端合同测试、Python 编译检查和 JS 语法检查。
+- 禁止修改项：未经解锁不得改变 3 天窗口、日期锚点顺序、默认隐藏口径、`include_stale_stopped=true` 只读排查参数或前端只读边界；不得将过期失效过滤下沉为 owner 事实删除、数据库清理、scheduler/source 动作或模型评分修改。
+- 解锁条件：用户明确批准本冻结对象解锁；若要改成“三个交易日”口径、改变 owner `observation-board` 字段或状态机、删除历史失效事实、调整 scheduler/source 逻辑，必须另行解锁对应服务。
+- 回滚方式：回退本对象对应的 compact 默认过滤、页面兜底过滤、测试和文档变更，重新运行前端合同测试、Python 编译检查、JS 语法检查，并重启前端服务；不清库、不重启 `source-data-service`，也不修改模型四 owner 数据。
+- 验证清单：`python -m pytest -q services/shence-frontend-service/tests/test_frontend_contract.py` 通过；`python -m compileall -q services/shence-frontend-service/src services/shence-frontend-service/tests` 通过；`node --check services/shence-frontend-service/public/app.js` 通过；`git diff --check` 通过；前端 `8030` / `18080` 重启后 `/readyz` 为 ready；默认 `/api/model-list/tboard?limit=20` 可读，当前 4 条样本仍在三天窗口内所以继续展示；`source-data-service` 未重启。
+
+### shence-frontend-service -> model-tboard -> Day1 summary dedupe
+
+- 冻结时间：2026-06-26 Asia/Shanghai。
+- 拍板人 / 确认来源：用户确认 Codex 交付报告，批准将模型四 Day1 汇总去重口径拍板冻结。
+- 数据资产范围：`/api/model-list/tboard` 读取 owner `GET /t-board-relay/day1/candidates` 只生成 `day1_scan_summary`，不向浏览器返回 rejected/data_blocked 候选明细或审计 payload。该汇总只看最新 `trade_date`，并在该交易日内按 `canonical_symbol`、`symbol`、`stock.symbol` 或 `instrument_id` 去重，保留 `updated_at`、`created_at`、`as_of_time_utc` 或列表顺序最新的一行后统计扫描数、合格数、未通过数、阻断数、开盘涨停数、未通过主因和更新时间。
+- 当前验收事实：前端 `8030` 重启后，`/api/model-list/tboard?limit=10` 返回 `read_only=true`；`day1_scan_summary` 为 `trade_date=2026-06-26`、`scanned_count=21`、`qualified_count=1`、`rejected_count=20`、`data_blocked_count=0`；主列表首条为 `000823.SZ 超声电子`，`model_score=48.0`，`observation_status=continue_watch`。响应不含 `request_payload`、`result_payload`、`game_hypothesis_payload`、`evidence_json` 或 `related_payload`。
+- 数据边界：去重只影响前端 compact 汇总展示，不删除、不改写、不截断 owner `decision_t_relay.*`、`research_t_relay.*`、`observation-board`、monitor snapshot 或 append-only 审计事实；前端不写 source/raw、scheduler、release gate、交易、买点、outcome 或学习权重，不把缺失事实补成 0/mock/示例 payload/前端推断。
+- 允许的只读验收：读取 `/api/model-list/tboard`、owner `/t-board-relay/day1/candidates`、owner `/t-board-relay/observation-board`、frontend `/readyz`，运行前端合同测试、Python 编译检查、JS 语法检查和 compact payload 剥离检查。
+- 禁止修改项：未经解锁不得改变 Day1 汇总去重 key、最新行选择顺序、计数字段含义、审计 payload 剥离、普通用户不看 rejected/data_blocked 明细的边界或前端只读边界；不得将该汇总变成 owner 事实删除、数据库清理、scheduler/source 动作或模型评分修改。
+- 解锁条件：用户明确批准本冻结对象解锁；若 owner `day1/candidates` 合同、Day1 合格判定、schema、scheduler/source 取数或模型四状态机变化，必须另行解锁对应服务。
+- 回滚方式：回退本对象对应的前端 compact helper、合同测试和文档变更，重新运行前端合同测试、Python 编译检查和 JS 语法检查，并只重启前端服务；不清库、不重启 `source-data-service`，也不修改模型四 owner 数据。
+- 验证清单：前端合同测试通过；Python 编译检查通过；JS 语法检查通过；重启后 scheduler/data-inspector/frontend `/readyz` 均 ready；`/api/model-list/tboard?limit=10` 返回 Day1 汇总 `21/1/20/0`；`source-data-service` 未重启。
+
+### shence-frontend-service -> model-tboard -> mobile plain-user cards
+
+- 冻结时间：2026-06-26 Asia/Shanghai。
+- 拍板人 / 确认来源：用户在本轮交付报告后回复“确认”，批准将模型四移动端普通用户字段卡片展示拍板冻结。
+- 数据资产范围：只冻结 `/api/model-list/tboard` 到 `#/model-tboard` 的手机视口展示方式；数据事实仍只来自 owner `observation-board`、repository status 和 Day1 candidates 汇总。手机卡片完整展示同一 10 个事实字段：股票、模型分、Day1、Day2、监测时间、当前判断、接力强度、关键依据、风险结论、更新；字段标签来自前端列合同，展示方式改变不新增、不删除、不改写任何 owner 字段。
+- 当前验收事实：compact API 与 owner `observation-board` 均返回 5 条真实观察对象；Day1 汇总为 `2026-06-26` 扫描 `21`、合格 `1`、未通过 `20`、阻断 `0`；手机 DOM 中 5 条观察对象均为字段卡片，`600172.SH 黄河旋风` 可见风险结论为“封板没守住，次日退出风险高”，页面不显示 owner 原始 `Day3退出风险` 文案；compact 响应不含 `request_payload`、`result_payload`、`game_hypothesis_payload`、`evidence_json` 或 `related_payload`。
+- 数据边界：卡片化只影响浏览器展示和初级用户阅读体验，不写 `decision_t_relay.*`、`research_t_relay.*`、source/raw、scheduler、release gate、交易、买点、outcome 或学习权重；不补股票名、模型分、盘口方向、风险结论或缺口事实；`model_score=0` 仍仅展示 owner 明确给出的硬失败综合分，缺关键事实时必须保持空态。
+- 允许的只读验收：读取 `/api/model-list/tboard`、owner `/t-board-relay/observation-board`、frontend `/readyz`，访问 `#/model-tboard`，运行前端合同测试、Python 编译检查、JS 语法检查和 Playwright 桌面 / 手机 DOM 与截图检查。
+- 禁止修改项：未经解锁不得移除手机字段卡片合同，不得删减 10 个事实字段，不得恢复普通用户可见“观察阶段”“Day3”“下一步”“数据提示”列，不得展示 `ASK` / `BID`、`source_gap:*`、repository/schema/provider/raw/internal 文本，不得将卡片化变成 owner 字段变更、数据库清理、scheduler/source 动作或模型评分修改。
+- 解锁条件：用户明确批准本冻结对象解锁；若 owner `observation-board` 字段、Day1 汇总口径、schema、scheduler/source 取数或模型四状态机变化，必须另行解锁对应服务。
+- 回滚方式：回退本对象对应的移动端卡片 CSS、合同测试和文档变更，重新运行前端合同测试、Python 编译检查、JS 语法检查和 Playwright 页面验收；不清库、不重启 `source-data-service`，也不修改模型四 owner 数据。
+- 验证清单：前端合同测试通过；Python 编译检查通过；JS 语法检查通过；尾随空白检查通过；Playwright 手机 DOM 验收显示 `rowDisplay=grid`、`cellDisplay=grid`、10 个 `data-label` 完整；frontend/scheduler/data-inspector `/readyz` 均 ready；`source-data-service` 未重启。

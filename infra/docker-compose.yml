@@ -226,6 +226,36 @@ services:
       start_period: 20s
     restart: unless-stopped
 
+  t-board-relay-service:
+    build:
+      context: ..
+      dockerfile: infra/docker/service.Dockerfile
+      args:
+        SERVICE_DIR: services/models_services/t-board-relay-service
+    container_name: ai-stock-t-board-relay-service
+    environment:
+      AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_SERVICE_BASE_URL: http://source-data-service:8041
+      SERVICE_NAME: t-board-relay-service
+      PORT: 8034
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-bootstrap:
+        condition: service_completed_successfully
+      source-data-service:
+        condition: service_healthy
+    command: ["uvicorn", "t_board_relay_model_service.main:app", "--host", "0.0.0.0", "--port", "8034"]
+    ports:
+      - "${T_BOARD_RELAY_SERVICE_PORT:-8035}:8034"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8034/readyz', timeout=3).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
   scheduler-service:
     build:
       context: ..
@@ -239,6 +269,12 @@ services:
       HOT_CANDIDATES_SERVICE_BASE_URL: http://hot-candidates-service:8031
       CANDIDATE_MEMORY_SERVICE_BASE_URL: http://candidate-memory-service:8032
       AMBUSH_WATCHLIST_SERVICE_BASE_URL: http://ambush-watchlist-service:8033
+      T_BOARD_RELAY_SERVICE_BASE_URL: http://t-board-relay-service:8034
+      RESEARCH_SERVICE_BASE_URL: http://research-service:8029
+      SCHEDULER_T_BOARD_GUARD_SYMBOL: ${SCHEDULER_T_BOARD_GUARD_SYMBOL:-000759.SZ}
+      SCHEDULER_REQUIRED_MODEL_SERVICES: ${SCHEDULER_REQUIRED_MODEL_SERVICES:-hot_candidates,t_board_relay}
+      SCHEDULER_MODEL_TIME_WHEEL_LIVE_DISPATCH: ${SCHEDULER_MODEL_TIME_WHEEL_LIVE_DISPATCH:-true}
+      SCHEDULER_TASK_STORE_PATH: ${SCHEDULER_TASK_STORE_PATH:-/var/lib/ai_stock_scheduler/task_store.sqlite3}
       SERVICE_NAME: scheduler-service
       PORT: 8023
     depends_on:
@@ -248,17 +284,82 @@ services:
         condition: service_completed_successfully
       source-data-service:
         condition: service_healthy
-      hot-candidates-service:
-        condition: service_healthy
-      candidate-memory-service:
-        condition: service_healthy
-      ambush-watchlist-service:
+      research-service:
         condition: service_healthy
     command: ["uvicorn", "scheduler_service.main:app", "--host", "0.0.0.0", "--port", "8023"]
     ports:
       - "${SCHEDULER_SERVICE_PORT:-8023}:8023"
+    volumes:
+      - scheduler_task_store:/var/lib/ai_stock_scheduler
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8023/readyz', timeout=3).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  data-inspector-service:
+    build:
+      context: ..
+      dockerfile: infra/docker/service.Dockerfile
+      args:
+        SERVICE_DIR: services/data-inspector-service
+    container_name: ai-stock-data-inspector-service
+    environment:
+      AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_SERVICE_BASE_URL: http://source-data-service:8041
+      SCHEDULER_SERVICE_BASE_URL: http://scheduler-service:8023
+      HOT_CANDIDATES_SERVICE_BASE_URL: http://hot-candidates-service:8031
+      CANDIDATE_MEMORY_SERVICE_BASE_URL: http://candidate-memory-service:8032
+      AMBUSH_WATCHLIST_SERVICE_BASE_URL: http://ambush-watchlist-service:8033
+      T_BOARD_RELAY_SERVICE_BASE_URL: http://t-board-relay-service:8034
+      DATA_INSPECTOR_REQUIRED_MODEL_SERVICES: ${DATA_INSPECTOR_REQUIRED_MODEL_SERVICES:-none}
+      T_BOARD_DEFAULT_SYMBOL: ${T_BOARD_DEFAULT_SYMBOL:-000759.SZ}
+      SERVICE_NAME: data-inspector-service
+      PORT: 8025
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-bootstrap:
+        condition: service_completed_successfully
+      source-data-service:
+        condition: service_healthy
+    command: ["uvicorn", "data_inspector_service.main:app", "--host", "0.0.0.0", "--port", "8025"]
+    ports:
+      - "${DATA_INSPECTOR_SERVICE_PORT:-8025}:8025"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8025/readyz', timeout=3).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  research-service:
+    build:
+      context: ..
+      dockerfile: infra/docker/service.Dockerfile
+      args:
+        SERVICE_DIR: services/research-service
+    container_name: ai-stock-research-service
+    environment:
+      AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_SERVICE_BASE_URL: http://source-data-service:8041
+      SERVICE_NAME: research-service
+      PORT: 8029
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-bootstrap:
+        condition: service_completed_successfully
+      source-data-service:
+        condition: service_healthy
+    command: ["uvicorn", "research_service.main:app", "--host", "0.0.0.0", "--port", "8029"]
+    ports:
+      - "${RESEARCH_SERVICE_PORT:-8029}:8029"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8029/readyz', timeout=3).read()\""]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -270,3 +371,4 @@ volumes:
   redis_data:
   nats_data:
   minio_data:
+  scheduler_task_store:

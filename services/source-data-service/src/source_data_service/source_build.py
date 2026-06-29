@@ -34,6 +34,8 @@ OHLC_RAW_FIELD_SETS: dict[str, dict[str, str]] = {
     # canonical validation names -> provider raw row field names
     "baostock_raw": {"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume", "amount": "amount"},
     "akshare_raw": {"open": "开盘", "high": "最高", "low": "最低", "close": "收盘", "volume": "成交量", "amount": "成交额"},
+    "tencent_raw": {"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume", "amount": "amount"},
+    "sohu_raw": {"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume", "amount": "amount"},
     "tushare_raw": {"open": "open", "high": "high", "low": "low", "close": "close", "volume": "vol", "amount": "amount"},
 }
 
@@ -52,6 +54,10 @@ def _field_set_for(provider: Provider, api_name: str) -> dict[str, str] | None:
         return OHLC_RAW_FIELD_SETS["baostock_raw"]
     if provider == Provider.AKSHARE and ("hist" in api_name or "index_zh_a_hist" in api_name or "board_industry_hist" in api_name):
         return OHLC_RAW_FIELD_SETS["akshare_raw"]
+    if provider == Provider.TENCENT and api_name == "daily_bars":
+        return OHLC_RAW_FIELD_SETS["tencent_raw"]
+    if provider == Provider.SOHU and api_name == "daily_bars":
+        return OHLC_RAW_FIELD_SETS["sohu_raw"]
     if provider == Provider.TUSHARE and api_name == "daily":
         return OHLC_RAW_FIELD_SETS["tushare_raw"]
     return None
@@ -84,6 +90,29 @@ def validate_raw_rows(request: QualityValidationRequest) -> QualityValidationRes
             )
 
         field_set = _field_set_for(request.provider, request.api_name)
+        if request.provider == Provider.THS and request.api_name == "paid_limit_up_probability":
+            probability = _as_decimal(row.get("paid_limit_up_probability"))
+            status_code = row.get("status_code")
+            if status_code not in (0, "0"):
+                issues.append(
+                    QualityCheckIssue(
+                        row_index=row_index,
+                        field_name="status_code",
+                        severity="error",
+                        rule_code="ths_paid_probability_status_not_success",
+                        message="THS paid probability raw row must have status_code=0 before source build.",
+                    )
+                )
+            if probability is None or probability < 0 or probability > 100:
+                issues.append(
+                    QualityCheckIssue(
+                        row_index=row_index,
+                        field_name="paid_limit_up_probability",
+                        severity="error",
+                        rule_code="ths_paid_probability_out_of_range",
+                        message="THS paid probability must be parseable Decimal in [0,100].",
+                    )
+                )
         if field_set:
             open_v = _as_decimal(row.get(field_set["open"]))
             high_v = _as_decimal(row.get(field_set["high"]))
@@ -202,7 +231,11 @@ def build_readiness_matrix() -> ReadinessMatrixOut:
         table_requirements = [item for item in requirements if item.source_table_name == table_name]
         p0 = [item for item in table_requirements if item.required_level.value == "P0"]
         p1 = [item for item in table_requirements if item.required_level.value == "P1"]
-        missing_backup = [item.canonical_field_name for item in p0 + p1 if item.backup_provider is None]
+        missing_backup = [
+            item.canonical_field_name
+            for item in p0 + p1
+            if item.backup_provider is None and not item.allows_missing_backup()
+        ]
         status = "passed"
         if missing_backup:
             status = "blocked"

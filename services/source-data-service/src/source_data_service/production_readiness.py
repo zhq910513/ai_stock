@@ -54,6 +54,16 @@ def build_production_readiness_report(*, require_postgres: bool = True, require_
     storage = list_storage_policies()
     model_reqs = list_model_requirements()
     queues = queue_summary()
+    p0_p1_missing_backup = [
+        f"{r.source_table_name}.{r.canonical_field_name}"
+        for r in requirements
+        if r.required_level.value in {"P0", "P1"} and not r.backup_provider and not r.allows_missing_backup()
+    ]
+    p0_p1_allowed_no_backup = [
+        f"{r.source_table_name}.{r.canonical_field_name}"
+        for r in requirements
+        if r.required_level.value in {"P0", "P1"} and not r.backup_provider and r.allows_missing_backup()
+    ]
 
     checks.append(
         _check(
@@ -74,9 +84,13 @@ def build_production_readiness_report(*, require_postgres: bool = True, require_
     checks.append(
         _check(
             "source_requirements_loaded",
-            len(requirements) >= 20 and all(r.backup_provider for r in requirements if r.required_level.value in {"P0", "P1"}),
-            evidence={"source_requirement_count": len(requirements), "p0_p1_missing_backup": [f"{r.source_table_name}.{r.canonical_field_name}" for r in requirements if r.required_level.value in {"P0", "P1"} and not r.backup_provider]},
-            action="P0/P1 source 字段必须有 backup provider，否则不能支撑补采和降级。",
+            len(requirements) >= 20 and not p0_p1_missing_backup,
+            evidence={
+                "source_requirement_count": len(requirements),
+                "p0_p1_missing_backup": p0_p1_missing_backup,
+                "p0_p1_allowed_no_backup": p0_p1_allowed_no_backup,
+            },
+            action="P0/P1 source 字段必须有 backup provider；仅 ths.paid_limit_up_probability 允许无备源，失效时阻断或在下一交易日 09:00 后放弃批次。",
         )
     )
     checks.append(

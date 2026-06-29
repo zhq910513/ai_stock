@@ -2,7 +2,7 @@
 # Non-sensitive only: store env var names, never token/password values.
 
 catalog_version = "market_data_source_catalog_v1"
-owner_service = "market-data-service"
+owner_service = "source-data-service"
 
 [guardrails]
 secret_values_forbidden = true
@@ -53,7 +53,7 @@ supported_modes = ["current_session", "after_close_target_day_backfill", "recent
 decision_role = "primary_or_context_source_after_probe"
 historical_backfill_role = "limited_by_endpoint_window_and_probe_result"
 contract_status = "active_verified_adapters"
-domains = ["quote", "auction", "daily_bar", "minute_bar", "moneyflow", "board_context", "northbound", "macro_lpr", "billboard"]
+domains = ["stock_universe", "quote", "auction", "daily_bar", "minute_bar", "moneyflow", "board_context", "northbound", "macro_lpr", "billboard"]
 planned_domains = []
 notes = "billboard uses the no-login Eastmoney DataCenter RPT_DAILYBILLBOARD_DETAILSNEW endpoint; adapter writes raw payloads and market.billboard_trade canonical rows."
 
@@ -75,11 +75,25 @@ access_tier = "free_public_unofficial"
 implemented = true
 auth_required = false
 env_keys = []
-supported_modes = ["current_session", "recent_historical_backfill", "auction_auxiliary_confirmation"]
-decision_role = "fallback_or_auxiliary_after_probe"
+supported_modes = ["current_session", "recent_historical_backfill", "auction_auxiliary_confirmation", "p0_daily_bar_replacement"]
+decision_role = "p0_daily_qfq_index_replacement_after_probe"
 historical_backfill_role = "recent_window_only"
-contract_status = "active_verified_fallback"
-domains = ["quote", "auction", "daily_bar", "minute_bar"]
+contract_status = "active_verified_daily_bars_replacement"
+domains = ["quote", "auction", "daily_bar", "adjusted_daily_bar", "index_daily_bar", "minute_bar"]
+notes = "source-data-service TencentAdapter.daily_bars is the current AKShare/EastMoney replacement for daily raw/qfq/index OHLC and volume after real probe and raw/source/lineage build. It deliberately leaves historical target-date amount and pct_chg as NULL for individual stocks; Sohu covers those fields."
+
+[providers.sohu]
+display_name = "Sohu public historical K-line"
+access_tier = "free_public_unofficial"
+implemented = true
+auth_required = false
+env_keys = []
+supported_modes = ["recent_historical_backfill", "p0_daily_bar_field_backup"]
+decision_role = "field_level_backup_after_probe_for_daily_amount_pct_chg"
+historical_backfill_role = "bounded_public_history_after_probe"
+contract_status = "active_verified_daily_amount_pct_backup"
+domains = ["daily_bar"]
+notes = "source-data-service SohuAdapter.daily_bars uses the public hisHq endpoint as source.daily_bar_v1 amount/pct_chg/turnover_rate backup. Volume is normalized from hands to shares and amount from ten-thousand CNY to CNY before canonical comparison."
 
 [providers.coingecko]
 display_name = "CoinGecko public API"
@@ -107,20 +121,22 @@ contract_status = "active_verified_adapters"
 domains = ["cross_market_global_risk", "cross_market_crypto"]
 
 [providers.ths]
-display_name = "THS public context and operator-supplied paid candidate prior"
+display_name = "THS public limit-up and context"
 access_tier = "free_public_unofficial"
 implemented = true
 auth_required = false
 env_keys = []
-supported_modes = ["operator_supplied_candidate_prior", "public_context_after_probe", "after_close_target_day_context"]
-decision_role = "candidate_prior_and_context_only"
+supported_modes = ["public_limit_up_pool_after_probe", "operator_supplied_candidate_prior", "public_context_after_probe", "after_close_target_day_context"]
+decision_role = "source_limit_event_primary_after_probe_and_context_only"
 historical_backfill_role = "public_context_recent_or_target_day_only"
-contract_status = "active_public_context_verified_no_login"
-domains = ["external_candidate_prior", "limit_up_reason", "market_state", "hot_block", "market_capital", "stock_concept", "stock_attention"]
+contract_status = "source_data_service_adapter_active_no_login_public_only"
+domains = ["limit_up_pool", "external_candidate_prior", "limit_up_reason", "market_state", "hot_block", "market_capital", "stock_concept", "stock_attention"]
 docs = [
+  "https://data.10jqka.com.cn/dataapi/limit_up/limit_up_pool",
   "https://data.10jqka.com.cn/mobile/limitup/v2/index.html",
   "https://eq.10jqka.com.cn/open/api/wencai/zhangting5.txt",
 ]
+notes = "source-data-service THSAdapter implements only public no-login/no-Cookie/no-hexin-v interfaces. limit_up_pool is the preferred source.limit_event_v1 route after real probe; daily-bar derivation remains backup."
 
 [providers.baidu]
 display_name = "Baidu Finance public web feed"
@@ -206,6 +222,7 @@ decision_role = "not_a_production_source_until_underlying_endpoint_probe"
 historical_backfill_role = "discovery_only_until_direct_adapter_contract_exists"
 contract_status = "candidate_library_wrapper_no_canonical_adapter"
 domains = ["moneyflow", "board_context", "macro"]
+notes = "Research-only wrapper source until latest real probe passes. source-data-service currently removes AKShare/EastMoney-backed stock_zh_a_hist_daily_raw, stock_zh_a_hist_daily_qfq, index_zh_a_hist and stock_zh_a_spot_em from production probe gates when their latest real probes fail; BaoStock and Tencent cover the P0 daily/universe paths."
 
 [providers.wind]
 display_name = "Wind Financial Terminal/API"

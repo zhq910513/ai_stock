@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, time, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, time, timezone
 from typing import Any
 
 from source_data_service.gap_detector import build_repair_plan
@@ -25,6 +26,50 @@ from source_data_service.source_repository import list_source_rows
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _date_or_none(value: Any) -> date | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    text = str(value)
+    try:
+        if len(text) == 8 and text.isdigit():
+            return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+        if len(text) >= 10:
+            return date.fromisoformat(text[:10])
+    except Exception:
+        return None
+    return None
+
+
+def _freshness_for_available_at(
+    *,
+    latest: datetime,
+    checked: datetime,
+    decision_time: datetime | None,
+    stale_after_minutes: int,
+) -> tuple[str, str]:
+    latest_utc = _as_utc(latest)
+    checked_utc = _as_utc(checked)
+    if decision_time is not None:
+        decision_utc = _as_utc(decision_time)
+        if latest_utc <= decision_utc:
+            visible_lag = max(0, int((decision_utc - latest_utc).total_seconds() // 60))
+            return "fresh", f"source row was available {visible_lag}m before decision_time"
+        unavailable_lag = max(0, int((latest_utc - decision_utc).total_seconds() // 60))
+        return "late", f"source row available_at is {unavailable_lag}m after decision_time"
+    lag_minutes = max(0, int((checked_utc - latest_utc).total_seconds() // 60))
+    if lag_minutes <= stale_after_minutes:
+        return "fresh", f"latest available_at age={lag_minutes}m within stale_after={stale_after_minutes}m"
+    return "stale", f"latest available_at age={lag_minutes}m exceeds stale_after={stale_after_minutes}m"
 
 
 FRESHNESS_SLA: list[SourceFreshnessSla] = [
@@ -72,7 +117,7 @@ FRESHNESS_SLA: list[SourceFreshnessSla] = [
     ),
     SourceFreshnessSla(
         source_table_name="source.stock_moneyflow_daily_v1",
-        canonical_field_name="net_mf_amount",
+        canonical_field_name="main_net_inflow",
         frequency="daily",
         market_phase="after_close",
         expected_available_time="16:15",
@@ -83,6 +128,76 @@ FRESHNESS_SLA: list[SourceFreshnessSla] = [
         late_policy="degrade",
         fallback_policy="degrade model explanation and mark moneyflow evidence gap",
         comment="Free moneyflow has provider口径差异；缺失时降级，不阻断 P0 release。",
+    ),
+    SourceFreshnessSla(
+        source_table_name="source.limit_price_v1",
+        canonical_field_name="up_limit_price",
+        frequency="daily",
+        market_phase="after_close",
+        expected_available_time="15:35",
+        latest_acceptable_time="16:30",
+        used_by_models=["t_board_relay"],
+        required_for_release_gate=True,
+        stale_after_minutes=60,
+        late_policy="block_official_release",
+        fallback_policy="rebuild source.limit_price_v1 from BaoStock/Tencent raw daily bars",
+        comment="Model-four T-board detection must use computed raw-price limit, not adjusted price.",
+    ),
+    SourceFreshnessSla(
+        source_table_name="source.limit_event_v1",
+        canonical_field_name="limit_event_type",
+        frequency="daily",
+        market_phase="after_close",
+        expected_available_time="15:35",
+        latest_acceptable_time="16:30",
+        used_by_models=["t_board_relay"],
+        required_for_release_gate=True,
+        stale_after_minutes=60,
+        late_policy="block_official_release",
+        fallback_policy="rebuild source.limit_event_v1 from source.daily_bar_v1 and source.limit_price_v1",
+        comment="Model-four Day1 scan must distinguish T-board, one-word board and broken limit.",
+    ),
+    SourceFreshnessSla(
+        source_table_name="source.realtime_quote_v1",
+        canonical_field_name="latest_price",
+        frequency="intraday_snapshot",
+        market_phase="day2_1030_watch",
+        expected_available_time="10:30",
+        latest_acceptable_time="10:40",
+        used_by_models=["t_board_relay"],
+        required_for_release_gate=True,
+        stale_after_minutes=60,
+        late_policy="block_official_release",
+        fallback_policy="fetch EastMoney quote_snapshot or derive historical watch from minute_bar_v1",
+        comment="Model-four Day2 watch needs latest price near limit and quote-derived float market cap.",
+    ),
+    SourceFreshnessSla(
+        source_table_name="source.minute_bar_v1",
+        canonical_field_name="close_price",
+        frequency="minute",
+        market_phase="day2_intraday_watch",
+        expected_available_time="10:30",
+        latest_acceptable_time="10:40",
+        used_by_models=["t_board_relay"],
+        required_for_release_gate=True,
+        stale_after_minutes=60,
+        late_policy="block_official_release",
+        fallback_policy="fetch EastMoney minute_bars and rebuild source.minute_bar_v1",
+        comment="Minute bars support Day2 near-limit and post-entry board-open verification.",
+    ),
+    SourceFreshnessSla(
+        source_table_name="source.trade_tick_v1",
+        canonical_field_name="side_code",
+        frequency="intraday_tick",
+        market_phase="day2_1030_trigger",
+        expected_available_time="10:30",
+        latest_acceptable_time="10:40",
+        used_by_models=["t_board_relay"],
+        required_for_release_gate=True,
+        stale_after_minutes=60,
+        late_policy="block_official_release",
+        fallback_policy="fetch EastMoney trade_details; if unavailable, keep model-four trigger data_blocked",
+        comment="Public trade details provide auditable tick-like evidence; they do not replace true order-book depth.",
     ),
 ]
 
@@ -212,7 +327,7 @@ MODEL_REQUIREMENTS: list[ModelSourceRequirement] = [
         model_code="ambush_watchlist",
         model_phase="release_gate",
         source_table_name="source.stock_moneyflow_daily_v1",
-        canonical_field_name="net_mf_amount",
+        canonical_field_name="main_net_inflow",
         required_level=RequiredLevel.P1,
         required_for_official_signal=False,
         required_for_backtest=True,
@@ -222,6 +337,96 @@ MODEL_REQUIREMENTS: list[ModelSourceRequirement] = [
         minimum_date_coverage_rate=0.85,
         minimum_field_coverage_rate=0.85,
         comment="资金流缺失可降级为 evidence_gap，不阻断模型三 P0 release。",
+    ),
+    ModelSourceRequirement(
+        model_code="t_board_relay",
+        model_phase="day1_scan",
+        source_table_name="source.daily_bar_v1",
+        canonical_field_name="close_price",
+        required_level=RequiredLevel.P0,
+        required_for_official_signal=True,
+        required_for_backtest=True,
+        required_for_research=True,
+        degrade_policy="block",
+        minimum_symbol_coverage_rate=0.995,
+        minimum_date_coverage_rate=0.995,
+        minimum_field_coverage_rate=0.995,
+        comment="模型四 Day1 必须用真实未复权 OHLC 判断开盘涨停、盘中开板和收盘回封。",
+    ),
+    ModelSourceRequirement(
+        model_code="t_board_relay",
+        model_phase="day1_scan",
+        source_table_name="source.limit_price_v1",
+        canonical_field_name="up_limit_price",
+        required_level=RequiredLevel.P0,
+        required_for_official_signal=True,
+        required_for_backtest=True,
+        required_for_research=True,
+        degrade_policy="block",
+        minimum_symbol_coverage_rate=0.995,
+        minimum_date_coverage_rate=0.995,
+        minimum_field_coverage_rate=0.995,
+        comment="模型四 Day1 T 字板识别必须有涨停价，不得用涨跌幅或推断补齐。",
+    ),
+    ModelSourceRequirement(
+        model_code="t_board_relay",
+        model_phase="day1_scan",
+        source_table_name="source.limit_event_v1",
+        canonical_field_name="limit_event_type",
+        required_level=RequiredLevel.P0,
+        required_for_official_signal=True,
+        required_for_backtest=True,
+        required_for_research=True,
+        degrade_policy="block",
+        minimum_symbol_coverage_rate=0.995,
+        minimum_date_coverage_rate=0.995,
+        minimum_field_coverage_rate=0.995,
+        comment="模型四 Day1 必须有涨跌停事件分类，区分 T 字板、一字板和炸板。",
+    ),
+    ModelSourceRequirement(
+        model_code="t_board_relay",
+        model_phase="day1_scan",
+        source_table_name="source.realtime_quote_v1",
+        canonical_field_name="float_market_cap",
+        required_level=RequiredLevel.P0,
+        required_for_official_signal=True,
+        required_for_backtest=True,
+        required_for_research=True,
+        degrade_policy="block",
+        minimum_symbol_coverage_rate=0.95,
+        minimum_date_coverage_rate=0.95,
+        minimum_field_coverage_rate=0.95,
+        comment="模型四 Day1 流通市值闸门使用 quote snapshot 的公开流通市值字段；缺失时不得 official。",
+    ),
+    ModelSourceRequirement(
+        model_code="t_board_relay",
+        model_phase="day2_trigger",
+        source_table_name="source.minute_bar_v1",
+        canonical_field_name="close_price",
+        required_level=RequiredLevel.P0,
+        required_for_official_signal=True,
+        required_for_backtest=True,
+        required_for_research=True,
+        degrade_policy="block",
+        minimum_symbol_coverage_rate=0.95,
+        minimum_date_coverage_rate=0.95,
+        minimum_field_coverage_rate=0.95,
+        comment="模型四 Day2 10:30 附近必须有真实分时价格路径。",
+    ),
+    ModelSourceRequirement(
+        model_code="t_board_relay",
+        model_phase="day2_trigger",
+        source_table_name="source.trade_tick_v1",
+        canonical_field_name="side_code",
+        required_level=RequiredLevel.P0,
+        required_for_official_signal=True,
+        required_for_backtest=True,
+        required_for_research=True,
+        degrade_policy="block",
+        minimum_symbol_coverage_rate=0.90,
+        minimum_date_coverage_rate=0.90,
+        minimum_field_coverage_rate=0.90,
+        comment="模型四 Day2 触发必须有公开逐笔/明细侧向证据；该字段是 provider-native side_code，不等同完整盘口五档。",
     ),
 ]
 
@@ -238,6 +443,63 @@ def list_storage_policies(table_name: str | None = None) -> list[SourceStoragePo
     if table_name:
         rows = [row for row in rows if row.table_name == table_name]
     return rows
+
+
+@dataclass(frozen=True)
+class _RequirementDateContext:
+    requirement: ModelSourceRequirement
+    trade_date: date
+    date_role: str
+    blocker: str | None = None
+
+
+def _pretrade_date_for(trade_date: date) -> date | None:
+    rows = list_source_rows("source.trade_calendar_v1", trade_date=trade_date.isoformat())
+    for row in rows:
+        candidate = (
+            row.values.get("pretrade_date")
+            or row.values.get("prev_trading_day")
+            or row.values.get("previous_trade_date")
+        )
+        parsed = _date_or_none(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _uses_previous_trade_date(req: ModelSourceRequirement, *, model_code: str, model_phase: str) -> bool:
+    return (
+        model_code == "hot_candidates"
+        and model_phase == "preopen_release_gate"
+        and req.source_table_name == "source.daily_bar_v1"
+    )
+
+
+def _requirement_date_contexts(*, model_code: str, model_phase: str, trade_date: date) -> list[_RequirementDateContext]:
+    contexts: list[_RequirementDateContext] = []
+    for req in list_model_requirements(model_code, model_phase):
+        if _uses_previous_trade_date(req, model_code=model_code, model_phase=model_phase):
+            pretrade_date = _pretrade_date_for(trade_date)
+            if pretrade_date is None:
+                contexts.append(
+                    _RequirementDateContext(
+                        requirement=req,
+                        trade_date=trade_date,
+                        date_role="previous_trade_date",
+                        blocker=f"source.trade_calendar_v1.pretrade_date:<any>:missing_for_{trade_date.isoformat()}",
+                    )
+                )
+                continue
+            contexts.append(
+                _RequirementDateContext(
+                    requirement=req,
+                    trade_date=pretrade_date,
+                    date_role="previous_trade_date",
+                )
+            )
+            continue
+        contexts.append(_RequirementDateContext(requirement=req, trade_date=trade_date, date_role="trade_date"))
+    return contexts
 
 
 def list_model_requirements(model_code: str | None = None, model_phase: str | None = None) -> list[ModelSourceRequirement]:
@@ -297,9 +559,22 @@ def _coverage_for(req: ModelSourceRequirement, symbols: list[str], trade_date: s
 
 
 def check_model_coverage(request: ModelCoverageCheckRequest) -> ModelCoverageCheckResult:
-    reqs = [r for r in list_model_requirements(request.model_code, request.model_phase) if r.required_level in set(request.required_levels)]
-    rows = [_coverage_for(req, request.symbols, str(request.trade_date)) for req in reqs]
+    contexts = [
+        context
+        for context in _requirement_date_contexts(
+            model_code=request.model_code,
+            model_phase=request.model_phase,
+            trade_date=request.trade_date,
+        )
+        if context.requirement.required_level in set(request.required_levels)
+    ]
+    rows = [
+        _coverage_for(context.requirement, request.symbols, context.trade_date.isoformat())
+        for context in contexts
+        if context.blocker is None
+    ]
     blocking = [f"{r.source_table_name}.{r.canonical_field_name}" for r in rows if r.status == "blocked"]
+    blocking.extend(context.blocker for context in contexts if context.blocker)
     degraded = [f"{r.source_table_name}.{r.canonical_field_name}" for r in rows if r.status == "degraded"]
     if blocking:
         status = "blocked"
@@ -343,14 +618,16 @@ def check_freshness(request: SourceFreshnessStatusRequest) -> SourceFreshnessSta
                 status = "missing"
                 reason = "no canonical source row or field value found"
             else:
-                lag_minutes = max(0, int((checked - latest).total_seconds() // 60))
-                if lag_minutes <= sla.stale_after_minutes:
+                status, reason = _freshness_for_available_at(
+                    latest=latest,
+                    checked=checked,
+                    decision_time=request.decision_time,
+                    stale_after_minutes=sla.stale_after_minutes,
+                )
+                if status == "stale" and request.trade_date < checked.date():
                     status = "fresh"
-                    reason = f"latest available_at age={lag_minutes}m within stale_after={sla.stale_after_minutes}m"
-                else:
-                    status = "stale"
-                    reason = f"latest available_at age={lag_minutes}m exceeds stale_after={sla.stale_after_minutes}m"
-            blocking = status in {"missing", "stale"} and sla.late_policy == "block_official_release"
+                    reason = "historical completed trade_date row exists; wall-clock age is not a live freshness blocker"
+            blocking = status in {"missing", "late", "stale"} and sla.late_policy == "block_official_release"
             if blocking:
                 blockers.append(f"{sla.source_table_name}.{sla.canonical_field_name}:{symbol or '<any>'}:{status}")
             rows.append(
@@ -372,6 +649,11 @@ def check_freshness(request: SourceFreshnessStatusRequest) -> SourceFreshnessSta
 
 
 def preflight_release(request: ReleasePreflightRequest) -> ReleasePreflightResult:
+    contexts = _requirement_date_contexts(
+        model_code=request.model_code,
+        model_phase=request.model_phase,
+        trade_date=request.trade_date,
+    )
     coverage = check_model_coverage(
         ModelCoverageCheckRequest(
             model_code=request.model_code,
@@ -383,19 +665,24 @@ def preflight_release(request: ReleasePreflightRequest) -> ReleasePreflightResul
     )
     # Check freshness for the P0/P1 fields used by this model phase.
     freshness_results = []
-    for req in list_model_requirements(request.model_code, request.model_phase):
+    date_role_blockers = [context.blocker for context in contexts if context.blocker]
+    for context in contexts:
+        if context.blocker:
+            continue
+        req = context.requirement
         freshness_results.append(
             check_freshness(
                 SourceFreshnessStatusRequest(
                     source_table_name=req.source_table_name,
                     canonical_fields=[req.canonical_field_name],
                     symbols=request.symbols,
-                    trade_date=request.trade_date,
+                    trade_date=context.trade_date,
                     decision_time=request.decision_time,
                 )
             )
         )
     freshness_blockers = [reason for result in freshness_results for reason in result.blocking_reasons]
+    freshness_blockers.extend(reason for reason in date_role_blockers if reason)
     freshness_status = "blocked" if freshness_blockers else ("passed" if all(r.status == "passed" for r in freshness_results) else "degraded")
     blocking = list(coverage.blocking_fields) + freshness_blockers
     degraded = list(coverage.degraded_fields)

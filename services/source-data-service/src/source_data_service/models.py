@@ -28,7 +28,13 @@ class Provider(str, Enum):
     TUSHARE = "tushare"
     EASTMONEY = "eastmoney"
     TENCENT = "tencent"
+    SOHU = "sohu"
+    BAIDU = "baidu"
     SINA = "sina"
+    THS = "ths"
+    COINGECKO = "coingecko"
+    YAHOO = "yahoo"
+    JIN10 = "jin10"
     CNINFO = "cninfo"
     INTERNAL = "internal"
 
@@ -126,12 +132,19 @@ class SourceTableRequirement(BaseModel):
     repair_raw_table_name: str
     description: str
 
+    def allows_missing_backup(self) -> bool:
+        return (
+            self.source_table_name == "source.ths_paid_limit_up_probability_v1"
+            and self.primary_provider == Provider.THS
+            and self.primary_api_name == "paid_limit_up_probability"
+        )
+
     @model_validator(mode="after")
     def validate_backup_and_no_model_fields(self) -> "SourceTableRequirement":
         field = self.canonical_field_name.lower()
         if any(fragment in field for fragment in MODEL_OWNED_FIELD_FRAGMENTS):
             raise ValueError(f"source requirement field has model-owned semantics: {self.canonical_field_name}")
-        if self.required_level in {RequiredLevel.P0, RequiredLevel.P1} and not self.backup_provider:
+        if self.required_level in {RequiredLevel.P0, RequiredLevel.P1} and not self.backup_provider and not self.allows_missing_backup():
             raise ValueError(f"{self.source_table_name}.{self.canonical_field_name} requires backup provider")
         return self
 
@@ -296,6 +309,83 @@ class ProbeResult(BaseModel):
     reject_reason: str | None = None
 
 
+class ThsPaidProbabilityCookieUpdateRequest(BaseModel):
+    user: str = Field(min_length=1)
+    userid: str = Field(min_length=1)
+    updated_by: str | None = None
+
+
+class ThsPaidProbabilityCookieStatus(BaseModel):
+    configured: bool
+    status: Literal["missing", "pending_probe", "valid", "expired", "invalid"] = "missing"
+    credential_version: str | None = None
+    user_masked: str | None = None
+    userid_masked: str | None = None
+    last_checked_at: datetime | None = None
+    last_success_at: datetime | None = None
+    last_failure_at: datetime | None = None
+    failure_reason: str | None = None
+
+
+class ThsPaidProbabilityProbeRequest(BaseModel):
+    trade_date: date | None = None
+    symbol: str | None = None
+    dry_run: bool = False
+
+
+class ThsPaidProbabilityProbeResult(BaseModel):
+    ok: bool
+    status: Literal["valid", "expired", "missing", "invalid", "dry_run"]
+    credential_version: str | None = None
+    trade_date: date | None = None
+    symbol: str | None = None
+    probability: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    checked_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ThsPaidProbabilityFetchCurrentBatchRequest(BaseModel):
+    trade_date: date | None = None
+    symbols: list[str] = Field(default_factory=list)
+    source_table_name: str = "source.ths_paid_limit_up_probability_v1"
+    run_worker_once: bool = False
+    dry_run: bool = False
+    request_source: str = "source-data-service:ths-paid-probability"
+
+
+class ThsPaidProbabilityBatchStatus(BaseModel):
+    trade_date: date
+    status: Literal[
+        "no_candidates",
+        "pending_cookie",
+        "fetching",
+        "partial",
+        "ready",
+        "cookie_expired",
+        "abandoned_no_probability_before_deadline",
+    ]
+    candidate_count: int = 0
+    fetched_count: int = 0
+    missing_symbols: list[str] = Field(default_factory=list)
+    deadline_at: datetime | None = None
+    next_trade_date: date | None = None
+    cookie_status: Literal["missing", "pending_probe", "valid", "expired", "invalid"] = "missing"
+    message: str | None = None
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ThsPaidProbabilityFetchCurrentBatchResult(BaseModel):
+    trade_date: date | None = None
+    submitted: bool
+    fetch_batch_id: str | None = None
+    submitted_job_count: int = 0
+    skipped_duplicate_count: int = 0
+    batch_status: ThsPaidProbabilityBatchStatus | None = None
+    probe: ThsPaidProbabilityProbeResult | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ReadinessRequest(BaseModel):
     source_table_name: str
 
@@ -395,6 +485,66 @@ class QualityValidationResult(BaseModel):
     issues: list[QualityCheckIssue]
 
 
+class MultiSourceQualityCheckRequest(BaseModel):
+    source_table_name: str
+    canonical_fields: list[str] = Field(default_factory=list)
+    symbol: str
+    trade_date: date
+    include_backup: bool = True
+    dry_run: bool = False
+    absolute_tolerance: dict[str, str] = Field(default_factory=dict)
+    relative_tolerance: dict[str, str] = Field(default_factory=dict)
+
+
+class MultiSourceProviderEvidence(BaseModel):
+    provider: Provider
+    api_name: str
+    raw_table_name: str
+    request_params: dict[str, Any]
+    row_count: int
+    target_row_found: bool = False
+    target_row_identity: dict[str, Any] = Field(default_factory=dict)
+    raw_quality_status: Literal["passed", "blocked", "not_checked"]
+    build_allowed: bool
+    error: str | None = None
+    warning: str | None = None
+    canonical_values: dict[str, str | None] = Field(default_factory=dict)
+
+
+class MultiSourceFieldComparison(BaseModel):
+    canonical_field_name: str
+    status: Literal["passed", "warning", "blocked"]
+    baseline_provider: Provider | None = None
+    baseline_api_name: str | None = None
+    compared_provider: Provider | None = None
+    compared_api_name: str | None = None
+    baseline_value: str | None = None
+    compared_value: str | None = None
+    absolute_diff: str | None = None
+    relative_diff: str | None = None
+    absolute_tolerance: str | None = None
+    relative_tolerance: str | None = None
+    reason: str
+
+
+class MultiSourceQualityCheckResult(BaseModel):
+    source_table_name: str
+    symbol: str
+    trade_date: date
+    status: Literal["passed", "warning", "blocked"]
+    checked_at: datetime
+    provider_count: int
+    usable_provider_count: int
+    field_count: int
+    passed_field_count: int
+    warning_field_count: int
+    blocked_field_count: int
+    provider_evidence: list[MultiSourceProviderEvidence]
+    comparisons: list[MultiSourceFieldComparison]
+    blocking_reasons: list[str] = Field(default_factory=list)
+    warning_reasons: list[str] = Field(default_factory=list)
+
+
 class ReadinessMatrixRow(BaseModel):
     source_table_name: str
     p0_field_count: int
@@ -475,6 +625,12 @@ class FetchStrategy(str, Enum):
     API_BATCH_BY_DATE = "api_batch_by_date"
 
 
+class FetchUniverseScope(str, Enum):
+    EXPLICIT_SYMBOLS = "explicit_symbols"
+    FULL_A_SHARE = "full_a_share"
+    STAGE_CANDIDATES = "stage_candidates"
+
+
 class FetchQueueName(str, Enum):
     URGENT_RELEASE_GATE_QUEUE = "urgent_release_gate_queue"
     NORMAL_DAILY_INGEST_QUEUE = "normal_daily_ingest_queue"
@@ -538,6 +694,7 @@ class FetchPlanRequest(BaseModel):
     source_table_name: str
     canonical_fields: list[str] = Field(default_factory=list)
     symbols: list[str] = Field(default_factory=list)
+    universe_scope: FetchUniverseScope = FetchUniverseScope.EXPLICIT_SYMBOLS
     trade_date: date | None = None
     start_date: date | None = None
     end_date: date | None = None
@@ -655,6 +812,8 @@ class FetchJobStatusOut(BaseModel):
     lease_expires_at: datetime | None = None
     last_error_code: str | None = None
     last_error_message: str | None = None
+    raw_request_hash: str | None = None
+    raw_response_schema_hash: str | None = None
     created_at: datetime
     updated_at: datetime
 

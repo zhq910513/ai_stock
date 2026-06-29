@@ -114,15 +114,22 @@ def build_hot_source_visibility_audit(row: dict[str, Any], *, decision_time: dat
     warning so data-inspector can force providers to backfill time lineage. Explicit
     future evidence is a hard block.
     """
-    domains: list[tuple[str, Any, Any]] = [
-        ("candidate_item", row.get("candidate_available_at") or row.get("batch_available_at"), row.get("candidate_id")),
-        ("teacher_prior", row.get("p_limit_up_available_at"), row.get("candidate_id")),
-        ("auction", (row.get("auction_snapshot") or {}).get("available_at") if isinstance(row.get("auction_snapshot"), dict) else None, (row.get("auction_snapshot") or {}).get("raw_payload_id") if isinstance(row.get("auction_snapshot"), dict) else None),
-        ("stock_moneyflow", (row.get("stock_rank") or {}).get("available_at") if isinstance(row.get("stock_rank"), dict) else None, (row.get("stock_rank") or {}).get("raw_payload_id") if isinstance(row.get("stock_rank"), dict) else None),
-        ("market_regime", (row.get("market_regime_context") or row.get("market_regime") or {}).get("available_at") if isinstance(row.get("market_regime_context") or row.get("market_regime"), dict) else None, (row.get("market_regime_context") or row.get("market_regime") or {}).get("snapshot_id") if isinstance(row.get("market_regime_context") or row.get("market_regime"), dict) else None),
-    ]
+    domains: list[tuple[str, Any, Any]] = []
+    candidate_available_at = row.get("candidate_available_at") or row.get("batch_available_at") or row.get("p_limit_up_available_at")
+    domains.append(("candidate_item", candidate_available_at, row.get("candidate_id")))
+    domains.append(("teacher_prior", row.get("p_limit_up_available_at"), row.get("candidate_id")))
+
+    auction = row.get("auction_snapshot") if isinstance(row.get("auction_snapshot"), dict) else None
+    if auction:
+        domains.append(("auction", auction.get("available_at"), auction.get("raw_payload_id")))
+    stock_rank = row.get("stock_rank") if isinstance(row.get("stock_rank"), dict) else None
+    if stock_rank:
+        domains.append(("stock_moneyflow", stock_rank.get("available_at"), stock_rank.get("raw_payload_id")))
+    market_regime = row.get("market_regime_context") or row.get("market_regime")
+    if isinstance(market_regime, dict) and market_regime:
+        domains.append(("market_regime", market_regime.get("available_at"), market_regime.get("snapshot_id")))
     for index, bar in enumerate([item for item in row.get("daily_bars") or [] if isinstance(item, dict)][-20:]):
-        domains.append((f"daily_bar[{index}]", bar.get("available_at"), bar.get("raw_payload_id") or bar.get("trading_day")))
+        domains.append((f"daily_bar[{index}]", bar.get("available_at"), bar.get("raw_payload_id") or bar.get("lineage_id") or bar.get("build_batch_id") or bar.get("trading_day") or bar.get("trade_date")))
     future_evidence: list[dict[str, Any]] = []
     missing_available_at: list[dict[str, Any]] = []
     visible_evidence: list[dict[str, Any]] = []
