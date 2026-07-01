@@ -13,7 +13,9 @@
 | `ambush-watchlist-service` | `8033` | `ambush_watchlist_effective_turn_v1_1`；Phase2/3/4 分阶段版本 | 深圳 A 股低位潜伏抬头 / 龙抬头结构扫描 |
 | `t-board-relay-service` | 容器 `8034` / 宿主默认 `8035` | `t_board_relay_v1` | T 字板主导资金博弈，识别 Day1 T 字板、Day2 开盘后 5 分钟滚动接力触发、买入后封板维护和 Day3 去留 |
 
-模型四当前集合层合同：Day2 未触发前由 `t_board_day2_watch_snapshot_v1` 五分钟滚动快照驱动普通用户观察台；触发确认以“买盘主动扫掉卖盘”为主，卖盘主动砸向买盘是风险 / 失效条件；触发后封板维护按开盘时段每 5 分钟留存至收盘；`observation-board` 同步输出 `model_score`、`model_score_label`、`score_state` 和 `model_score_version=t_board_relay_observation_score_v1`，由模型四 owner 基于阶段事实综合计算，缺关键事实时保持 `model_score=NULL`，不补 0；`t_relay.observation.monitor.snapshot_5m` 通过 `POST /t-board-relay/observation-monitor/snapshot` 每 5 分钟把当前用户可读投影 append-only 留存到 `decision_t_relay.t_board_observation_monitor_snapshot_v1`，用于三交易日回放和后续调优；前端只读消费 `observation-board` 投影和模型分降序，不生成、不修改模型事实。
+模型四当前集合层合同：Day2 未触发前由 `t_board_day2_watch_snapshot_v1` 五分钟滚动事实驱动普通用户观察台；触发确认以“买盘主动扫掉卖盘”为主，卖盘主动砸向买盘是风险 / 失效条件；触发后封板维护按开盘时段每 5 分钟留存至收盘；`observation-board` 同步输出 `model_score`、`model_score_label`、`score_state` 和 `model_score_version=t_board_relay_observation_score_v1`，由模型四 owner 基于阶段事实综合计算，缺关键事实时保持 `model_score=NULL`，不补 0；Day2 10:30 后缺有效五分钟事实时必须落 `data_wait`，不得继续显示观察中；`t_relay.observation.monitor.snapshot_5m` 每 5 分钟通过 `POST /t-board-relay/observation-monitor/snapshot` 留存 `projection_snapshot_5m`，只作为观察投影留痕和恢复审计，不覆盖真实阶段事实时间；`t_relay.live_result.compute_30m` 每 30 分钟留存 `model_result_30m`，写入 `model_evaluated_at/last_model_output_at`，二者都 append-only 写入 `decision_t_relay.t_board_observation_monitor_snapshot_v1`；前端只读消费 `observation-board` 投影和模型分降序，`更新` 列必须同时展示最后一次模型产出时间 `last_model_output_at/model_evaluated_at` 与最新真实抓取/阶段事实时间 `latest_data_fetch_at/last_data_captured_at`，`latest_projection_snapshot_at` 仅作审计，不得冒充真实抓取时间，前端不生成、不修改模型事实。
+
+2026-07-01 用户回复“允许”后，模型四集合层双时间合同进入拍板冻结：5 分钟 `projection_snapshot_5m` 只能证明观察台投影链路仍在运行，30 分钟 `model_result_30m` 才能推动 `last_model_output_at/model_evaluated_at`，真实抓取 / 阶段事实时间只能来自 owner 阶段事实。未经解锁不得合并三类时间，不得把投影时间显示成抓取时间或模型产出时间，不得移除 `t_relay.live_result.compute_30m`，不得让前端、research、scheduler 或 Jarvis 补写模型四事实。
 
 模型服务均是 owner service：只接收已组装 payload，执行模型合同计算并返回结构化结果；不直接并发调用 BaoStock、AKShare、Tencent、Tushare、EastMoney、Baidu、CNINFO 等 provider；不直接读取 `raw_*`；不直接修改前端、Jarvis、交易、学习权重或人工状态。
 
@@ -115,6 +117,7 @@ GET /readyz
 | `t_relay.day3.exit.open` | `t-board-relay-service` | `POST /t-board-relay/day3/exit-check` |
 | `t_relay.day3.exit.tail` | `t-board-relay-service` | `POST /t-board-relay/day3/exit-check` |
 | `t_relay.observation.monitor.snapshot_5m` | `t-board-relay-service` | `POST /t-board-relay/observation-monitor/snapshot` |
+| `t_relay.live_result.compute_30m` | `t-board-relay-service` | `POST /t-board-relay/observation-monitor/snapshot` |
 | `t_relay.outcome.build` | `t-board-relay-service` | `POST /t-board-relay/outcomes/build` |
 
 ## 调度时间
@@ -122,7 +125,7 @@ GET /readyz
 - 热点：竞价冻结 `09:25:05,09:25:30`；盘前评分 `09:26:00,09:28:00,09:29:30`；release gate 截止 `09:30:00`；开盘 5 分钟买点 `09:30-09:36`；盘中观察 `09:30-15:00`；T+5/T+20 outcome 和离线 evolution 在收盘后。
 - 候选记忆：seed/entity 在热点成熟样本后；pre-signal 扫描 `15:55` 及可选 `10:30` 研究扫描；release gate `16:05`；outcome/evolution 每日收盘后及 T+5/T+20/T+40。
 - 潜伏抬头：source capability 周期审计；图库离线挖掘；Phase2 收盘后 `15:20`；Phase3 release gate `15:35`；观察/outcome/evolution `15:55` 及成熟窗口。
-- T 字板接力：Day1 先在 `10:40/14:55/15:02/15:10` 通过 THS 公开涨停池构建 `source.limit_event_v1`，再于 `15:12/15:20/15:30/15:35/15:45` 只对 T 字板阶段候选补交易状态、日线、涨跌停价和流通市值；owner 在 `15:05-15:30` 评估候选 T 字板和封单比例；Day2 `09:25` 预加载、`09:30-10:30` 每 5 分钟滚动观察，首次接近涨停后进入盘口确认，仅 `order_consumption_side=ASK` 且 `order_consumption_amount>0` 表示卖盘被主动买盘扫掉并触发接力机会提示，`BID` 表示主动卖出打买盘并作为风险 / 失效条件，方向或金额缺失时等待确认或 `data_blocked`；触发后到 `15:00` 封板维护监控；Day3 `09:25-09:35` 开盘涨停去留、`14:40-14:55` 尾盘未涨停退出研究事件。
+- T 字板接力：Day1 先在 `10:40/14:55/15:02/15:10` 通过 THS 公开涨停池构建 `source.limit_event_v1`，再于 `15:12/15:20/15:30/15:35/15:45` 只对 T 字板阶段候选补交易状态、日线、涨跌停价和流通市值；owner 在 `15:05-15:30` 评估候选 T 字板和封单比例；Day2 `09:25` 预加载、`09:30-10:30` 每 5 分钟滚动观察，首次接近涨停后进入盘口确认，仅 `order_consumption_side=ASK` 且 `order_consumption_amount>0` 表示卖盘被主动买盘扫掉并触发接力机会提示，`BID` 表示主动卖出打买盘并作为风险 / 失效条件，方向或金额缺失时等待确认或 `data_blocked`；触发后到 `15:00` 封板维护监控；观察台 `09:30-15:00` 每 5 分钟留存投影快照，并在 `09:32-15:02` 每 30 分钟留存模型结果快照；Day3 `09:25-09:35` 开盘涨停去留、`14:40-14:55` 尾盘未涨停退出研究事件。
 
 非临时 source 高频窗口已由 `scheduler-service` 的 `source_fetch_schedule_registry_v1` 和 `scheduler_source_time_wheel_v1` 承担，到点只提交 `source-data-service /source/fetch/submit`，真实 provider 并发仍由 source-data-worker 控制。模型三可以使用全 A 日频/日线底座做市场扫描；模型四 Day1 不做全 A 高频/报价盲扫，而是先读 `source.limit_event_v1` 的涨停池/T 字板候选，再候选级补 P0 事实。模型 owner 任务仍只接收已组装业务 payload；`research-service` 负责组装，scheduler 负责任务定义、交易日实例化、dry-run、source time wheel、payload preflight 和已接入模型 live dispatch，不伪造模型输入或模型事实。模型四已定向接入 scheduler，但保持 non-official，不反写前三模型。
 

@@ -201,6 +201,43 @@ def _compact_tboard_repository_view(body: Any, *, include_stale_stopped: bool = 
     return compact
 
 
+def _tboard_time_order_key(value: Any) -> tuple[int, float, str]:
+    text = str(value or "").strip()
+    if not text:
+        return (0, 0.0, "")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return (1, parsed.timestamp(), text)
+    except ValueError:
+        return (0, 0.0, text)
+
+
+def _latest_tboard_observation_time(items: list[Any], fields: tuple[str, ...]) -> str | None:
+    best_value: str | None = None
+    best_key: tuple[int, float, str] = (0, 0.0, "")
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for field in fields:
+            value = str(item.get(field) or "").strip()
+            if not value:
+                continue
+            key = _tboard_time_order_key(value)
+            if best_value is None or key > best_key:
+                best_value = value
+                best_key = key
+    return best_value
+
+
+def _tboard_observation_time_summary(observation_board: Any) -> dict[str, str | None]:
+    items = _response_items(observation_board)
+    return {
+        "latest_data_fetch_at": _latest_tboard_observation_time(items, ("latest_data_fetch_at", "last_data_captured_at")),
+        "last_model_output_at": _latest_tboard_observation_time(items, ("last_model_output_at", "model_evaluated_at")),
+        "latest_projection_snapshot_at": _latest_tboard_observation_time(items, ("latest_projection_snapshot_at",)),
+    }
+
+
 def _compact_hot_model_list_view(body: Any) -> Any:
     if not isinstance(body, dict):
         return body
@@ -297,7 +334,7 @@ def _dedupe_tboard_day1_latest_items(items: list[dict[str, Any]]) -> list[dict[s
     return [entry[1] for entry in latest_by_stock.values()]
 
 
-def _compact_tboard_day1_scan_summary(body: Any) -> dict[str, Any]:
+def _compact_tboard_day1_scan_summary(body: Any, observation_board: Any | None = None) -> dict[str, Any]:
     items = [item for item in _response_items(body) if isinstance(item, dict)]
     trade_dates = sorted({str(item.get("trade_date") or "").strip() for item in items if item.get("trade_date")})
     latest_trade_date = trade_dates[-1] if trade_dates else None
@@ -342,6 +379,7 @@ def _compact_tboard_day1_scan_summary(body: Any) -> dict[str, Any]:
         for item in latest_items
         if item.get("updated_at") or item.get("created_at")
     ]
+    observation_times = _tboard_observation_time_summary(observation_board)
     return {
         "ok": True,
         "data": {
@@ -355,6 +393,7 @@ def _compact_tboard_day1_scan_summary(body: Any) -> dict[str, Any]:
             "summary_text": summary_text,
             "reason_counts": reason_counts[:5],
             "updated_at": max(updated_values) if updated_values else None,
+            **observation_times,
         },
     }
 
@@ -525,6 +564,14 @@ async def tboard_model_list(
             )
         )
         results = await asyncio.gather(*tasks, return_exceptions=True)
+    raw_results_by_key = dict(zip(keys, results, strict=True))
+    compact_observation_board: Any | None = None
+    observation_result = raw_results_by_key.get("observation_board")
+    if not isinstance(observation_result, Exception):
+        compact_observation_board = _compact_tboard_repository_view(
+            observation_result,
+            include_stale_stopped=include_stale_stopped,
+        )
     payload: dict[str, Any] = {
         "contract_kind": "shence_tboard_model_list_compact_v1",
         "read_only": True,
@@ -535,7 +582,7 @@ async def tboard_model_list(
             payload["day1_scan_summary"] = (
                 {"ok": False, "error": "今日 Day1 扫描结论暂时不可读"}
                 if isinstance(result, Exception)
-                else _compact_tboard_day1_scan_summary(result)
+                else _compact_tboard_day1_scan_summary(result, compact_observation_board)
             )
             continue
         if isinstance(result, Exception):
@@ -543,7 +590,9 @@ async def tboard_model_list(
         else:
             payload[key] = {
                 "ok": True,
-                "data": _compact_tboard_repository_view(result, include_stale_stopped=include_stale_stopped),
+                "data": compact_observation_board
+                if key == "observation_board" and compact_observation_board is not None
+                else _compact_tboard_repository_view(result, include_stale_stopped=include_stale_stopped),
             }
     return payload
 

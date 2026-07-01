@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Query
 
@@ -195,8 +196,11 @@ def _display_time(value: Any) -> Any:
 
 
 DEFAULT_MONITOR_INTERVAL_MINUTES = 5
+MODEL_RESULT_INTERVAL_MINUTES = 30
 OBSERVATION_SORT_WINDOW_LIMIT = 500
 OBSERVATION_SCORE_VERSION = "t_board_relay_observation_score_v1"
+MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
+DAY2_WATCH_WINDOW_END = time(10, 30)
 
 
 def _latest_record_time(*items: dict[str, Any]) -> Any:
@@ -208,6 +212,62 @@ def _latest_record_time(*items: dict[str, Any]) -> Any:
             if value:
                 return value
     return None
+
+
+def _latest_time_value(*items: dict[str, Any]) -> Any:
+    best_dt: datetime | None = None
+    best_value: Any = None
+    for item in items:
+        if not item:
+            continue
+        item_value: Any = None
+        item_dt: datetime | None = None
+        for field in ("as_of_time", "captured_at", "available_at", "as_of_time_utc", "updated_at", "created_at"):
+            value = item.get(field)
+            parsed = _parse_iso_datetime(value)
+            if parsed:
+                item_value = value
+                item_dt = parsed
+                break
+        if item_dt and (best_dt is None or item_dt >= best_dt):
+            best_dt = item_dt
+            best_value = item_value
+    return best_value
+
+
+def _projection_generated_at() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _time_seconds(value: Any) -> int | None:
+    text = _display_time(value)
+    if not text:
+        return None
+    parts = str(text).split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+        second = int(parts[2]) if len(parts) > 2 else 0
+    except ValueError:
+        return None
+    return hour * 3600 + minute * 60 + second
+
+
+def _day2_watch_window_complete(day2_watch: dict[str, Any]) -> bool:
+    seconds = _time_seconds(day2_watch.get("as_of_time") or day2_watch.get("monitor_check_time"))
+    return seconds is not None and seconds >= DAY2_WATCH_WINDOW_END.hour * 3600 + DAY2_WATCH_WINDOW_END.minute * 60
+
+
+def _day2_window_elapsed(day1_trade_date: Any) -> bool:
+    day1 = _parse_iso_date(day1_trade_date)
+    if day1 is None:
+        return False
+    now = datetime.now(MARKET_TIMEZONE)
+    if now.date().weekday() >= 5:
+        return False
+    return now.date() > day1 and now.time() >= DAY2_WATCH_WINDOW_END
 
 
 def _last_monitor_time(
@@ -679,6 +739,14 @@ def _build_observation_item(
     outcome = outcome if valid_trigger and outcome else None
     hypothesis = hypothesis if valid_trigger and hypothesis else None
 
+    if not valid_day2_watch and not valid_trigger and _day2_window_elapsed(day1.get("trade_date")):
+        status = "data_wait"
+        conclusion = "Day2 \u76d1\u6d4b\u6570\u636e\u672a\u843d\u5e93\uff0c\u6682\u4e0d\u7ee7\u7eed\u89c2\u5bdf"
+        next_observation = "\u68c0\u67e5 Day2 \u4e94\u5206\u949f\u6293\u6570\u94fe\u8def"
+        key_reason = "Day2 09:30-10:30 \u7a97\u53e3\u5df2\u8fc7\uff0c\u672a\u89c1\u771f\u5b9e\u4e94\u5206\u949f\u76d1\u6d4b\u4e8b\u5b9e"
+        risk_tip = "Day2 \u771f\u5b9e\u6293\u6570\u65f6\u95f4\u672a\u63a8\u8fdb\uff0c\u4e0d\u80fd\u6309\u7ee7\u7eed\u89c2\u5bdf\u5c55\u793a"
+        data_notice = "Day2 \u76d1\u6d4b\u7f3a\u5931"
+
     if valid_day2_watch and not valid_trigger:
         monitor_time = _display_time(valid_day2_watch.get("as_of_time"))
         monitor_label = f" {monitor_time}" if monitor_time else ""
@@ -697,6 +765,19 @@ def _build_observation_item(
             key_reason = f"Day2{monitor_label} \u4e94\u5206\u949f\u76d1\u6d4b\u6570\u636e\u4e0d\u8db3"
             risk_tip = "\u5173\u952e\u884c\u60c5\u6216\u76d8\u53e3\u4e8b\u5b9e\u7f3a\u5931\uff0c\u65e0\u6cd5\u786e\u8ba4\u63a5\u529b\u5f3a\u5ea6"
             data_notice = "\u5206\u949f\u884c\u60c5\u5f85\u8865"
+        elif _day2_watch_window_complete(valid_day2_watch):
+            status = "stopped"
+            conclusion = "Day2 \u672a\u5230\u63a5\u529b\u70b9\uff0c\u505c\u6b62\u89c2\u5bdf"
+            next_observation = "\u65e0\u9700\u7ee7\u7eed\u8ddf\u8e2a"
+            key_reason = "Day2 09:30-10:30 \u4e94\u5206\u949f\u76d1\u6d4b\u672a\u63a5\u8fd1\u6da8\u505c"
+            risk_tip = "Day2 \u5f00\u76d8\u524d1\u5c0f\u65f6\u672a\u63a5\u8fd1\u6da8\u505c\uff0c\u63a5\u529b\u5f3a\u5ea6\u4e0d\u8fbe\u6807"
+        elif _day2_window_elapsed(day1.get("trade_date")):
+            status = "data_wait"
+            conclusion = "Day2 \u4e94\u5206\u949f\u76d1\u6d4b\u4e0d\u5b8c\u6574\uff0c\u6682\u505c\u89c2\u5bdf"
+            next_observation = "\u8865\u9f50 Day2 \u540e\u7eed\u76d1\u6d4b\u70b9\u540e\u590d\u6838"
+            key_reason = f"Day2{monitor_label} \u6709\u76d1\u6d4b\uff0c\u4f46 10:30 \u524d\u540e\u7eed\u4e94\u5206\u949f\u4e8b\u5b9e\u672a\u9f50"
+            risk_tip = "Day2 \u76d1\u6d4b\u65f6\u95f4\u672a\u8986\u76d6\u5b8c\u6574\u7a97\u53e3\uff0c\u4e0d\u80fd\u7ee7\u7eed\u6309\u89c2\u5bdf\u4e2d\u5c55\u793a"
+            data_notice = "Day2 \u76d1\u6d4b\u4e0d\u5b8c\u6574"
         else:
             status = "continue_watch"
             conclusion = "Day2 \u6eda\u52a8\u76d1\u6d4b\u4e2d"
@@ -796,7 +877,7 @@ def _build_observation_item(
     if ignored_stage_reasons:
         data_notice = "\uff1b".join(ignored_stage_reasons)
 
-    latest_snapshot_time = _latest_record_time(outcome or {}, day3 or {}, post_entry or {}, valid_trigger or {}, valid_day2_watch or {}, day1)
+    last_data_captured_at = _latest_time_value(outcome or {}, day3 or {}, post_entry or {}, valid_trigger or {}, valid_day2_watch or {}, day1)
     last_monitor_at = _last_monitor_time(
         day2_watch=valid_day2_watch,
         trigger=valid_trigger,
@@ -849,8 +930,15 @@ def _build_observation_item(
         "data_notice": data_notice,
         "data_gap_count": len(labels),
         "data_gap_labels": labels,
-        "latest_snapshot_time": latest_snapshot_time,
-        "updated_at": latest_snapshot_time,
+        "latest_snapshot_time": last_data_captured_at,
+        "updated_at": last_data_captured_at,
+        "latest_data_fetch_at": last_data_captured_at,
+        "last_data_captured_at": last_data_captured_at,
+        "display_update_at": last_data_captured_at,
+        "last_model_output_at": None,
+        "model_evaluated_at": None,
+        "model_result_interval_minutes": MODEL_RESULT_INTERVAL_MINUTES,
+        "projection_generated_at": _projection_generated_at(),
         "last_monitor_at": last_monitor_at,
         "monitor_interval_minutes": DEFAULT_MONITOR_INTERVAL_MINUTES,
         "monitoring_summary": monitoring_summary,
@@ -866,12 +954,34 @@ def _observation_sort_key(item: dict[str, Any]) -> tuple[bool, Decimal, str]:
 
 def _snapshot_newer_than_item(snapshot: dict[str, Any], item: dict[str, Any]) -> bool:
     snapshot_time = _parse_iso_datetime(snapshot.get("captured_at") or snapshot.get("as_of_time"))
-    item_time = _parse_iso_datetime(item.get("updated_at") or item.get("latest_snapshot_time"))
+    item_time = _parse_iso_datetime(item.get("last_data_captured_at") or item.get("updated_at") or item.get("latest_snapshot_time"))
     return bool(snapshot_time and (item_time is None or snapshot_time >= item_time))
 
 
+def _snapshot_interval_minutes(snapshot: dict[str, Any]) -> int:
+    try:
+        return int(snapshot.get("monitor_interval_minutes") or DEFAULT_MONITOR_INTERVAL_MINUTES)
+    except (TypeError, ValueError):
+        return DEFAULT_MONITOR_INTERVAL_MINUTES
+
+
+def _is_model_result_snapshot(snapshot: dict[str, Any]) -> bool:
+    return _snapshot_interval_minutes(snapshot) >= MODEL_RESULT_INTERVAL_MINUTES
+
+
+def _apply_projection_snapshot_metadata(item: dict[str, Any], snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    if not snapshot:
+        return item
+    merged = dict(item)
+    snapshot_time = snapshot.get("captured_at") or snapshot.get("as_of_time")
+    merged["latest_projection_snapshot_at"] = snapshot_time
+    merged["latest_projection_snapshot_id"] = snapshot.get("observation_snapshot_id")
+    merged["latest_monitor_snapshot_id"] = snapshot.get("observation_snapshot_id")
+    return merged
+
+
 def _apply_monitor_snapshot(item: dict[str, Any], snapshot: dict[str, Any] | None) -> dict[str, Any]:
-    if not snapshot or not _snapshot_newer_than_item(snapshot, item):
+    if not snapshot or not _is_model_result_snapshot(snapshot) or not _snapshot_newer_than_item(snapshot, item):
         return item
     merged = dict(item)
     for field in (
@@ -893,11 +1003,12 @@ def _apply_monitor_snapshot(item: dict[str, Any], snapshot: dict[str, Any] | Non
         if snapshot.get(field) is not None:
             merged[field] = snapshot.get(field)
     snapshot_time = snapshot.get("captured_at") or snapshot.get("as_of_time")
-    merged["latest_snapshot_time"] = snapshot_time
-    merged["updated_at"] = snapshot_time
-    merged["last_monitor_at"] = snapshot.get("as_of_time") or snapshot_time
-    merged["monitor_interval_minutes"] = snapshot.get("monitor_interval_minutes") or merged.get("monitor_interval_minutes")
+    merged["last_model_output_at"] = snapshot_time
+    merged["model_evaluated_at"] = snapshot_time
+    merged["model_result_interval_minutes"] = _snapshot_interval_minutes(snapshot)
+    merged["latest_model_result_snapshot_id"] = snapshot.get("observation_snapshot_id")
     merged["latest_monitor_snapshot_id"] = snapshot.get("observation_snapshot_id")
+    merged["monitor_interval_minutes"] = DEFAULT_MONITOR_INTERVAL_MINUTES
     return merged
 
 
@@ -969,9 +1080,13 @@ def _observation_board_response(*, limit: int, include_monitor_snapshots: bool =
     latest_hypothesis_by_entity: dict[str, dict[str, Any]] = {}
     for item in hypothesis_items:
         _keep_latest(latest_hypothesis_by_entity, item.get("related_entity_id"), item)
-    latest_monitor_snapshot_by_candidate: dict[str, dict[str, Any]] = {}
+    latest_projection_snapshot_by_candidate: dict[str, dict[str, Any]] = {}
+    latest_model_result_by_candidate: dict[str, dict[str, Any]] = {}
     for item in monitor_snapshot_items:
-        _keep_latest(latest_monitor_snapshot_by_candidate, item.get("day1_candidate_id"), item)
+        if _is_model_result_snapshot(item):
+            _keep_latest(latest_model_result_by_candidate, item.get("day1_candidate_id"), item)
+        else:
+            _keep_latest(latest_projection_snapshot_by_candidate, item.get("day1_candidate_id"), item)
 
     unique_day1: dict[str, dict[str, Any]] = {}
     for item in day1_items:
@@ -1002,8 +1117,10 @@ def _observation_board_response(*, limit: int, include_monitor_snapshots: bool =
             outcome=outcome,
             hypothesis=hypothesis,
         )
-        monitor_snapshot = latest_monitor_snapshot_by_candidate.get(str(day1.get("day1_candidate_id")))
-        items.append(_apply_monitor_snapshot(observation_item, monitor_snapshot))
+        projection_snapshot = latest_projection_snapshot_by_candidate.get(str(day1.get("day1_candidate_id")))
+        model_snapshot = latest_model_result_by_candidate.get(str(day1.get("day1_candidate_id")))
+        observation_item = _apply_projection_snapshot_metadata(observation_item, projection_snapshot)
+        items.append(_apply_monitor_snapshot(observation_item, model_snapshot))
     items.sort(key=_observation_sort_key, reverse=True)
     return {
         "contract_kind": "t_board_relay_observation_board_v1",
@@ -1028,11 +1145,17 @@ def _observation_monitor_snapshot_response(request: TBoardRelayRequest) -> dict[
     trade_date_value = request.trade_date.isoformat() if request.trade_date else payload.get("trade_date")
     board = _observation_board_response(limit=limit, include_monitor_snapshots=False)
     items: list[dict[str, Any]] = []
+    snapshot_kind = "model_result_30m" if monitor_interval_minutes >= MODEL_RESULT_INTERVAL_MINUTES else "projection_snapshot_5m"
     for item in board.get("items") or []:
         enriched = dict(item)
         enriched["snapshot_day_index"] = _snapshot_day_index(item, trade_date_value)
         enriched["snapshot_trade_date"] = _snapshot_trade_date(item, trade_date_value)
         enriched["monitor_interval_minutes"] = monitor_interval_minutes
+        enriched["snapshot_kind"] = snapshot_kind
+        if snapshot_kind == "model_result_30m":
+            enriched["last_model_output_at"] = captured_at.isoformat()
+            enriched["model_evaluated_at"] = captured_at.isoformat()
+            enriched["model_result_interval_minutes"] = monitor_interval_minutes
         items.append(enriched)
     repo = _repository()
     persist = repo.persist_observation_monitor_snapshots(
@@ -1054,6 +1177,7 @@ def _observation_monitor_snapshot_response(request: TBoardRelayRequest) -> dict[
                 "as_of_time": as_of_time.isoformat(),
                 "trade_date": trade_date_value,
                 "monitor_interval_minutes": monitor_interval_minutes,
+                "snapshot_kind": snapshot_kind,
                 "snapshot_count": len(items),
                 "items": items,
             },

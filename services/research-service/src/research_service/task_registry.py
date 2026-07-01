@@ -387,6 +387,23 @@ TASK_REQUIREMENTS: tuple[TaskRequirement, ...] = (
         ),
     ),
     TaskRequirement(
+        task_code="t_relay.live_result.compute_30m",
+        task_kind="observation",
+        owner_service="t-board-relay-service",
+        schedule_hint="Day1 through Day3 open sessions every 30 minutes",
+        frequency_hint="rolling_30m_model_result",
+        model_code="t_board_relay",
+        model_phase="observation_monitor_result_30m",
+        endpoint="/t-board-relay/observation-monitor/snapshot",
+        source_tables=(),
+        upstream_tables=(),
+        append_only=True,
+        notes=(
+            "Append-only observation-board model result. The owner service reads its repository "
+            "projection and writes result_kind=model_result_30m snapshots."
+        ),
+    ),
+    TaskRequirement(
         task_code="t_relay.day3.exit.open",
         task_kind="model_compute",
         owner_service="t-board-relay-service",

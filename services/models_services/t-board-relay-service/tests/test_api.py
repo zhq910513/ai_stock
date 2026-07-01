@@ -311,6 +311,7 @@ def test_observation_board_queries_qualified_day1_before_page_limit(monkeypatch)
             return []
 
     monkeypatch.setattr(api, "_repository", lambda: FakeRepository())
+    monkeypatch.setattr(api, "_day2_window_elapsed", lambda day1_trade_date: False)
 
     body = TestClient(app).get("/t-board-relay/observation-board?limit=1").json()
 
@@ -395,13 +396,20 @@ def test_observation_board_projects_day2_watch_before_trigger(monkeypatch) -> No
             raise AssertionError("observation-board should use lightweight stage rows")
 
     monkeypatch.setattr(api, "_repository", lambda: FakeRepository())
+    monkeypatch.setattr(api, "_day2_window_elapsed", lambda day1_trade_date: False)
 
     item = TestClient(app).get("/t-board-relay/observation-board").json()["items"][0]
 
     assert item["day2_trade_date"] == "2026-06-23"
     assert item["day2_trigger_time"] == "09:40:00"
-    assert item["latest_snapshot_time"] == "2026-06-23T09:40:03"
-    assert item["updated_at"] == "2026-06-23T09:40:03"
+    assert item["latest_snapshot_time"] == "2026-06-23T09:40:00"
+    assert item["updated_at"] == "2026-06-23T09:40:00"
+    assert item["latest_data_fetch_at"] == "2026-06-23T09:40:00"
+    assert item["last_data_captured_at"] == "2026-06-23T09:40:00"
+    assert item["display_update_at"] == "2026-06-23T09:40:00"
+    assert item["last_model_output_at"] is None
+    assert item["model_evaluated_at"] is None
+    assert item["model_result_interval_minutes"] == 30
     assert item["last_monitor_at"] == "2026-06-23T09:40:00"
     assert item["monitor_interval_minutes"] == 5
     assert item["monitoring_summary"] == "Day2 每5分钟滚动监测，最近检查 09:40:00"
@@ -415,6 +423,43 @@ def test_observation_board_projects_day2_watch_before_trigger(monkeypatch) -> No
     assert "ASK" not in item["risk_tip"]
     assert "BID" not in item["risk_tip"]
     assert all("source_gap:" not in label for label in item["data_gap_labels"])
+
+
+def test_observation_board_marks_elapsed_day2_without_watch_as_data_wait(monkeypatch) -> None:  # noqa: ANN001
+    class FakeRepository:
+        def status(self):
+            return {"repository_attached": True, "warning_codes": []}
+
+        def list_day1_observation_candidates(self, *, limit=100):  # noqa: ANN001, ARG002
+            return [
+                {
+                    "day1_candidate_id": "day1-qualified",
+                    "canonical_symbol": "000823.SZ",
+                    "stock_name": "Test",
+                    "trade_date": "2026-06-26",
+                    "candidate_status": "qualified",
+                    "is_t_board": True,
+                    "float_market_cap_pass": True,
+                    "created_at": "2026-06-29T07:00:00",
+                }
+            ]
+
+        def list_observation_rows(self, entity, *, limit=100):  # noqa: ANN001, ARG002
+            return []
+
+    monkeypatch.setattr(api, "_repository", lambda: FakeRepository())
+    monkeypatch.setattr(api, "_day2_window_elapsed", lambda day1_trade_date: True)
+
+    item = TestClient(app).get("/t-board-relay/observation-board").json()["items"][0]
+
+    assert item["stock"]["symbol"] == "000823.SZ"
+    assert item["observation_status"] == "data_wait"
+    assert item["score_state"] == "data_wait"
+    assert item["model_score"] is None
+    assert item["latest_snapshot_time"] == "2026-06-29T07:00:00"
+    assert item["display_update_at"] == "2026-06-29T07:00:00"
+    assert item["latest_data_fetch_at"] == "2026-06-29T07:00:00"
+    assert "Day2" in item["key_reason"]
 
 
 def test_observation_columns_exclude_audit_payloads() -> None:
@@ -474,6 +519,7 @@ def test_observation_board_ignores_same_day_day2_fact(monkeypatch) -> None:  # n
             return []
 
     monkeypatch.setattr(api, "_repository", lambda: FakeRepository())
+    monkeypatch.setattr(api, "_day2_window_elapsed", lambda day1_trade_date: False)
 
     item = TestClient(app).get("/t-board-relay/observation-board").json()["items"][0]
 
@@ -577,6 +623,7 @@ def test_observation_board_describes_missed_day2_as_rolling_monitor_end(monkeypa
             return []
 
     monkeypatch.setattr(api, "_repository", lambda: FakeRepository())
+    monkeypatch.setattr(api, "_day2_window_elapsed", lambda day1_trade_date: False)
 
     item = TestClient(app).get("/t-board-relay/observation-board").json()["items"][0]
 
@@ -622,6 +669,7 @@ def test_observation_board_reclassifies_legacy_bid_trigger_as_stopped(monkeypatc
             return []
 
     monkeypatch.setattr(api, "_repository", lambda: FakeRepository())
+    monkeypatch.setattr(api, "_day2_window_elapsed", lambda day1_trade_date: False)
 
     item = TestClient(app).get("/t-board-relay/observation-board").json()["items"][0]
 
@@ -685,6 +733,7 @@ def test_observation_board_updates_after_post_entry_board_open(monkeypatch) -> N
             return []
 
     monkeypatch.setattr(api, "_repository", lambda: FakeRepository())
+    monkeypatch.setattr(api, "_day2_window_elapsed", lambda day1_trade_date: False)
 
     item = TestClient(app).get("/t-board-relay/observation-board").json()["items"][0]
 
@@ -839,11 +888,35 @@ def test_observation_monitor_snapshot_persists_current_projection(monkeypatch) -
     assert body["repository_write"]["persisted"] is True
     assert body["repository_write"]["inserted_count"] == 1
     assert body["observation_monitor_snapshot"]["snapshot_count"] == 1
+    assert body["observation_monitor_snapshot"]["snapshot_kind"] == "projection_snapshot_5m"
+    assert body["observation_monitor_snapshot"]["monitor_interval_minutes"] == 5
     assert persisted["run_id"] == "snapshot-test"
     snapshot_item = persisted["items"][0]
+    assert snapshot_item["snapshot_kind"] == "projection_snapshot_5m"
     assert snapshot_item["snapshot_day_index"] == 2
     assert snapshot_item["current_conclusion"] == "接力机会已触发，可买入观察"
     assert snapshot_item["model_score"] is not None
+    assert snapshot_item["model_evaluated_at"] is None
+
+    persisted.clear()
+    response_30m = TestClient(app).post(
+        "/t-board-relay/observation-monitor/snapshot",
+        json={
+            "payload": {"trade_date": "2026-06-23", "limit": 20, "monitor_interval_minutes": 30},
+            "as_of_time_utc": "2026-06-23T02:00:00Z",
+            "run_id": "snapshot-test-30m",
+        },
+    )
+
+    assert response_30m.status_code == 200
+    body_30m = response_30m.json()["structured_output"]
+    assert body_30m["observation_monitor_snapshot"]["snapshot_kind"] == "model_result_30m"
+    assert body_30m["observation_monitor_snapshot"]["monitor_interval_minutes"] == 30
+    assert persisted["run_id"] == "snapshot-test-30m"
+    snapshot_item_30m = persisted["items"][0]
+    assert snapshot_item_30m["snapshot_kind"] == "model_result_30m"
+    assert snapshot_item_30m["model_evaluated_at"] == "2026-06-23T02:00:00+00:00"
+    assert snapshot_item_30m["model_result_interval_minutes"] == 30
 
 
 def test_observation_board_uses_latest_monitor_snapshot_when_newer(monkeypatch) -> None:  # noqa: ANN001
@@ -882,7 +955,7 @@ def test_observation_board_uses_latest_monitor_snapshot_when_newer(monkeypatch) 
                     "day_index": 2,
                     "as_of_time": "2026-06-23T02:15:00+00:00",
                     "captured_at": "2026-06-23T02:15:03+00:00",
-                    "monitor_interval_minutes": 5,
+                    "monitor_interval_minutes": 30,
                     "observation_status": "stopped",
                     "current_stage": "Day2 观察",
                     "current_conclusion": "卖盘主动砸向买盘，停止观察",
@@ -901,11 +974,162 @@ def test_observation_board_uses_latest_monitor_snapshot_when_newer(monkeypatch) 
             ]
 
     monkeypatch.setattr(api, "_repository", lambda: FakeRepository())
+    monkeypatch.setattr(api, "_day2_window_elapsed", lambda day1_trade_date: False)
 
     item = TestClient(app).get("/t-board-relay/observation-board").json()["items"][0]
 
-    assert item["updated_at"] == "2026-06-23T02:15:03+00:00"
-    assert item["last_monitor_at"] == "2026-06-23T02:15:00+00:00"
+    assert item["updated_at"] == "2026-06-22T15:20:00+08:00"
+    assert item["latest_data_fetch_at"] == "2026-06-22T15:20:00+08:00"
+    assert item["last_data_captured_at"] == "2026-06-22T15:20:00+08:00"
+    assert item["display_update_at"] == "2026-06-22T15:20:00+08:00"
+    assert item["last_model_output_at"] == "2026-06-23T02:15:03+00:00"
+    assert item["model_evaluated_at"] == "2026-06-23T02:15:03+00:00"
+    assert item["model_result_interval_minutes"] == 30
     assert item["latest_monitor_snapshot_id"] == "snapshot-7"
+    assert item["latest_model_result_snapshot_id"] == "snapshot-7"
+    assert item["model_score"] == 15
+
+
+def test_observation_board_keeps_five_minute_snapshot_as_projection_metadata(monkeypatch) -> None:  # noqa: ANN001
+    class FakeRepository:
+        def status(self):
+            return {"repository_attached": True, "warning_codes": []}
+
+        def list_day1_observation_candidates(self, *, limit=100):  # noqa: ANN001, ARG002
+            return [
+                {
+                    "day1_candidate_pk": 1,
+                    "day1_candidate_id": "day1-1",
+                    "canonical_symbol": "002297.SZ",
+                    "stock_name": "Test",
+                    "trade_date": "2026-06-22",
+                    "candidate_status": "qualified",
+                    "is_t_board": True,
+                    "float_market_cap_pass": True,
+                    "source_gap_codes": [],
+                    "created_at": "2026-06-22T15:20:00+08:00",
+                }
+            ]
+
+        def list_observation_rows(self, entity, *, limit=100):  # noqa: ANN001, ARG002
+            return []
+
+        def list_observation_monitor_snapshots(self, *, limit=100):  # noqa: ANN001, ARG002
+            return [
+                {
+                    "observation_snapshot_pk": 7,
+                    "observation_snapshot_id": "snapshot-5m",
+                    "day1_candidate_id": "day1-1",
+                    "canonical_symbol": "002297.SZ",
+                    "trade_date": "2026-06-23",
+                    "day_index": 2,
+                    "as_of_time": "2026-06-23T02:15:00+00:00",
+                    "captured_at": "2026-06-23T02:15:03+00:00",
+                    "monitor_interval_minutes": 5,
+                    "observation_status": "stopped",
+                    "model_score": 15,
+                    "data_gap_count": 0,
+                    "data_gap_labels": [],
+                    "created_at": "2026-06-23T02:15:03+00:00",
+                }
+            ]
+
+    monkeypatch.setattr(api, "_repository", lambda: FakeRepository())
+    monkeypatch.setattr(api, "_day2_window_elapsed", lambda day1_trade_date: False)
+
+    item = TestClient(app).get("/t-board-relay/observation-board").json()["items"][0]
+
+    assert item["updated_at"] == "2026-06-22T15:20:00+08:00"
+    assert item["latest_data_fetch_at"] == "2026-06-22T15:20:00+08:00"
+    assert item["last_data_captured_at"] == "2026-06-22T15:20:00+08:00"
+    assert item["latest_snapshot_time"] == "2026-06-22T15:20:00+08:00"
+    assert item["display_update_at"] == "2026-06-22T15:20:00+08:00"
+    assert item["last_model_output_at"] is None
+    assert item["model_evaluated_at"] is None
+    assert item["latest_projection_snapshot_at"] == "2026-06-23T02:15:03+00:00"
+    assert item["latest_projection_snapshot_id"] == "snapshot-5m"
+    assert item["latest_monitor_snapshot_id"] == "snapshot-5m"
+    assert item["model_score"] != 15
+
+
+def test_observation_board_keeps_model_result_when_projection_is_newer(monkeypatch) -> None:  # noqa: ANN001
+    class FakeRepository:
+        def status(self):
+            return {"repository_attached": True, "warning_codes": []}
+
+        def list_day1_observation_candidates(self, *, limit=100):  # noqa: ANN001, ARG002
+            return [
+                {
+                    "day1_candidate_pk": 1,
+                    "day1_candidate_id": "day1-1",
+                    "canonical_symbol": "002297.SZ",
+                    "stock_name": "Test",
+                    "trade_date": "2026-06-22",
+                    "candidate_status": "qualified",
+                    "is_t_board": True,
+                    "float_market_cap_pass": True,
+                    "source_gap_codes": [],
+                    "created_at": "2026-06-22T15:20:00+08:00",
+                }
+            ]
+
+        def list_observation_rows(self, entity, *, limit=100):  # noqa: ANN001, ARG002
+            return []
+
+        def list_observation_monitor_snapshots(self, *, limit=100):  # noqa: ANN001, ARG002
+            return [
+                {
+                    "observation_snapshot_pk": 7,
+                    "observation_snapshot_id": "snapshot-model",
+                    "day1_candidate_id": "day1-1",
+                    "canonical_symbol": "002297.SZ",
+                    "trade_date": "2026-06-23",
+                    "day_index": 2,
+                    "as_of_time": "2026-06-23T02:15:00+00:00",
+                    "captured_at": "2026-06-23T02:15:03+00:00",
+                    "monitor_interval_minutes": 30,
+                    "observation_status": "stopped",
+                    "current_stage": "Day2 观察",
+                    "current_conclusion": "卖盘主动砸向买盘，停止观察",
+                    "key_reason": "接近涨停，卖盘往下砸",
+                    "risk_tip": "卖压占优",
+                    "model_score": 15,
+                    "data_gap_count": 0,
+                    "data_gap_labels": [],
+                    "created_at": "2026-06-23T02:15:03+00:00",
+                },
+                {
+                    "observation_snapshot_pk": 8,
+                    "observation_snapshot_id": "snapshot-5m",
+                    "day1_candidate_id": "day1-1",
+                    "canonical_symbol": "002297.SZ",
+                    "trade_date": "2026-06-23",
+                    "day_index": 2,
+                    "as_of_time": "2026-06-23T02:30:00+00:00",
+                    "captured_at": "2026-06-23T02:30:03+00:00",
+                    "monitor_interval_minutes": 5,
+                    "observation_status": "continue_watch",
+                    "model_score": None,
+                    "data_gap_count": 0,
+                    "data_gap_labels": [],
+                    "created_at": "2026-06-23T02:30:03+00:00",
+                },
+            ]
+
+    monkeypatch.setattr(api, "_repository", lambda: FakeRepository())
+    monkeypatch.setattr(api, "_day2_window_elapsed", lambda day1_trade_date: False)
+
+    item = TestClient(app).get("/t-board-relay/observation-board").json()["items"][0]
+
+    assert item["latest_projection_snapshot_at"] == "2026-06-23T02:30:03+00:00"
+    assert item["display_update_at"] == "2026-06-22T15:20:00+08:00"
+    assert item["latest_snapshot_time"] == "2026-06-22T15:20:00+08:00"
+    assert item["latest_data_fetch_at"] == "2026-06-22T15:20:00+08:00"
+    assert item["last_data_captured_at"] == "2026-06-22T15:20:00+08:00"
+    assert item["last_model_output_at"] == "2026-06-23T02:15:03+00:00"
+    assert item["model_evaluated_at"] == "2026-06-23T02:15:03+00:00"
+    assert item["latest_projection_snapshot_id"] == "snapshot-5m"
+    assert item["latest_model_result_snapshot_id"] == "snapshot-model"
+    assert item["latest_monitor_snapshot_id"] == "snapshot-model"
     assert item["current_conclusion"] == "卖盘主动砸向买盘，停止观察"
     assert item["model_score"] == 15

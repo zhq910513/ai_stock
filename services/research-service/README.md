@@ -1,5 +1,29 @@
 # research-service
 
+## Model Execution No-Persist Probe Contract
+
+2026-06-29 current contract: `POST /research/model-execution/run` with `persist_audit=false` is an execution probe. It may assemble the real payload and call the owner endpoint to inspect the owner response, but it must not write `governance.research_model_execution_audit_v1` and must not materialize owner output into any `decision_*` or `research_*` model fact table. Successful owner probes return `execution_status=materialization_skipped`, `owner_called=true`, `materialization_attempted=false`, `audit_persisted=false`, empty `materialized_counts`, and `gap_codes=["research_execution_no_persist_materialization_skipped"]`.
+
+Formal scheduler/live runs that should write model facts must keep `persist_audit=true`. This preserves a clean boundary between read/probe verification and append-only model fact materialization.
+
+## T Relay Observation Monitor Result Contract
+
+2026-07-01 current contract: `research-service` registers both `t_relay.observation.monitor.snapshot_5m` and `t_relay.live_result.compute_30m`. Both tasks are pass-through observation-monitor tasks for `t-board-relay-service /t-board-relay/observation-monitor/snapshot`; neither task reads `source.*`, `decision_t_relay.*`, raw tables, or provider responses inside research-service.
+
+`t_relay.observation.monitor.snapshot_5m` assembles a single owner `payload` with `monitor_interval_minutes=5`. `t_relay.live_result.compute_30m` assembles the same shape with `monitor_interval_minutes=30` and `result_kind=model_result_30m`. The owner service reads its own repository projection and writes append-only rows to `decision_t_relay.t_board_observation_monitor_snapshot_v1`. The 30-minute task is the only observation-monitor path that may advance `last_model_output_at` / `model_evaluated_at`; the 5-minute snapshot remains an audit/recovery projection and must not be shown as model output time.
+
+### research-service -> model-execution -> no-persist probe boundary freeze
+
+- Freeze object: `research-service -> model-execution -> no-persist probe boundary`.
+- Freeze time: 2026-06-29 Asia/Shanghai.
+- Decision source: user delegated the decision with "你来决定"; Codex decided the fix is ready to freeze after tests, runtime deployment, no-persist probe verification, and core service health checks.
+- Locked scope: `persist_audit=false` execution semantics for `/research/model-execution/run`; owner may be called for probe inspection, but execution audit and all `decision_*` / `research_*` materialization must remain disabled; successful probes must expose `research_execution_no_persist_materialization_skipped`.
+- Allowed read-only acceptance: `/readyz`, `/research/model-payload/requirements`, `/research/model-payload/assemble` with `persist_audit=false`, `/research/model-execution/run` with `persist_audit=false` on controlled probes, database read-only row counts, source/scheduler/data-inspector ready checks.
+- Forbidden without explicit unlock: changing no-persist to write execution audit or model facts, hiding skipped materialization as success, bypassing owner/source/preflight gaps, changing `persist_audit=true` formal materialization semantics, touching provider/raw/source writes, or publishing official signals from a probe.
+- Unlock conditions: owner execution contract change, scheduler dispatch contract change, materializer table contract change, audit schema change, or explicit user approval naming this freeze object.
+- Rollback: revert the related `research-service` code/docs/tests change and replace only `research-service` with a prior working image; do not touch source-data-service, source-data-worker, scheduler-service, data-inspector-service, Postgres, or model owner services unless separately approved.
+- Verification checklist: `python -m pytest -q services/research-service/tests`, `py_compile` for research service modules, container code check for `research_execution_no_persist_materialization_skipped`, no-persist probe keeps `decision_hot` and execution audit counts unchanged, `persist_audit=true` path covered by tests, source/scheduler/data-inspector/research/hot ready, source queues have no queued/leased/dead-letter jobs.
+
 ## Hot Score Daily Bar Fallback Contract
 
 2026-06-26 current contract: for `hot.score.auction_confirmed` only, if `source.daily_bar_v1` has no row for a paid-probability candidate but `source.adjusted_daily_bar_v1` has usable rows for the same symbol/trade date through the normal source build path, `research-service` may normalize the adjusted OHLC fields into the owner-facing `daily_bars` price-path view. The payload must keep `adjusted_daily_bars`, set `daily_bar_source=source.adjusted_daily_bar_v1`, set `daily_bar_fallback_used=true`, and keep `source_gap:daily_bar_missing_using_adjusted_daily_bar` in `warnings`.
@@ -74,13 +98,13 @@ POST /research/model-payload/assemble
 POST /research/model-execution/run
 ```
 
-`GET /research/model-payload/requirements` 返回 25 个非 source 的模型 owner 任务合同，覆盖：
+`GET /research/model-payload/requirements` 返回 26 个非 source 的模型 owner 任务合同，覆盖：
 
 ```text
 hot.* 6 个
 memory.* 5 个
 ambush.* 6 个
-t_relay.* 8 个
+t_relay.* 9 个
 ```
 
 `POST /research/model-payload/assemble` 请求：
@@ -227,7 +251,7 @@ decision_t_relay.t_board_day3_exit_decision_v1
 - `hot-candidates-service`：research-service 包装成 `{ "payload": ... }`。
 - `candidate-memory-service`：research-service 包装成 `{ "row": ... }`；`memory.seed.from_hot_signals` 会先构建 seed，再调用 `/production/entity/build` 物化 entity。
 - `ambush-watchlist-service`：research-service 直接透传阶段 payload。
-- `t-board-relay-service`：Day1 使用 `rows[]`，每行从 `source.stock_master_v1.stock_name` 投影 `stock_name/name` 供 owner 写入 Day1 候选和前端只读观察台；Day2/Day3/outcome 与 `t_relay.observation.monitor.snapshot_5m` 使用单对象 `payload`，owner request body 不再携带 `row` 或 `rows`。
+- `t-board-relay-service`：Day1 使用 `rows[]`，每行从 `source.stock_master_v1.stock_name` 投影 `stock_name/name` 供 owner 写入 Day1 候选和前端只读观察台；Day2/Day3/outcome、`t_relay.observation.monitor.snapshot_5m` 与 `t_relay.live_result.compute_30m` 使用单对象 `payload`，owner request body 不再携带 `row` 或 `rows`。
 
 payload 内保留 `payload_assembly_contract`、`payload_assembly_status`、`payload_assembly_source`、`source_refs`、`source_gap_codes`、`contract_gaps`、`warning_codes` 和 `source_preflight`，供 scheduler preflight 和后续审计使用。
 
@@ -256,7 +280,7 @@ model execution request
 
 状态含义：
 
-- `assembled_research_payload`：当前任务所需 source/upstream/preflight 合同满足组装要求，且 payload 中没有硬阻断上游缺口码或 sample 标记。模型四 `t_relay.day2.watch.rolling_5m`、`t_relay.day2.trigger.rolling_5m`、`t_relay.day2.post_entry.monitor`、`t_relay.day3.exit.open`、`t_relay.day3.exit.tail` 与 `t_relay.outcome.build` 中的 `source_gap:seal_order_snapshot_missing`、`source_gap:dynamic_feature_bundle_missing`、`source_gap:near_limit_order_absorption_missing` 属于 owner 已定义的可审计研究缺口，只进入 warnings，不改变 assembled 状态。`t_relay.observation.monitor.snapshot_5m` 不读取 source/upstream，只透传观察台快照参数和 scheduler 补偿上下文给 owner。
+- `assembled_research_payload`：当前任务所需 source/upstream/preflight 合同满足组装要求，且 payload 中没有硬阻断上游缺口码或 sample 标记。模型四 `t_relay.day2.watch.rolling_5m`、`t_relay.day2.trigger.rolling_5m`、`t_relay.day2.post_entry.monitor`、`t_relay.day3.exit.open`、`t_relay.day3.exit.tail` 与 `t_relay.outcome.build` 中的 `source_gap:seal_order_snapshot_missing`、`source_gap:dynamic_feature_bundle_missing`、`source_gap:near_limit_order_absorption_missing` 属于 owner 已定义的可审计研究缺口，只进入 warnings，不改变 assembled 状态。`t_relay.observation.monitor.snapshot_5m` 与 `t_relay.live_result.compute_30m` 不读取 source/upstream，只透传观察台快照或 30 分钟模型结果参数和 scheduler 上下文给 owner。
 - `blocked_data_gap`：缺 source、缺 upstream、source quality 不可用、缺 available_at、上游事实携带硬阻断缺口码 / sample 标记，或 source preflight 未通过。
 
 ## 调度频率
@@ -268,7 +292,7 @@ model execution request
 | 热点 `hot.*` | 09:25-09:36 固定/窗口，盘中观察，收盘 outcome，18:30 evolution | 显式预检：`POST /research/model-payload/assemble`；正式 live dispatch：`POST /research/model-execution/run` |
 | 候选记忆 `memory.*` | 15:45 seed，15:55 pre-signal，16:05 release，次日开盘窗口，收盘成熟检查 | 显式预检：`POST /research/model-payload/assemble`；正式 live dispatch：`POST /research/model-execution/run` |
 | 潜伏抬头 `ambush.*` | 周期 source audit，18:10 图库，15:20 Phase2，15:35 release/buy point，15:55 outcome | 显式预检：`POST /research/model-payload/assemble`；正式 live dispatch：`POST /research/model-execution/run` |
-| T 字板 `t_relay.*` | Day1 15:05-15:30，Day2 09:25 预加载、09:30-10:30 每五分钟滚动接近涨停观察、触发后至收盘维护，Day3 09:25-09:35/14:40-14:55，观察台快照 09:30-11:30/13:00-15:00 每五分钟，outcome | 显式预检：`POST /research/model-payload/assemble`；正式 live dispatch：`POST /research/model-execution/run` |
+| T 字板 `t_relay.*` | Day1 15:05-15:30，Day2 09:25 预加载、09:30-10:30 每五分钟滚动接近涨停观察、触发后至收盘维护，Day3 09:25-09:35/14:40-14:55，观察台快照 09:30-11:30/13:00-15:00 每五分钟，观察台模型结果每 30 分钟，outcome | 显式预检：`POST /research/model-payload/assemble`；正式 live dispatch：`POST /research/model-execution/run` |
 
 非临时 source 采集仍由 `scheduler-service` 提交到 `source-data-service /source/fetch/submit`，本服务不提交 provider fetch。
 
@@ -357,12 +381,12 @@ source_gap:outcome_evolution_context
 - 冻结时间：2026-06-24 Asia/Shanghai。
 - 拍板人 / 确认来源：用户授权 Codex 判断模型四链路是否可拍板，并在本轮回复“批准”；Codex 基于 scheduler catch-up、research execution、owner snapshot 和 frontend 只读验收判定可以冻结。
 - 锁定范围：`t_relay.observation.monitor.snapshot_5m` 在 research-service 内只组装单对象 `payload`，字段为 `trade_date`、`limit`、`monitor_interval_minutes`、`as_of_time_utc`、`symbols` 和 `scheduler_context`；该任务不读取 source 表、不读取 `decision_t_relay.*` 上游表、不组装 row/rows，不补历史盘口或分钟事实。
-- 当前冻结证据：`GET /research/model-payload/requirements` 返回 `task_count=25` 且该任务 `source_tables=[]`、`upstream_tables=[]`、`append_only=true`；2026-06-24 scheduler catch-up 非 dry-run 通过 `/research/model-execution/run` materialized，owner 快照表从 4 行增至 8 行，4 条 Day1 合格对象的观察台更新时间推进到 `2026-06-24T09:50:48.617447+00:00`。
+- 历史冻结证据：2026-06-24 `GET /research/model-payload/requirements` 返回 `task_count=25` 且该任务 `source_tables=[]`、`upstream_tables=[]`、`append_only=true`；scheduler catch-up 非 dry-run 通过 `/research/model-execution/run` materialized，owner 快照表从 4 行增至 8 行，4 条 Day1 合格对象的观察台更新时间推进到 `2026-06-24T09:50:48.617447+00:00`。当前 2026-07-01 requirements 为 26 个任务，新增 `t_relay.live_result.compute_30m` 直通合同。
 - 允许的只读验收：`/readyz`、`/research/model-payload/requirements`、`/research/model-payload/assemble` 且 `persist_audit=false`、scheduler dry-run catch-up、owner snapshot/observation-board 和 frontend compact。
 - 禁止修改项：未获解锁不得让该任务读取 raw/provider/source/upstream，不得把补偿快照伪装为历史实时盘口，不得由 research 计算模型分、状态、交易、买点、official signal 或前端展示事实。
 - 解锁条件：owner snapshot endpoint 合同、scheduler catch-up 语义、research execution 合同、快照 payload 字段或用户明确批准解锁。
 - 回滚方式：回退后续 snapshot pass-through 相关 research 变更；如曾发版，仅 `--no-deps` 替换 research-service；不触碰 source-data-service/source-data-worker/data-inspector/Postgres/model owner。
-- 验证清单：requirements task_count=25；snapshot 任务无 source/upstream；research ready；scheduler catch-up dry-run 可选中槽位；非 dry-run 仅经 research execution 到 owner；owner snapshot append-only 增长；frontend compact 4 行可读。
+- 验证清单：requirements task_count=26；snapshot 与 30 分钟结果任务均无 source/upstream；research ready；scheduler catch-up dry-run 可选中槽位；非 dry-run 仅经 research execution 到 owner；owner snapshot append-only 增长；frontend compact 可读。
 
 ## 落库表
 
@@ -393,6 +417,19 @@ idx_research_model_execution_owner_status_v1
 idx_research_model_execution_symbol_day_v1
 idx_research_model_execution_payload_hash_v1
 ```
+
+### research-service -> model-payload-assembler -> t_relay live_result.compute_30m pass-through freeze
+
+- 冻结对象：`research-service -> model-payload-assembler -> t_relay live_result.compute_30m pass-through`。
+- 冻结时间：2026-07-01 Asia/Shanghai。
+- 拍板人 / 确认来源：用户在模型四双时间修复交付后回复“允许”，批准拍板冻结。
+- 锁定范围：`GET /research/model-payload/requirements` 必须注册 `t_relay.live_result.compute_30m`；`POST /research/model-payload/assemble` 和正式 live dispatch 的 `/research/model-execution/run` 对该任务只组装单对象 `payload`，字段包含 `trade_date`、`limit`、`monitor_interval_minutes=30`、`result_kind=model_result_30m`、`as_of_time_utc`、`symbols` 和 `scheduler_context`；research-service 不读取 `source.*`、`decision_t_relay.*`、raw 表或 provider，不计算模型分、不写模型四业务事实，owner 写入 `decision_t_relay.t_board_observation_monitor_snapshot_v1`。
+- 当前冻结证据：2026-07-01 运行态 `/research/model-payload/requirements` 返回 `task_count=26` 且包含 `t_relay.live_result.compute_30m`；scheduler `/readyz` ready，model/source task store `blocking_statuses=[]`；两条模型四死信任务在备份后带 `manual_requeue_after_research_contract_sync` 审计重排并成功；frontend compact 与 owner 观察台返回 `last_model_output_at=2026-07-01T02:32:00+00:00`，5 分钟投影仅进入 `latest_projection_snapshot_at=2026-07-01T02:30:00+00:00`。
+- 允许的只读验收：`/readyz`、`/research/model-payload/requirements`、`/research/model-payload/assemble` 且 `persist_audit=false`、scheduler `/readyz` / runtime status、owner observation-board / snapshots、frontend compact。
+- 禁止修改项：未经解锁不得移除 `t_relay.live_result.compute_30m`，不得把该任务改成 `rows[]` 或要求 source/upstream 表，不得把 5 分钟 `snapshot_5m` 当作模型产出时间，不得由 research 写 `decision_t_relay.*` / `research_t_relay.*` 业务事实，不得读取 raw/provider 或绕过 source-data-service 正规抓取链路。
+- 解锁条件：owner snapshot endpoint 合同、scheduler 30 分钟调度频率、research task registry / assembler 合同、模型四前端更新时间展示或用户明确批准解锁。
+- 回滚方式：回退本对象后续 research-service task registry / assembler / 文档变更，并仅按需 `--no-deps` 替换 research-service 后重新验证 readyz、requirements、no-persist assemble、scheduler ready 和 owner/frontend 只读结果；不得清库、不得删除 scheduler task store 审计、不得重启 `source-data-service`。
+- 验证清单：requirements 中有 26 个任务；`t_relay.live_result.compute_30m` 的 `source_tables=[]`、`upstream_tables=[]`；no-persist assemble 只返回单对象 payload；30 分钟模型结果可推动 owner `last_model_output_at/model_evaluated_at`；5 分钟投影不推动模型产出时间；research / scheduler / data-inspector / source 健康。
 
 ## 下游消费
 

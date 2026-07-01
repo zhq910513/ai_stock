@@ -44,6 +44,46 @@ def _json_value(value: Any, default: Any) -> Any:
     return value
 
 
+_RAW_RECORD_METADATA_COLUMNS = {
+    "raw_id",
+    "provider",
+    "api_name",
+    "request_params_json",
+    "request_hash",
+    "response_schema_hash",
+    "response_row_hash",
+    "batch_id",
+    "biz_key",
+}
+
+
+def _durable_raw_row_payload(data: dict[str, Any], request_params: dict[str, Any]) -> dict[str, Any]:
+    raw_row = _json_value(data.get("raw_row_json"), {})
+    if not isinstance(raw_row, dict):
+        raw_row = {}
+    row = dict(raw_row)
+
+    raw_provider_row = _json_value(data.get("raw_provider_row"), None)
+    if raw_provider_row is not None and "raw_provider_row" not in row:
+        row["raw_provider_row"] = raw_provider_row
+
+    for key, value in data.items():
+        if key in _RAW_RECORD_METADATA_COLUMNS or key == "raw_row_json":
+            continue
+        if value in (None, "") or key in row:
+            continue
+        row[key] = value
+
+    if "date" not in row:
+        request_date = request_params.get("date")
+        trade_date = _date_or_none(data.get("trade_date") or request_params.get("trade_date"))
+        if request_date not in (None, ""):
+            row["date"] = request_date
+        elif trade_date is not None:
+            row["date"] = trade_date.strftime("%Y%m%d")
+    return row
+
+
 def _schema_table(table_name: str) -> tuple[str, str]:
     if "." not in table_name:
         raise ValueError(f"table name must be schema-qualified: {table_name}")
@@ -696,7 +736,7 @@ class PostgresRawSourceRepository:
         for record in rows:
             data = dict(zip(names, record))
             request_params = _json_value(data.get("request_params_json"), {})
-            raw_row = _json_value(data.get("raw_row_json"), {})
+            raw_row = _durable_raw_row_payload(data, request_params)
             raw_symbol = _normalize_symbol(data.get("symbol") or _extract_code(raw_row, request_params))
             raw_trade_date = _extract_trade_date(raw_row, request_params) or _date_or_none(data.get("trade_date") or data.get("day"))
             if not _raw_row_matches_requested_identity(raw_symbol, raw_trade_date, symbol, trade_date_value):

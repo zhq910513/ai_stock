@@ -41,6 +41,10 @@ T_RELAY_OBSERVATION_MONITOR_TIMES_LOCAL = _trading_session_times_every_minutes(
     ((time(9, 30), time(11, 30)), (time(13, 0), time(15, 0))),
     5,
 )
+T_RELAY_LIVE_RESULT_TIMES_LOCAL = _trading_session_times_every_minutes(
+    ((time(9, 32), time(11, 32)), (time(13, 2), time(15, 2))),
+    30,
+)
 
 T_RELAY_DAY3_MORNING_MONITOR_TIMES_LOCAL = _times_every_minutes(time(9, 25), time(11, 30), 5)
 T_RELAY_DAY3_AFTERNOON_MONITOR_TIMES_LOCAL = _times_every_minutes(time(13, 0), time(15, 0), 5)
@@ -104,6 +108,7 @@ TASK_START_TIMES_LOCAL: dict[str, tuple[time, ...]] = {
     "t_relay.day3.exit.open": T_RELAY_DAY3_MORNING_MONITOR_TIMES_LOCAL,
     "t_relay.day3.exit.tail": T_RELAY_DAY3_AFTERNOON_MONITOR_TIMES_LOCAL,
     "t_relay.observation.monitor.snapshot_5m": T_RELAY_OBSERVATION_MONITOR_TIMES_LOCAL,
+    "t_relay.live_result.compute_30m": T_RELAY_LIVE_RESULT_TIMES_LOCAL,
     "t_relay.outcome.build": (time(15, 40),),
 }
 

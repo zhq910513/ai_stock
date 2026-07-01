@@ -17,8 +17,13 @@ def test_three_model_plan_exposes_all_release_gate_publishers() -> None:
     assert "t_relay.day1.scan.close" in task_codes
     assert "t_relay.day2.trigger.rolling_5m" in task_codes
     assert "t_relay.observation.monitor.snapshot_5m" in task_codes
+    assert "t_relay.live_result.compute_30m" in task_codes
     assert tasks["t_relay.observation.monitor.snapshot_5m"]["append_only"] is True
     assert tasks["t_relay.observation.monitor.snapshot_5m"]["writes_to"] == [
+        "decision_t_relay.t_board_observation_monitor_snapshot_v1"
+    ]
+    assert tasks["t_relay.live_result.compute_30m"]["append_only"] is True
+    assert tasks["t_relay.live_result.compute_30m"]["writes_to"] == [
         "decision_t_relay.t_board_observation_monitor_snapshot_v1"
     ]
     publishers = [item["task_code"] for item in body["tasks"] if item["is_official_publish"]]

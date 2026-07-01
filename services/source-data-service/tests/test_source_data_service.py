@@ -17,6 +17,7 @@ import source_data_service.operational_governance as operational_governance
 import source_data_service.ths_paid_probability as ths_paid_probability
 from source_data_service.postgres_repository import (
     _date_or_none,
+    _durable_raw_row_payload,
     _extract_code as _pg_extract_code,
     _extract_trade_date as _pg_extract_trade_date,
     _normalize_symbol as _pg_normalize_symbol,
@@ -572,6 +573,60 @@ def test_ths_paid_probability_builds_source_values_without_cookie_material() -> 
     assert "cookie" not in serialized
     assert "userid" not in serialized
     assert "user_cookie" not in serialized
+
+
+def test_durable_typed_raw_reader_exposes_ths_paid_probability_columns() -> None:
+    captured_at = datetime(2026, 6, 29, 7, 21, 16, tzinfo=timezone.utc)
+    row = _durable_raw_row_payload(
+        {
+            "raw_id": 1001,
+            "provider": "ths",
+            "api_name": "paid_limit_up_probability",
+            "request_params_json": {
+                "date": "20260629",
+                "stock_code": "000521",
+                "credential_version": "ths_paid_test_version",
+            },
+            "request_hash": "provider_hash",
+            "response_schema_hash": "schema_hash",
+            "response_row_hash": "row_hash",
+            "trade_date": date(2026, 6, 29),
+            "code": "000521",
+            "stock_code": "000521",
+            "symbol": "000521.SZ",
+            "paid_limit_up_probability": "78.36",
+            "status_code": 0,
+            "status_msg": "success",
+            "credential_version": "ths_paid_test_version",
+            "available_at": captured_at,
+            "captured_at": captured_at,
+            "raw_provider_row": {"data": "78.36", "status_code": 0, "status_msg": "success"},
+        },
+        {
+            "date": "20260629",
+            "stock_code": "000521",
+            "credential_version": "ths_paid_test_version",
+        },
+    )
+
+    assert row["date"] == "20260629"
+    assert row["trade_date"] == date(2026, 6, 29)
+    assert row["symbol"] == "000521.SZ"
+    assert row["paid_limit_up_probability"] == "78.36"
+    assert row["status_code"] == 0
+    assert row["raw_provider_row"]["status_msg"] == "success"
+    values, warnings = _build_values(
+        Provider.THS,
+        "paid_limit_up_probability",
+        "source.ths_paid_limit_up_probability_v1",
+        row,
+        ["paid_limit_up_probability"],
+    )
+    assert warnings == []
+    assert values == {"paid_limit_up_probability": 78.36}
+    serialized = str(row).lower()
+    assert "cookie" not in serialized
+    assert "userid" not in serialized
 
 
 def test_legacy_public_provider_adapters_are_runtime_visible() -> None:

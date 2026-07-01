@@ -513,11 +513,11 @@ def _executor(repo: MemoryRepository, owner: FakeOwnerClient | None = None) -> R
     )
 
 
-def test_requirements_cover_25_owner_tasks() -> None:
+def test_requirements_cover_26_owner_tasks() -> None:
     payload = requirements_payload()
 
     assert payload["assembler_contract"] == "research_model_payload_assembler_v1"
-    assert payload["task_count"] == 25
+    assert payload["task_count"] == 26
     assert all(not any(str(src).startswith("raw") for src in task["source_tables"]) for task in payload["tasks"])
 
 
@@ -560,6 +560,9 @@ def test_official_release_requirements_do_not_wait_for_their_own_outputs() -> No
     assert tasks["t_relay.observation.monitor.snapshot_5m"]["source_tables"] == ()
     assert tasks["t_relay.observation.monitor.snapshot_5m"]["upstream_tables"] == ()
     assert tasks["t_relay.observation.monitor.snapshot_5m"]["official_publish"] is False
+    assert tasks["t_relay.live_result.compute_30m"]["source_tables"] == ()
+    assert tasks["t_relay.live_result.compute_30m"]["upstream_tables"] == ()
+    assert tasks["t_relay.live_result.compute_30m"]["official_publish"] is False
 
 
 def test_t_relay_day1_assembles_real_source_payload_and_audit() -> None:
@@ -722,6 +725,38 @@ def test_t_relay_observation_snapshot_assembles_without_source_or_upstream() -> 
     assert snapshot_payload["scheduler_context"]["captured_late"] is True
 
 
+def test_t_relay_live_result_assembles_without_source_or_upstream() -> None:
+    repo = MemoryRepository()
+    assembler = _assembler(repo, source_client=BlockingSourceClient())
+
+    result = assembler.assemble(
+        api_module.ModelPayloadAssembleRequest(
+            task_code="t_relay.live_result.compute_30m",
+            symbol="000759.SZ",
+            trade_date=date(2026, 7, 1),
+            as_of_time_utc="2026-07-01T02:02:00Z",
+            persist_audit=False,
+            extra_context={
+                "scheduler_materialized_instance": {
+                    "task_code": "t_relay.live_result.compute_30m",
+                    "scheduled_at": "2026-07-01T02:02:00Z",
+                }
+            },
+        )
+    )
+
+    snapshot_payload = result.payload["payload"]
+    assert result.payload_assembly_status == "assembled_research_payload"
+    assert result.source_refs == []
+    assert result.upstream_refs == []
+    assert repo.upstream_fetches == []
+    assert snapshot_payload["trade_date"] == "2026-07-01"
+    assert snapshot_payload["monitor_interval_minutes"] == 30
+    assert snapshot_payload["result_kind"] == "model_result_30m"
+    assert snapshot_payload["as_of_time_utc"] == "2026-07-01T02:02:00+00:00"
+    assert snapshot_payload["scheduler_context"]["task_code"] == "t_relay.live_result.compute_30m"
+
+
 def test_t_relay_owner_client_wraps_observation_snapshot_without_rows() -> None:
     task = get_requirement("t_relay.observation.monitor.snapshot_5m")
     assert task is not None
@@ -770,6 +805,59 @@ def test_t_relay_owner_client_wraps_observation_snapshot_without_rows() -> None:
     assert body["trade_date"] == "2026-06-24"
     assert body["run_id"] == "snapshot-run-1"
     assert body["as_of_time_utc"] == "2026-06-24T02:15:00Z"
+    assert "rows" not in body
+    assert "row" not in body
+
+
+def test_t_relay_owner_client_wraps_live_result_without_rows() -> None:
+    task = get_requirement("t_relay.live_result.compute_30m")
+    assert task is not None
+    calls: list[dict[str, Any]] = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, Any]:
+            return {"structured_output": {"observation_monitor_snapshot": {"snapshot_count": 1}}}
+
+    class Client:
+        def post(self, url: str, *, json: dict[str, Any], timeout: float) -> Response:  # noqa: ANN001
+            calls.append({"url": url, "json": json, "timeout": timeout})
+            return Response()
+
+    owner = ModelOwnerClient(
+        hot_candidates_base_url="http://hot",
+        candidate_memory_base_url="http://memory",
+        ambush_watchlist_base_url="http://ambush",
+        t_board_relay_base_url="http://tboard",
+        request_timeout_seconds=12,
+        client=Client(),  # type: ignore[arg-type]
+    )
+
+    owner.call_owner(
+        task,
+        payload={
+            "payload": {
+                "trade_date": "2026-07-01",
+                "limit": 500,
+                "monitor_interval_minutes": 30,
+                "result_kind": "model_result_30m",
+                "as_of_time_utc": "2026-07-01T02:02:00+00:00",
+            },
+            "trade_date": "2026-07-01",
+        },
+        run_id="live-result-run-1",
+        as_of_time_utc="2026-07-01T02:02:00Z",
+    )
+
+    call = calls[0]
+    body = call["json"]
+    assert call["url"] == "http://tboard/t-board-relay/observation-monitor/snapshot"
+    assert body["payload"]["monitor_interval_minutes"] == 30
+    assert body["payload"]["result_kind"] == "model_result_30m"
+    assert body["trade_date"] == "2026-07-01"
+    assert body["run_id"] == "live-result-run-1"
     assert "rows" not in body
     assert "row" not in body
 
@@ -1090,6 +1178,33 @@ def test_execution_calls_hot_owner_and_materializes_decision_tables() -> None:
     assert ("source.daily_bar_v1", "000759.SZ", date(2026, 6, 12), True) in repo.source_fetches
     assert ("source.ths_paid_limit_up_probability_v1", "000759.SZ", date(2026, 6, 12), False) in repo.source_fetches
     assert repo.execution_audits[0]["accepted"] is True
+
+
+def test_execution_no_persist_calls_owner_without_materializing_decision_tables_or_audit() -> None:
+    repo = MemoryRepository()
+    owner = FakeOwnerClient()
+    executor = _executor(repo, owner)
+
+    result = executor.run(
+        api_module.ModelExecutionRunRequest(
+            task_code="hot.score.auction_confirmed",
+            symbol="000759.SZ",
+            trade_date=date(2026, 6, 12),
+            persist_audit=False,
+        )
+    )
+
+    assert result.execution_status == "materialization_skipped"
+    assert result.accepted is False
+    assert result.dispatch_allowed is True
+    assert result.owner_called is True
+    assert result.materialization_attempted is False
+    assert result.audit_persisted is False
+    assert result.materialized_counts == {}
+    assert result.gap_codes == ["research_execution_no_persist_materialization_skipped"]
+    assert owner.calls[0][0] == "hot.score.auction_confirmed"
+    assert repo.inserted_rows == []
+    assert repo.execution_audits == []
 
 
 def test_hot_score_uses_adjusted_daily_when_unadjusted_daily_is_missing() -> None:

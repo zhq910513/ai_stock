@@ -14,7 +14,7 @@
 | `/api/source/ths/paid-probability/*` | source-data-service 付费概率 Cookie 状态、批次状态和受控抓取入口 | 候选页 Cookie 配置、立即抓取、批次状态提示 | 仅允许 cookie/status、cookie、probe、fetch-current-batch、batch-status、deadline-check；不放开通用 source 写代理 |
 | `/api/model-list/hot` | `research-service /research/model-list/hot`、`decision_hot.*` 只读投影、`source.stock_master_v1`、`source.daily_bar_v1`、`source.ths_paid_limit_up_probability_v1` 展示上下文、`hot_model_data_readiness_v1` 准备度字段 | 热点模型页；只展示已落库模型结果，按模型分降序，并展示准备度、缺失分、P0 阻断和维度明细 | 只读；不回退 source universe，不触发 owner，不计算分数，不补买点/概率/行情；保留准备度合同字段，剥离审计大字段 |
 | `/api/backend/tboard/*` | `decision_t_relay.*`、`research_t_relay.*` owner GET | 模型四 owner 只读事实 | 只读 |
-| `/api/model-list/tboard` | `t-board-relay-service /t-board-relay/observation-board`、repository status 和 `/t-board-relay/day1/candidates` | 模型四 T 字接力观察台；普通用户列为股票、模型分、Day1、Day2、监测时间、当前判断、接力强度、关键依据、风险结论、更新；顶部显示今日 Day1 扫描汇总 | 只读；只消费 Day1 合格观察对象和 owner `model_score`；Day1 candidates 只在最新交易日内按股票去重并保留最新行后生成汇总计数和白话原因，不返回 rejected/data_blocked 明细；按模型分降序展示；剥离审计大字段，不改后端事实；普通用户列表不展示 `current_stage`、`day3_trade_date`、`next_observation`、`data_notice`、`data_gap_labels`、`ASK` 或 `BID` |
+| `/api/model-list/tboard` | `t-board-relay-service /t-board-relay/observation-board`、repository status 和 `/t-board-relay/day1/candidates` | 模型四 T 字接力观察台；普通用户列为股票、模型分、Day1、Day2、监测时间、当前判断、接力强度、关键依据、风险结论、更新；顶部显示最近 Day1 扫描汇总 | 只读；只消费 Day1 合格观察对象和 owner `model_score`；Day1 candidates 只在最新交易日内按股票去重并保留最新行后生成汇总计数和白话原因，不返回 rejected/data_blocked 明细；按模型分降序展示；`更新` 同时展示 `last_model_output_at/model_evaluated_at` 对应的最后一次模型产出时间，以及 `latest_data_fetch_at/last_data_captured_at` 对应的最新真实抓取/阶段事实时间；`latest_projection_snapshot_at` 只作审计，不冒充抓取；剥离审计大字段，不改后端事实；普通用户列表不展示 `current_stage`、`day3_trade_date`、`next_observation`、`data_notice`、`data_gap_labels`、`ASK` 或 `BID` |
 | `/api/backend/data-inspector/*` | 巡检摘要 | 健康/缺口展示 | 只读 |
 | `/api/backend/scheduler/*` | scheduler status/sample | 调度状态展示 | 只读 |
 | `/api/research/*` | `research_ambush.*` | 低谷图库研究资产写入 | 只允许研究中心合同 POST |
@@ -32,7 +32,7 @@
 
 热点模型页无后台调度；浏览器首屏只读调用 `/api/model-list/hot?limit=20`，前端服务再只读调用 `research-service /research/model-list/hot`。20 行只是普通用户首屏读取规模，用于保证准备度逐行真实验证后页面可及时展示，不改变后端接口 `limit` 参数能力，也不截断或删除任何已落库模型事实；该首屏真实准备度链路使用 24.0 秒浏览器预算和 30.0 秒服务端代理预算，避免 20 行逐条准备度验证在 12 秒边界误判为空态。该路径只读取已落库 `decision_hot.*` 投影、必要 source 展示上下文和 `hot_model_data_readiness_v1` 准备度合同，不触发 owner、scheduler、source fetch 或 provider 请求；无结果时显示空态/缺口，不回退到 source universe。准备度 KPI、准备度列和维度矩阵只消费后端返回的 `readiness_score_pct`、`missing_points`、`blocked_points`、`readiness_state`、`top_missing_dimension`、`readiness_gap_codes`、`readiness_dimensions` 和 `readiness_summary`；KPI 固定展示数据准备度、P0 阻断、已有模型分、概率覆盖和数据缺口，维度矩阵展示优先级、权重、覆盖和缺失分；字段覆盖矩阵的事实来源只展示中文业务来源，不展示服务名、schema/table、`source_gap:*` 原码、raw/provider/internal 文本或接口路径；没有真实行或没有准备度数值时显示“暂无”或“待评估”，不得把空态显示成 0% 或 100%。
 
-前端无后台调度。浏览器请求使用短超时，只读拉取当前页面所需数据；失败时显示中文空态，不补事实。模型四列表通过 `/api/model-list/tboard` 读取 owner `observation-board`、repository status 和 Day1 candidates；Day1 candidates 只在前端服务内按最新 `trade_date` 聚合，并在该交易日内按 `canonical_symbol`、`symbol`、`stock.symbol` 或 `instrument_id` 去重，保留 `updated_at` / `created_at` 最新行后统计今日扫描数、严格 Day1 合格数、未通过主因和更新时间，不把候选明细或审计字段返回浏览器。compact 响应在前端服务内剥离 `request_payload`、`result_payload`、`game_hypothesis_payload`、`evidence_json`、`related_payload` 后再返回浏览器，避免审计 / 证据大字段影响页面读取。模型四 `model_score` 只来自 owner 投影，页面按分数由高到低展示，缺关键事实时保持空态，不补 0、不自行评分。模型四 `day2_trigger_time` 仅展示 Day2 开盘后五分钟滚动监测中首次接近条件的检查时间，不代表前端写入交易、买点或 official signal。普通用户列表不展示“观察阶段”“Day3”“下一步”“数据提示”列；缺口只允许通过 owner 已投影的当前判断、关键依据或风险结论白话呈现。用户停留在 `#/model-tboard` 且已登录时，浏览器按 `TBOARD_AUTO_REFRESH_MS=60000` 每 60 秒重新读取 `/api/model-list/tboard?limit=100`；页面隐藏、切走路由或登出时清理 timer，这只是只读刷新节奏，不是 scheduler/source/model 写入调度。模型四已有可见数据时，自动刷新只 patch 表格 body、Day1 扫描汇总、错误提示和不占布局的刷新角标，不重建页面壳、筛选区或固定表头，不重置横向滚动，也不重复绑定表格 chrome；后台失败时保留上次可见内容。
+前端无后台调度。浏览器请求使用短超时，只读拉取当前页面所需数据；失败时显示中文空态，不补事实。模型四列表通过 `/api/model-list/tboard` 读取 owner `observation-board`、repository status 和 Day1 candidates；Day1 candidates 只在前端服务内按最新 `trade_date` 聚合，并在该交易日内按 `canonical_symbol`、`symbol`、`stock.symbol` 或 `instrument_id` 去重，保留 `updated_at` / `created_at` 最新行后统计最近 Day1 扫描数、严格 Day1 合格数、未通过主因和 Day1 更新时间，不把候选明细或审计字段返回浏览器；同一汇总会从 owner `observation-board` 压缩结果提取 `last_model_output_at/model_evaluated_at`、`latest_data_fetch_at/last_data_captured_at` 和只读审计用 `latest_projection_snapshot_at`。compact 响应在前端服务内剥离 `request_payload`、`result_payload`、`game_hypothesis_payload`、`evidence_json`、`related_payload` 后再返回浏览器，避免审计 / 证据大字段影响页面读取。模型四 `model_score` 只来自 owner 投影，页面按分数由高到低展示，缺关键事实时保持空态，不补 0、不自行评分。模型四 `day2_trigger_time` 仅展示 Day2 开盘后五分钟滚动监测中首次接近条件的检查时间，不代表前端写入交易、买点或 official signal。模型四 `更新` 同时展示 30 分钟模型结果时间 `last_model_output_at/model_evaluated_at` 和真实阶段事实时间 `latest_data_fetch_at/last_data_captured_at`；`latest_projection_snapshot_at` 只作为投影审计时间，不进入普通用户抓取时间。普通用户列表不展示“观察阶段”“Day3”“下一步”“数据提示”列；缺口只允许通过 owner 已投影的当前判断、关键依据或风险结论白话呈现。用户停留在 `#/model-tboard` 且已登录时，浏览器按 `TBOARD_AUTO_REFRESH_MS=60000` 每 60 秒重新读取 `/api/model-list/tboard?limit=100`；页面隐藏、切走路由或登出时清理 timer，这只是只读刷新节奏，不是 scheduler/source/model 写入调度。模型四已有可见数据时，自动刷新只 patch 表格 body、Day1 扫描汇总、错误提示和不占布局的刷新角标，不重建页面壳、筛选区或固定表头，不重置横向滚动，也不重复绑定表格 chrome；后台失败时保留上次可见内容。
 
 候选页付费概率依赖 scheduler/source-data-service 调度：15:20、16:05、18:00、20:30 抓取当前候选批次；09:01 执行 deadline guard。前端只展示后端批次状态，不自行放弃候选批次；未到下一交易日 09:00 前只显示阻断/等待/部分入库。
 
@@ -107,17 +107,32 @@
 - 数据资产范围：`/api/model-list/tboard` 只读聚合 owner `GET /t-board-relay/observation-board`；返回浏览器前剥离 `request_payload`、`result_payload`、`game_hypothesis_payload`、`evidence_json`、`related_payload`；页面只消费 10 个用户列，按 owner `model_score` 降序展示，并按 60 秒只读刷新。默认列表不主动展示超过 3 天的 `stopped` 失效对象，历史失效事实仍保留在 owner 和 append-only 快照中。
 - 当前运行事实：compact 响应 `read_only=true`，且 `observation_board.data.items` 为 4 条 Day1 合格对象；`600172.SH` 已随 post-entry monitor 更新为“触发后开板，停止观察”；截图留存在 `services/shence-frontend-service/playwright-artifacts/model-tboard-20260624-final-validation.png`。
 - 数据边界：前端不写 `decision_t_relay.*`、`research_t_relay.*`、source/raw、scheduler、release gate、交易、买点、outcome 或学习权重；不把缺口补成 0/mock/示例 payload/前端推断；不直接展示 `ASK` / `BID` 或 `source_gap:*`。
+- 更新时间边界：模型四列表“更新”列并列展示 `last_model_output_at/model_evaluated_at`（最后一次 30 分钟模型结果产出时间）和 `latest_data_fetch_at/last_data_captured_at`（最新真实抓取 / 阶段事实时间）。`latest_projection_snapshot_at` 只表示最近 5 分钟投影快照生成时间，用于审计和排查，不得冒充抓取时间。
+- 数据缺口语义：owner 返回 `observation_status=data_wait` 时，普通用户列表当前判断必须展示“暂不观察”，接力强度必须展示“数据缺口”；不得展示“等待确认 / 待确认”，避免被理解为仍可继续观察。
 - 解锁条件：用户明确批准本子对象解锁；若 owner projection 合同变化，必须另行解锁 `t-board-relay-service`。
 
 ### shence-frontend-service -> model-tboard -> snapshot refresh acceptance
 
 - 冻结时间：2026-06-24 Asia/Shanghai。
 - 拍板人 / 确认来源：用户授权 Codex 判断模型四链路是否可拍板，并在本轮回复“批准”；Codex 基于登录会话、compact API 和 Playwright DOM 验收判定普通用户可读目标已达成。
-- 数据资产范围：`/api/model-list/tboard` 只读聚合 owner repository status 和 `observation-board`，返回浏览器前剥离审计 payload；`#/model-tboard` 只消费 `stock.symbol/name`、owner `model_score`、阶段日期、当前判断、接力强度、关键依据、风险结论和更新时间。
+- 数据资产范围：`/api/model-list/tboard` 只读聚合 owner repository status 和 `observation-board`，返回浏览器前剥离审计 payload；`#/model-tboard` 只消费 `stock.symbol/name`、owner `model_score`、阶段日期、当前判断、接力强度、关键依据、风险结论和更新时间。更新时间并列展示 owner 最近 30 分钟模型结果时间 `last_model_output_at/model_evaluated_at` 与真实阶段事实时间 `latest_data_fetch_at/last_data_captured_at`；`latest_projection_snapshot_at` 只作 5 分钟投影审计，不得代替抓取时间。
 - 当前验收事实：compact API 返回 `read_only=true`、`compact_audit_payloads=true`、4 条 Day1 合格对象、股票名完整、模型分排序 15/12/12/0、更新时间 `2026-06-24 09:50:48`；Playwright DOM 显示 4 行和 10 个核心列，不显示“数据提示”“不自动下单”“接力机会提示仅作观察”。
 - 数据边界：前端不写 `decision_t_relay.*`、`research_t_relay.*`、source/raw、scheduler、release gate、交易、买点、outcome 或学习权重；不补股票名、模型分、盘口方向或风险结论；`model_score=0` 仅展示 owner 明确给出的硬失败综合分。
 - 只读验收：frontend readyz、登录 session、`/api/model-list/tboard`、owner observation-board、Playwright DOM、前端合同测试。
 - 解锁条件：owner `observation-board` 字段、compact 聚合合同、列定义、排序口径、自动刷新语义、股票名来源或用户明确批准解锁。
+
+### shence-frontend-service -> model-tboard -> dual-time update display asset
+
+- 冻结时间：2026-07-01 Asia/Shanghai。
+- 拍板人 / 确认来源：用户在模型四双时间修复交付后回复“允许”，批准拍板冻结。
+- 数据资产范围：`/api/model-list/tboard` 从 owner `observation-board` 中只读提取三类时间：`last_model_output_at/model_evaluated_at` 为 30 分钟模型结果产出时间，`latest_data_fetch_at/last_data_captured_at` 为真实抓取 / 阶段事实时间，`latest_projection_snapshot_at` 为 5 分钟投影审计时间。浏览器 `#/model-tboard` 的“更新”列只展示前两类为“模型 / 抓取”双时间。
+- 当前验收事实：2026-07-01 compact 响应同时返回 `last_model_output_at=2026-07-01T02:32:00+00:00`、`latest_data_fetch_at=2026-06-26T07:53:37.143354+00:00` 和 `latest_projection_snapshot_at=2026-07-01T02:30:00+00:00`；页面不再把 5 分钟投影当作最新抓取或模型产出。
+- 数据边界：前端服务不写 `decision_t_relay.*`、`research_t_relay.*`、source/raw、scheduler、release gate、交易、买点、outcome 或学习权重；缺模型产出显示“未产出”，缺真实抓取推进显示“未推进”，不得用当前时间、投影时间、0、空字符串、mock 或 GPT 推断补齐。
+- 允许的只读验收：`/api/model-list/tboard`、owner observation-board、frontend `/readyz`、`#/model-tboard` DOM、前端合同测试、Python 编译检查、JS 语法检查。
+- 禁止修改项：未经解锁不得合并三类时间，不得删除“模型 / 抓取”双时间，不得把 `latest_projection_snapshot_at` 作为普通用户更新时间，不得让前端触发抓取、调度、模型评分、official signal 或交易事实写入。
+- 解锁条件：owner 时间字段合同、research 30 分钟任务、scheduler 频率、前端模型四列合同或用户明确批准解锁。
+- 回滚方式：回退本对象后续 compact 时间提取、页面渲染、测试和文档变更，重新执行只读验收；不清库、不重启 `source-data-service`，不修改 owner append-only 数据。
+- 验证清单：compact 返回双时间字段；页面更新列显示“模型 / 抓取”；投影时间只用于审计；响应剥离审计 payload；source/scheduler/data-inspector/frontend 健康。
 
 ### shence-frontend-service -> model-tboard -> plain user semantics
 

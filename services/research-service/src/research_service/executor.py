@@ -69,7 +69,7 @@ class ResearchModelExecutor:
                 "materialized_counts": {},
                 "audit_persisted": False,
             }
-            response["audit_persisted"] = self._persist(response, assembly, None, None)
+            response["audit_persisted"] = self._persist(response, assembly, None, None, persist_audit=request.persist_audit)
             return ModelExecutionRunResponse(**response)
         owner_result: OwnerCallResult | None = None
         try:
@@ -92,7 +92,7 @@ class ResearchModelExecutor:
                 "materialized_counts": {},
                 "audit_persisted": False,
             }
-            response["audit_persisted"] = self._persist(response, assembly, None, None)
+            response["audit_persisted"] = self._persist(response, assembly, None, None, persist_audit=request.persist_audit)
             return ModelExecutionRunResponse(**response)
         if not owner_result.accepted:
             response = base | {
@@ -110,7 +110,22 @@ class ResearchModelExecutor:
                 "materialized_counts": {},
                 "audit_persisted": False,
             }
-            response["audit_persisted"] = self._persist(response, assembly, owner_result, None)
+            response["audit_persisted"] = self._persist(response, assembly, owner_result, None, persist_audit=request.persist_audit)
+            return ModelExecutionRunResponse(**response)
+        if not request.persist_audit:
+            response = base | {
+                "execution_status": "materialization_skipped",
+                "accepted": False,
+                "dispatch_allowed": True,
+                "owner_called": True,
+                "materialization_attempted": False,
+                "owner_endpoint": owner_result.endpoint,
+                "owner_status_code": owner_result.status_code,
+                "owner_response": owner_result.response_body,
+                "gap_codes": ["research_execution_no_persist_materialization_skipped"],
+                "materialized_counts": {},
+                "audit_persisted": False,
+            }
             return ModelExecutionRunResponse(**response)
         try:
             counts = self.materializer.materialize(task=task, assembly=assembly, owner_response=owner_result.response_body)
@@ -130,7 +145,7 @@ class ResearchModelExecutor:
                 "materialized_counts": {},
                 "audit_persisted": False,
             }
-            response["audit_persisted"] = self._persist(response, assembly, owner_result, None)
+            response["audit_persisted"] = self._persist(response, assembly, owner_result, None, persist_audit=request.persist_audit)
             return ModelExecutionRunResponse(**response)
         materializer_gaps = list(counts.get("materializer_gap_codes") or [])
         persisted_count = sum(int(value) for key, value in counts.items() if key != "materializer_gap_codes" and isinstance(value, int))
@@ -157,7 +172,7 @@ class ResearchModelExecutor:
             "materialized_counts": counts,
             "audit_persisted": False,
         }
-        response["audit_persisted"] = self._persist(response, assembly, owner_result, counts)
+        response["audit_persisted"] = self._persist(response, assembly, owner_result, counts, persist_audit=request.persist_audit)
         return ModelExecutionRunResponse(**response)
 
     def _run_hot_task_fanout(self, request: ModelExecutionRunRequest) -> ModelExecutionRunResponse:
@@ -233,7 +248,14 @@ class ResearchModelExecutor:
             "materialized_counts": counts,
             "audit_persisted": False,
         }
-        response["audit_persisted"] = self._persist(response, assembly, None, counts, symbol_override=None)
+        response["audit_persisted"] = self._persist(
+            response,
+            assembly,
+            None,
+            counts,
+            symbol_override=None,
+            persist_audit=request.persist_audit,
+        )
         return ModelExecutionRunResponse(**response)
 
     def _run_blocked_hot_empty_pool(self, request: ModelExecutionRunRequest) -> ModelExecutionRunResponse:
@@ -267,7 +289,13 @@ class ResearchModelExecutor:
             },
             "audit_persisted": False,
         }
-        response["audit_persisted"] = self._persist(response, assembly, None, response["materialized_counts"])
+        response["audit_persisted"] = self._persist(
+            response,
+            assembly,
+            None,
+            response["materialized_counts"],
+            persist_audit=request.persist_audit,
+        )
         return ModelExecutionRunResponse(**response)
 
     def _base_response(self, execution_id: str, assembly: ModelPayloadAssembleResponse) -> dict[str, Any]:
@@ -297,7 +325,10 @@ class ResearchModelExecutor:
         owner_result: OwnerCallResult | None,
         counts: dict[str, Any] | None,
         symbol_override: str | None = "",
+        persist_audit: bool = True,
     ) -> bool:
+        if not persist_audit:
+            return False
         return self.repository.persist_execution_audit(
             execution_id=response["execution_id"],
             assembly_id=assembly.assembly_id,

@@ -216,7 +216,7 @@ const MODEL_LIST_COLUMN_WIDTHS = {
     relay_strength_label: 86,
     key_reason: 196,
     risk_tip: 204,
-    latest_snapshot_time: 96,
+    latest_snapshot_time: 142,
   },
 };
 
@@ -235,7 +235,7 @@ const MODEL_COLUMN_HINTS = {
   verification_status: "收益或阶段结果验证状态；等待、缺口和未成熟不能当作成功。",
   risk_summary: "风险摘要，来自后端事实或缺口状态，前端不推断零风险。",
   data_quality: "标准事实或研究仓库可读质量。",
-  latest_snapshot_time: "该行最新可见更新时间。",
+  latest_snapshot_time: "该行最后一次模型产出时间和最新真实抓取/事实时间。",
   source_gaps: "行级待补事实数量和前两个主要原因。",
   source: "该行主要数据来源。",
   first_signal_date: "候选记忆种子第一次出现在候选池的日期。",
@@ -2098,17 +2098,19 @@ function renderTBoardDay1ScanSummary(profile, extraData = {}) {
   const summary = extraData.day1_scan_summary;
   if (!summary) return `<div class="tboard-day1-summary tboard-day1-summary--empty" data-model-day1-summary="true"></div>`;
   if (summary.ok === false) {
-    return `<div class="tboard-day1-summary tboard-day1-summary--warning" data-model-day1-summary="true"><strong>今日 Day1 扫描</strong><span>${escapeHtml(summary.error || "今日 Day1 扫描结论暂时不可读")}</span></div>`;
+    return `<div class="tboard-day1-summary tboard-day1-summary--warning" data-model-day1-summary="true"><strong>最近 Day1 扫描</strong><span>${escapeHtml(summary.error || "Day1 扫描结论暂时不可读")}</span></div>`;
   }
   const data = summary.data || {};
   const text = data.summary_text || data.main_reason;
   if (!text) return `<div class="tboard-day1-summary tboard-day1-summary--empty" data-model-day1-summary="true"></div>`;
   const meta = [
     data.trade_date ? `Day1 ${formatDateTimeValue(data.trade_date)}` : "",
-    data.updated_at ? `更新 ${formatDateTimeValue(data.updated_at)}` : "",
+    data.updated_at ? `Day1更新 ${formatDateTimeValue(data.updated_at)}` : "",
+    `模型 ${data.last_model_output_at ? formatDateTimeValue(data.last_model_output_at) : "未产出"}`,
+    `抓取 ${data.latest_data_fetch_at ? formatDateTimeValue(data.latest_data_fetch_at) : "未推进"}`,
   ].filter(Boolean).join(" / ");
   return `<div class="tboard-day1-summary" data-model-day1-summary="true">
-    <strong>今日 Day1 扫描</strong>
+    <strong>最近 Day1 扫描</strong>
     <span>${escapeHtml(text)}</span>
     ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
   </div>`;
@@ -2916,7 +2918,7 @@ function tBoardRelayStrengthText(item) {
   if (reason === "not_triggered") return "未触发";
   const status = String(item?.observation_status || "").toLowerCase();
   if (status === "stopped") return "已停止";
-  if (status === "data_wait") return "待确认";
+  if (status === "data_wait") return "数据缺口";
   if (status === "continue_watch") return "观察中";
   return item?.relay_strength_label || "待确认";
 }
@@ -2929,7 +2931,7 @@ function tBoardConclusionText(item) {
   const status = String(item?.observation_status || "").toLowerCase();
   if (status === "opportunity") return "已触发，继续看封板";
   if (status === "continue_watch") return "继续观察";
-  if (status === "data_wait") return "等待确认";
+  if (status === "data_wait") return "暂不观察";
   const raw = String(item?.current_conclusion || "").trim();
   if (raw.includes("可买入") || raw.includes("已触发")) return "已触发，继续看封板";
   return item?.current_conclusion;
@@ -2967,32 +2969,54 @@ function tBoardRiskText(item) {
   return risk;
 }
 
+function tBoardUpdateText(lastModelOutputAt, latestDataFetchAt) {
+  const modelText = lastModelOutputAt ? formatDateTimeValue(lastModelOutputAt) : "未产出";
+  const fetchText = latestDataFetchAt ? formatDateTimeValue(latestDataFetchAt) : "未推进";
+  return `模型 ${modelText} / 抓取 ${fetchText}`;
+}
+
 function buildTBoardListRows(extra) {
   const items = arrayFromResponse(extra.observation_board?.data)
     .filter((item) => !tBoardIsStaleStopped(item));
-  return items.map((item) => ({
-    stock: item.stock || { symbol: item.canonical_symbol, name: item.stock_name },
-    observation_id: item.observation_id,
-    observation_status: item.observation_status,
-    model_score: item.model_score,
-    model_score_label: item.model_score_label,
-    score_state: item.score_state,
-    model_score_version: item.model_score_version,
-    current_conclusion: tBoardConclusionText(item),
-    current_stage: item.current_stage,
-    day1_trade_date: item.day1_trade_date,
-    day2_trade_date: item.day2_trade_date,
-    day2_trigger_time: item.day2_trigger_time || item.trigger_time,
-    day3_trade_date: item.day3_trade_date,
-    relay_strength_label: tBoardRelayStrengthText(item),
-    next_observation: item.next_observation,
-    key_reason: tBoardKeyReasonText(item),
-    risk_tip: tBoardRiskText(item),
-    latest_snapshot_time: item.latest_snapshot_time,
-    source_gaps: item.data_gap_labels || [],
-    data_gap_count: item.data_gap_count || 0,
-    game_state: item.game_state_label,
-  })).sort((a, b) => modelScoreSortValue(b) - modelScoreSortValue(a) || recordOrderValue(b) - recordOrderValue(a));
+  return items.map((item) => {
+    const latestDataFetchAt = item.latest_data_fetch_at || item.last_data_captured_at || null;
+    const lastModelOutputAt = item.last_model_output_at || item.model_evaluated_at || null;
+    const projectionSnapshotAt = item.latest_projection_snapshot_at || null;
+    const rowUpdatedAt = lastModelOutputAt || latestDataFetchAt || projectionSnapshotAt;
+    return {
+      stock: item.stock || { symbol: item.canonical_symbol, name: item.stock_name },
+      observation_id: item.observation_id,
+      observation_status: item.observation_status,
+      model_score: item.model_score,
+      model_score_label: item.model_score_label,
+      score_state: item.score_state,
+      model_score_version: item.model_score_version,
+      current_conclusion: tBoardConclusionText(item),
+      current_stage: item.current_stage,
+      day1_trade_date: item.day1_trade_date,
+      day2_trade_date: item.day2_trade_date,
+      day2_trigger_time: item.day2_trigger_time || item.trigger_time,
+      day3_trade_date: item.day3_trade_date,
+      relay_strength_label: tBoardRelayStrengthText(item),
+      next_observation: item.next_observation,
+      key_reason: tBoardKeyReasonText(item),
+      risk_tip: tBoardRiskText(item),
+      latest_snapshot_time: tBoardUpdateText(lastModelOutputAt, latestDataFetchAt),
+      updated_at: rowUpdatedAt,
+      display_update_at: projectionSnapshotAt,
+      latest_data_fetch_at: latestDataFetchAt,
+      last_data_captured_at: item.last_data_captured_at || null,
+      last_model_output_at: lastModelOutputAt,
+      model_evaluated_at: item.model_evaluated_at || null,
+      latest_projection_snapshot_at: projectionSnapshotAt,
+      model_result_interval_minutes: item.model_result_interval_minutes,
+      latest_model_result_snapshot_id: item.latest_model_result_snapshot_id || null,
+      latest_projection_snapshot_id: item.latest_projection_snapshot_id || null,
+      source_gaps: item.data_gap_labels || [],
+      data_gap_count: item.data_gap_count || 0,
+      game_state: item.game_state_label,
+    };
+  }).sort((a, b) => modelScoreSortValue(b) - modelScoreSortValue(a) || recordOrderValue(b) - recordOrderValue(a));
 }
 
 function modelListDescription(profile) {

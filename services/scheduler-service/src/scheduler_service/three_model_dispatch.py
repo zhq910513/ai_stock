@@ -34,6 +34,7 @@ LIVE_DISPATCH_SAMPLE_TASKS = OFFICIAL_RELEASE_GATE_TASKS + (
     "t_relay.day3.exit.open",
     "t_relay.day3.exit.tail",
     "t_relay.observation.monitor.snapshot_5m",
+    "t_relay.live_result.compute_30m",
     "t_relay.outcome.build",
 )
 
@@ -134,6 +135,7 @@ TASK_CODE_PATH_OVERRIDES: dict[str, str] = {
     "t_relay.day3.exit.open": "/t-board-relay/day3/exit-check",
     "t_relay.day3.exit.tail": "/t-board-relay/day3/exit-check",
     "t_relay.observation.monitor.snapshot_5m": "/t-board-relay/observation-monitor/snapshot",
+    "t_relay.live_result.compute_30m": "/t-board-relay/observation-monitor/snapshot",
     "t_relay.outcome.build": "/t-board-relay/outcomes/build",
 }
 
@@ -586,6 +588,15 @@ def build_live_dispatch_sample_payload(
             "trade_date": trading_day,
             "limit": 500,
             "monitor_interval_minutes": 5,
+        }
+    if task_code == "t_relay.live_result.compute_30m":
+        return {
+            "run_id": f"sample-t-relay-live-result-{trading_day}",
+            "as_of_time_utc": as_of_time_utc,
+            "trade_date": trading_day,
+            "limit": 500,
+            "monitor_interval_minutes": 30,
+            "result_kind": "model_result_30m",
         }
     if task_code == "t_relay.outcome.build":
         return {

@@ -28,6 +28,11 @@ T_RELAY_DAY2_TASKS = {
     "t_relay.day2.trigger.rolling_5m",
 }
 
+T_RELAY_OBSERVATION_MONITOR_TASKS = {
+    "t_relay.observation.monitor.snapshot_5m",
+    "t_relay.live_result.compute_30m",
+}
+
 T_RELAY_DEGRADABLE_UPSTREAM_GAP_TASKS = {
     *T_RELAY_DAY2_TASKS,
     "t_relay.day2.post_entry.monitor",
@@ -457,19 +462,25 @@ class ResearchPayloadAssembler:
         source_rows: dict[str, dict[str, list[dict[str, Any]]]],
         upstream_rows: dict[str, dict[str, list[dict[str, Any]]]],
     ) -> dict[str, Any]:
-        if task.task_code == "t_relay.observation.monitor.snapshot_5m":
-            return {
-                "payload": {
-                    "trade_date": request.trade_date.isoformat(),
-                    "limit": 500,
-                    "monitor_interval_minutes": T_RELAY_DAY2_MONITOR_INTERVAL_MINUTES,
-                    "as_of_time_utc": request.as_of_time_utc.isoformat() if request.as_of_time_utc else None,
-                    "symbols": symbols,
-                    "scheduler_context": request.extra_context.get("scheduler_materialized_instance")
-                    if isinstance(request.extra_context, dict)
-                    else None,
-                }
+        if task.task_code in T_RELAY_OBSERVATION_MONITOR_TASKS:
+            monitor_interval_minutes = (
+                30
+                if task.task_code == "t_relay.live_result.compute_30m"
+                else T_RELAY_DAY2_MONITOR_INTERVAL_MINUTES
+            )
+            payload = {
+                "trade_date": request.trade_date.isoformat(),
+                "limit": 500,
+                "monitor_interval_minutes": monitor_interval_minutes,
+                "as_of_time_utc": request.as_of_time_utc.isoformat() if request.as_of_time_utc else None,
+                "symbols": symbols,
+                "scheduler_context": request.extra_context.get("scheduler_materialized_instance")
+                if isinstance(request.extra_context, dict)
+                else None,
             }
+            if task.task_code == "t_relay.live_result.compute_30m":
+                payload["result_kind"] = "model_result_30m"
+            return {"payload": payload}
         rows = [self._t_relay_symbol_payload(task, request, symbol, source_rows, upstream_rows) for symbol in symbols]
         if task.task_code == "t_relay.day1.scan.close":
             return {"rows": rows}

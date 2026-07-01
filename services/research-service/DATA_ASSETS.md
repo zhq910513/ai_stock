@@ -1,10 +1,32 @@
 # research-service DATA_ASSETS
 
+## Model Execution No-Persist Probe Asset Contract
+
+2026-06-29 asset contract: `/research/model-execution/run` with `persist_audit=false` is non-materializing. It can read assembled source/upstream facts and call the owner service for response inspection, but it cannot write `governance.research_model_execution_audit_v1`, `decision_hot.*`, `decision_memory.*`, `decision_ambush.*`, `decision_t_relay.*`, `research_t_relay.*`, or any other model fact table. The response must expose the skipped materialization through `research_execution_no_persist_materialization_skipped` instead of silently writing or pretending the run was materialized.
+
+### research-service -> model-execution -> no-persist probe boundary asset freeze
+
+- Freeze object: `research-service -> model-execution -> no-persist probe boundary`.
+- Freeze time: 2026-06-29 Asia/Shanghai.
+- Decision source: user delegated the decision with "你来决定"; Codex froze the asset boundary after runtime verification showed owner 200 with unchanged `decision_hot` and execution audit counts.
+- Locked asset boundary: `persist_audit=false` may read assembled source/upstream facts and may call the owner endpoint, but must not write `governance.research_model_execution_audit_v1`, `decision_hot.*`, `decision_memory.*`, `decision_ambush.*`, `decision_t_relay.*`, `research_t_relay.*`, `source.*`, or raw/provider assets.
+- Allowed read-only acceptance: database row counts, orphan score count, execution audit count for a probe execution id, `/readyz`, `/research/model-payload/assemble`, controlled `/research/model-execution/run` no-persist probes, and source queue summaries.
+- Forbidden without explicit unlock: using no-persist as a hidden materialization path, inserting orphan model facts, writing execution audit for probes, changing skipped materialization gap codes, filling missing facts with defaults, or modifying source/provider/raw/cookie behavior.
+- Unlock conditions: execution audit asset contract change, materializer target table change, scheduler live dispatch contract change, or explicit user approval naming this freeze object.
+- Rollback: revert the research-service no-persist asset-boundary change and redeploy only research-service; restore accidentally removed probe rows only from the saved backup when explicitly requested.
+- Verification checklist: no-persist probe returns `materialization_skipped`, `owner_called=true`, `materialization_attempted=false`, `audit_persisted=false`, empty `materialized_counts`; `decision_hot` and execution audit counts remain unchanged; orphan hot score count remains 0; core services stay ready.
+
 ## Hot Score Daily Bar Fallback Asset Contract
 
 2026-06-26 asset contract: `hot.score.auction_confirmed` reads both `source.daily_bar_v1` and `source.adjusted_daily_bar_v1`. If the unadjusted daily row is missing for a paid-probability candidate while adjusted daily rows are present, usable, and source-built, `research-service` may expose those adjusted rows as normalized owner-facing `daily_bars` for the hot score stage only. The normalized rows map `adjusted_open/high/low/close` to `open_price/high_price/low_price/close_price` and preserve source audit fields such as `available_at`, `lineage_id`, and `build_batch_id`.
 
 The fallback keeps the original `source.adjusted_daily_bar_v1` asset visible through `adjusted_daily_bars`, marks `daily_bar_source=source.adjusted_daily_bar_v1`, and records `source_gap:daily_bar_missing_using_adjusted_daily_bar` as a warning. It does not write `source.daily_bar_v1`, does not read raw/provider tables, does not change source-data-service orchestration, and does not apply to release gate, buy point, outcome, evolution, memory, ambush, or T relay tasks.
+
+## T Relay Observation Monitor Result Asset Contract
+
+2026-07-01 asset contract: `t_relay.observation.monitor.snapshot_5m` and `t_relay.live_result.compute_30m` are research pass-through assets. They do not read `source.*`, `decision_t_relay.*`, raw tables, or provider responses in research-service. Both call `t-board-relay-service /t-board-relay/observation-monitor/snapshot`; the owner repository is the only writer of `decision_t_relay.t_board_observation_monitor_snapshot_v1`.
+
+The five-minute task carries `monitor_interval_minutes=5` and is an audit/recovery projection. The 30-minute task carries `monitor_interval_minutes=30` and `result_kind=model_result_30m`; only this 30-minute task may be interpreted downstream as model output time. Neither task may fill missing market facts with defaults, infer model state, or publish official signals.
 
 ## Hot Stage Case Reuse Asset Contract
 
@@ -144,10 +166,11 @@ For non-score stages, the materializer resolves the case lineage from assembled 
 |---|---|---|
 | `trade_date` | scheduler materializer / catch-up request | 本次快照所属交易日；不由 research-service 推断 Day1/Day2/Day3 结论 |
 | `limit` | research-service 固定合同 | 默认 500，只控制 owner 读取观察台投影窗口 |
-| `monitor_interval_minutes` | research-service 固定合同 | 固定 5，匹配模型四观察台五分钟留痕频率 |
+| `monitor_interval_minutes` | research-service 固定合同 | `snapshot_5m` 固定 5，匹配模型四观察台五分钟留痕频率；`live_result.compute_30m` 固定 30，匹配模型结果产出频率 |
+| `result_kind` | research-service 固定合同 | 仅 `t_relay.live_result.compute_30m` 写入 `model_result_30m`，用于 owner 和前端区分模型产出与投影快照 |
 | `scheduler_context` | scheduler `_scheduler_materialized_instance` | 保存原始计划槽位、`catch_up_run_id`、`captured_late`、`original_scheduled_at`、`catch_up_checked_at` 等调度审计字段 |
 
-当前代码合同：`t_relay.observation.monitor.snapshot_5m` 不读取 `source.*`、`decision_t_relay.*` 或 raw/provider；它只调用 owner 快照入口，由 `t-board-relay-service` 从自身 repository 当前投影生成 append-only 快照。迟到补偿只能说明“当前捕获了某个错过槽位的观察台投影”，不得把补偿快照解释为历史实时盘口事实。
+当前代码合同：`t_relay.observation.monitor.snapshot_5m` 与 `t_relay.live_result.compute_30m` 均不读取 `source.*`、`decision_t_relay.*` 或 raw/provider；它们只调用 owner 快照入口，由 `t-board-relay-service` 从自身 repository 当前投影生成 append-only 快照。迟到补偿只能说明“当前捕获了某个错过槽位的观察台投影”；只有 `result_kind=model_result_30m` 的 30 分钟任务可作为模型产出时间，不得把五分钟补偿快照解释为历史实时盘口事实或模型结果。
 
 ## 性能索引
 
@@ -173,7 +196,7 @@ For non-score stages, the materializer resolves the case lineage from assembled 
 | `research-service -> model-payload-assembler -> hot release upstream case-link reader` | `hot.release_gate.preopen` 按 `hot_decision_case_v1.hot_case_id` 读取 `hot_score_fact_v1` / `hot_evidence_snapshot_v1` | 2026-06-19 定向发布后，no-persist assemble 对 `000759.SZ / 2026-06-12` 读到 score `row_count=1`、evidence `row_count=8`，仅保留 `source_gap:source_preflight_not_passed` | 只读 `decision_hot.hot_decision_case_v1`、`decision_hot.hot_score_fact_v1`、`decision_hot.hot_evidence_snapshot_v1`；不写 release audit，不生成 `hot_signal_fact_v1` |
 | `research-service -> model-execution -> owner materialization bridge` | `/research/model-execution/run`、`ResearchDecisionMaterializer`、`governance.research_model_execution_audit_v1`、owner 输出物化表 | 代码合同：blocked assembly 不触达 owner；owner 失败/物化失败均写 execution audit；materialized_counts 记录写入表计数；scheduler live time wheel 只调用 research execution；热点 score/release/buy-point 可按真实候选池 fanout | 只物化 owner 返回的真实结构化结果；不计算分数、不绕过 source preflight、不直接发布、改写或提升 official signal；热点 research-only signal 与 blocked buy-point 保留诊断语义；T 字板业务事实由 owner repository 写入 |
 | `research-service -> model-payload-assembler -> t_relay Day2 warning/assembly contract` | `t_relay.day2.watch.rolling_5m` / `t_relay.day2.trigger.rolling_5m` 的 Day2 source/upstream 资产读取、warning 语义和 no-persist 验收口径 | 2026-06-23 用户批准解锁为开盘后五分钟滚动监测；首次 `day2_distance_to_up_limit_pct <= 0.01` 视为接近条件，提示可买入观察；未接近时继续滚动观察 | 只读 `source.limit_price_v1`、`source.minute_bar_v1`、`source.realtime_quote_v1`、`source.trade_tick_v1`、`decision_t_relay.t_board_day1_candidate_v1`、`decision_t_relay.t_board_day2_watch_snapshot_v1`；`trade_tick` 仅为逐笔侧向证据；不读 raw/provider；不把封单快照、动态特征或吸收分缺口补成事实 |
-| `research-service -> model-payload-assembler -> t_relay observation snapshot pass-through` | `t_relay.observation.monitor.snapshot_5m`、owner `/t-board-relay/observation-monitor/snapshot`、scheduler catch-up context | 2026-06-24 新增第 25 个 research task；no-persist 组装不读取 source/upstream，owner request body 只携带单对象 `payload` | 不读 raw/provider/source/upstream；不补历史盘口事实；不生成前端事实；owner repository 负责 `decision_t_relay.t_board_observation_monitor_snapshot_v1` 写入 |
+| `research-service -> model-payload-assembler -> t_relay observation monitor pass-through` | `t_relay.observation.monitor.snapshot_5m`、`t_relay.live_result.compute_30m`、owner `/t-board-relay/observation-monitor/snapshot`、scheduler context | 当前 requirements 含 26 个 research task；两类 observation-monitor 组装均不读取 source/upstream，owner request body 只携带单对象 `payload`；30 分钟任务额外携带 `result_kind=model_result_30m` | 不读 raw/provider/source/upstream；不补历史盘口事实；不生成前端事实；owner repository 负责 `decision_t_relay.t_board_observation_monitor_snapshot_v1` 写入；只有 30 分钟任务可作为模型产出时间 |
 
 回滚标签：`infra-research-service:rollback-20260618-research-scheduler-release`。只读验收允许继续调用 `/readyz`、`/research/model-payload/requirements`、`/scheduler/model-payload/assemble-preflight`；`/research/model-execution/run` 会写 execution audit 且可能触达 owner，只能在用户明确批准 live 验收、发布或调度执行时调用。修改上述合同必须重新解锁。
 
@@ -187,7 +210,7 @@ Day2 合同单独回滚标签：`infra-research-service:rollback-20260618-trelay
 
 - 冻结时间：2026-06-24 Asia/Shanghai。
 - 数据资产范围：`t_relay.observation.monitor.snapshot_5m` 的 research payload 只承载 scheduler 快照参数和 catch-up 审计上下文，转交 owner `/t-board-relay/observation-monitor/snapshot`；owner 负责写 `decision_t_relay.t_board_observation_monitor_snapshot_v1`。
-- 当前验收事实：requirements 当前为 25 个任务；snapshot 任务不声明 source/upstream 资产；2026-06-24 非 dry-run catch-up materialized 后，owner 快照表 append-only 增长 4 行，覆盖 002297.SZ、600769.SH、301580.SZ、600172.SH，观察台更新时间推进到 `2026-06-24T09:50:48.617447+00:00`。
+- 历史验收事实：2026-06-24 验收时 requirements 为 25 个任务；snapshot 任务不声明 source/upstream 资产；非 dry-run catch-up materialized 后，owner 快照表 append-only 增长 4 行，覆盖 002297.SZ、600769.SH、301580.SZ、600172.SH，观察台更新时间推进到 `2026-06-24T09:50:48.617447+00:00`。当前 2026-07-01 requirements 为 26 个任务，新增 `t_relay.live_result.compute_30m` 直通合同。
 - 数据边界：research-service 不读取 raw/provider/source/upstream，不补盘口事实，不生成前端事实、模型分、交易、买点或 official signal；迟到补偿保留原计划槽位和实际捕获时间，不能伪装成历史实时数据。
 - 只读验收：requirements、no-persist assemble、scheduler dry-run catch-up、owner snapshot/observation-board、frontend compact。
 - 解锁条件：snapshot payload 字段、owner endpoint、scheduler catch-up、research execution 合同或用户明确批准解锁。
@@ -198,6 +221,19 @@ Day2 合同单独回滚标签：`infra-research-service:rollback-20260618-trelay
 - 不读取 `raw_*`、`raw.*` 或 provider 原始响应。
 - 不写 `source.*`，不自行计算模型分数、release gate、official signal、买点、outcome、标签、交易或学习权重；只允许物化 owner service 的真实返回。
 - 不用 sample payload、0、空字符串、mock 或 GPT 推断补缺口。
+
+### research-service -> t_relay live_result.compute_30m pass-through asset freeze
+
+- 冻结时间：2026-07-01 Asia/Shanghai。
+- 拍板人 / 确认来源：用户在模型四双时间修复交付后回复“允许”，批准拍板冻结。
+- 数据资产范围：`t_relay.live_result.compute_30m` 是 research-service 的直通组装资产，只生成 owner request `payload`，其中 `monitor_interval_minutes=30`、`result_kind=model_result_30m`；它不读取 `source.*`、`decision_t_relay.*`、raw 表或 provider，不写 `decision_t_relay.t_board_observation_monitor_snapshot_v1`，该表仍由 `t-board-relay-service` owner repository 负责 append-only 写入。
+- 当前数据资产证据：2026-07-01 requirements 为 26 个任务并包含 `t_relay.live_result.compute_30m`；scheduler task store 已无 model/source blocking statuses；owner / frontend compact 返回 30 分钟模型结果时间和 5 分钟投影审计时间分离。
+- 数据边界：research-service 只负责把 scheduler 上下文和固定 result kind 交给 owner；30 分钟任务可作为模型输出版本时间来源，5 分钟任务只能作为投影审计来源。缺真实抓取事实时，research 不得用当前时间、投影时间、0、空字符串、mock 或 GPT 推断填补。
+- 允许的只读验收：`/readyz`、`/research/model-payload/requirements`、`/research/model-payload/assemble` 且 `persist_audit=false`、scheduler ready/runtime、owner observation-board / snapshots、frontend compact。
+- 禁止修改项：未经解锁不得让该任务读取 source/upstream/raw/provider，不得由 research 写 owner 业务事实，不得把 `snapshot_5m` 冒充 `model_result_30m`，不得删除 scheduler task store 审计或绕过 source-data-service 抓取链路。
+- 解锁条件：research task registry / assembler、owner snapshot endpoint、scheduler 30 分钟调度、frontend 更新时间展示或用户明确批准解锁。
+- 回滚方式：回退本对象后续 research-service 合同变更并重新执行 requirements、no-persist assemble、scheduler ready 和 owner/frontend 只读验收；不得清库、不得重启 `source-data-service`、不得删除 append-only owner 快照。
+- 验证清单：requirements `task_count=26`；`t_relay.live_result.compute_30m` 无 source/upstream 资产；payload 为单对象；`result_kind=model_result_30m`；owner 能把 30 分钟结果时间写入 `last_model_output_at/model_evaluated_at`。
 
 ## 2026-06-18 Execution Bridge 数据资产冻结记录
 

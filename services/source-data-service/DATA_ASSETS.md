@@ -33,6 +33,8 @@
 | governance | `governance.source_freshness_*`、`governance.model_source_*`、`governance.model_release_preflight_v1`、`governance.source_data_acceptance_*` | freshness、coverage、release preflight、验收证据 | P0 |
 | governance | `governance.ths_paid_probability_cookie_v1`、`governance.ths_paid_probability_batch_status_v1` | 付费概率 Cookie 留存状态和候选批次等待/放弃状态 | P0；Cookie 明文仅存在运行库，不进入 raw params、日志、仓库或前端响应 |
 
+`raw_ths.paid_limit_up_probability_v1` is a typed raw table. Source build must read its safe physical columns and `raw_provider_row` as raw evidence for quality validation, including `symbol`, `trade_date`, `paid_limit_up_probability`, `status_code`, `status_msg`, `credential_version` and `available_at`; the active Cookie values remain only in `governance.ths_paid_probability_cookie_v1` and must not appear in raw params, raw payload, logs, docs or frontend output.
+
 ## 接口入口
 
 | 接口 | 调用方 | 作用 |

@@ -187,6 +187,9 @@ def test_four_model_pages_use_locked_backend_readonly_contract() -> None:
     assert "t-board-relay/day1/candidates" in (SERVICE_ROOT / "src" / "shence_frontend_service" / "main.py").read_text(encoding="utf-8")
     assert "day1_scan_summary" in (SERVICE_ROOT / "src" / "shence_frontend_service" / "main.py").read_text(encoding="utf-8")
     assert "renderTBoardDay1ScanSummary" in source
+    assert "最近 Day1 扫描" in source
+    assert '模型 ${data.last_model_output_at ? formatDateTimeValue(data.last_model_output_at) : "未产出"}' in source
+    assert '抓取 ${data.latest_data_fetch_at ? formatDateTimeValue(data.latest_data_fetch_at) : "未推进"}' in source
     assert "renderModelRefreshStatus" in source
     assert "compact_audit_payloads" in (SERVICE_ROOT / "src" / "shence_frontend_service" / "main.py").read_text(encoding="utf-8")
     assert "前端只读展示，不触发模型评分" in source
@@ -268,6 +271,9 @@ def test_tboard_compact_day1_summary_does_not_expose_audit_payloads(monkeypatch)
                     {
                         "stock": {"symbol": "002297.SZ", "name": "博云新材"},
                         "model_score": 15,
+                        "latest_data_fetch_at": "2026-06-24T09:40:00+08:00",
+                        "last_model_output_at": "2026-06-24T10:02:00+08:00",
+                        "latest_projection_snapshot_at": "2026-06-24T10:05:00+08:00",
                         "current_conclusion": "已触发，继续看封板",
                         "request_payload": {"hidden": True},
                         "result_payload": {"hidden": True},
@@ -311,6 +317,9 @@ def test_tboard_compact_day1_summary_does_not_expose_audit_payloads(monkeypatch)
     assert summary["scanned_count"] == 2
     assert summary["qualified_count"] == 0
     assert summary["open_on_limit_count"] == 0
+    assert summary["latest_data_fetch_at"] == "2026-06-24T09:40:00+08:00"
+    assert summary["last_model_output_at"] == "2026-06-24T10:02:00+08:00"
+    assert summary["latest_projection_snapshot_at"] == "2026-06-24T10:05:00+08:00"
     assert summary["main_reason"] == "没有开盘即涨停，不满足模型四 Day1 T 字板条件"
     assert "严格 Day1 合格 0 只" in summary["summary_text"]
     encoded = frontend_main.dumps_compact(body)
@@ -701,10 +710,23 @@ def test_tboard_terminal_rows_use_plain_user_semantics() -> None:
     assert "function tBoardConclusionText" in source
     assert "function tBoardKeyReasonText" in source
     assert "function tBoardRiskText" in source
+    assert "function tBoardUpdateText" in source
     assert "relay_strength_label: tBoardRelayStrengthText(item)" in tboard_body
     assert "current_conclusion: tBoardConclusionText(item)" in tboard_body
     assert "key_reason: tBoardKeyReasonText(item)" in tboard_body
     assert "risk_tip: tBoardRiskText(item)" in tboard_body
+    assert "const latestDataFetchAt = item.latest_data_fetch_at || item.last_data_captured_at || null;" in tboard_body
+    assert "const lastModelOutputAt = item.last_model_output_at || item.model_evaluated_at || null;" in tboard_body
+    assert "const projectionSnapshotAt = item.latest_projection_snapshot_at || null;" in tboard_body
+    assert "latest_snapshot_time: tBoardUpdateText(lastModelOutputAt, latestDataFetchAt)" in tboard_body
+    assert "latest_data_fetch_at: latestDataFetchAt" in tboard_body
+    assert "last_data_captured_at: item.last_data_captured_at || null" in tboard_body
+    assert "last_model_output_at: lastModelOutputAt" in tboard_body
+    assert "model_evaluated_at: item.model_evaluated_at || null" in tboard_body
+    assert 'if (status === "data_wait") return "暂不观察";' in source
+    assert 'if (status === "data_wait") return "数据缺口";' in source
+    assert 'if (status === "data_wait") return "等待确认";' not in source
+    assert 'if (status === "data_wait") return "待确认";' not in source
     assert "封板失败" in source
     assert "卖压占优" in source
     assert "未触发" in source

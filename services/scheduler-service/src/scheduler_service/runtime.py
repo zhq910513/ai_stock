@@ -1915,7 +1915,7 @@ class SchedulerRuntime:
         scheduler_payload["run_id"] = (
             f"scheduler-catchup:{catch_up_run_id}:{payload['task_code']}:{payload['trading_day']}:{payload['run_slot']}"
         )
-        if payload["task_code"] == "t_relay.observation.monitor.snapshot_5m":
+        if payload["task_code"] in {"t_relay.observation.monitor.snapshot_5m", "t_relay.live_result.compute_30m"}:
             scheduler_payload["as_of_time_utc"] = checked_at.astimezone(timezone.utc).isoformat()
         materialized = scheduler_payload.get("_scheduler_materialized_instance")
         if isinstance(materialized, dict):

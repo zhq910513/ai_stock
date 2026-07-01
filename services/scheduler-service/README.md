@@ -34,7 +34,8 @@
 - `t_relay.day2.watch.rolling_5m` 和 `t_relay.day2.trigger.rolling_5m` 为 Day2 `09:30-10:30` 每 5 分钟，用于滚动观察接近涨停和盘口方向确认。
 - `t_relay.day2.post_entry.monitor` 为 Day2 触发后的持续封板维护，当前 materializer 在开盘时段 `09:35-11:30` 与 `13:00-15:00` 每 5 分钟生成实例；午休不生成监测实例。
 - `t_relay.day3.exit.open` 为 Day3 `09:25-11:30` 每 5 分钟上午去留观察；`t_relay.day3.exit.tail` 为 Day3 `13:00-15:00` 每 5 分钟下午去留观察，其中 `14:40-14:55` 是尾盘退出判断重点。
-- `t_relay.observation.monitor.snapshot_5m` 为模型四普通用户观察台当前输出快照，当前 materializer 在 `09:30-11:30` 与 `13:00-15:00` 每 5 分钟生成实例；owner 端点 append-only 写 `decision_t_relay.t_board_observation_monitor_snapshot_v1`，用于三交易日回放和后续调优。
+- `t_relay.observation.monitor.snapshot_5m` 为模型四普通用户观察台当前 5 分钟投影快照，当前 materializer 在 `09:30-11:30` 与 `13:00-15:00` 每 5 分钟生成实例；owner 端点 append-only 写 `decision_t_relay.t_board_observation_monitor_snapshot_v1`，用于三交易日回放和后续调优。
+- `t_relay.live_result.compute_30m` 为模型四普通用户观察台 30 分钟模型结果快照，当前 materializer 在 `09:32-11:32` 与 `13:02-15:02` 每 30 分钟生成实例，错开五分钟数据采集；owner 端点同样写 `decision_t_relay.t_board_observation_monitor_snapshot_v1`，但 payload 必须带 `monitor_interval_minutes=30` 和 `result_kind=model_result_30m`。
 - 上述模型四任务全部保持 `is_official_publish=false`；scheduler 只负责任务实例化、审计和转交，不生成交易指令、官方信号或模型事实。
 
 模型锁定状态：
@@ -97,6 +98,7 @@
 - `t_relay.day3.exit.open`
 - `t_relay.day3.exit.tail`
 - `t_relay.observation.monitor.snapshot_5m`
+- `t_relay.live_result.compute_30m`
 - `t_relay.outcome.build`
 
 `GET /scheduler/validate/live-dispatch-samples` 会校验上述样例都能生成 owner-service 合同体。样例 payload 只用于调度联通和请求体合同验证，不是市场事实、provider 响应或 source 证据；不得替代 `source.*`、lineage、available_at 或 release preflight。模型四真实数据验收必须使用 `000759.SZ / 2026-06-12` 的 source 标准层事实。
@@ -261,6 +263,7 @@ t_relay.day1.scan.close
 -> t_relay.day3.exit.open
 -> t_relay.day3.exit.tail
 -> t_relay.observation.monitor.snapshot_5m
+-> t_relay.live_result.compute_30m
 -> t_relay.outcome.build
 ```
 
@@ -368,6 +371,7 @@ source、score、buy point、observation、outcome、evolution、pattern library
 | `t_relay.day3.exit.open` | `t-board-relay-service` | `POST /t-board-relay/day3/exit-check` |
 | `t_relay.day3.exit.tail` | `t-board-relay-service` | `POST /t-board-relay/day3/exit-check` |
 | `t_relay.observation.monitor.snapshot_5m` | `t-board-relay-service` | `POST /t-board-relay/observation-monitor/snapshot` |
+| `t_relay.live_result.compute_30m` | `t-board-relay-service` | `POST /t-board-relay/observation-monitor/snapshot` |
 | `t_relay.outcome.build` | `t-board-relay-service` | `POST /t-board-relay/outcomes/build` |
 
 owner 请求体适配规则：
@@ -413,7 +417,7 @@ POST /scheduler/model-payload/assemble-preflight
 
 `POST /scheduler/model-payload/assemble-preflight` 返回 `scheduler_research_payload_assemble_preflight_v1`，用于显式联调真实 payload：scheduler 调用 `research-service /research/model-payload/assemble`，取回 payload 后立即执行现有 `scheduler_model_payload_preflight_v1`，并且只在预检通过时返回 owner request body preview。该接口不调用模型 owner endpoint，不写模型事实，默认 `persist_audit=false`；调用方显式传 `persist_audit=true` 时，审计写入仍由 `research-service` 的 append-only 表负责。若 research-service 返回 `blocked_data_gap`，或 source preflight 因 `decision_time/as_of_time_utc` 可见性判定为 late/stale/missing，scheduler 必须返回 `dispatch_allowed=false`，不得用当前健康检查口径、sample payload、0、空字符串或推断值改写为可派发。
 
-`POST /scheduler/model-schedule/catch-up` 返回 `scheduler_model_schedule_catch_up_v1`，用于补偿因服务未运行、发布窗口错过或迟到窗口过窄而没有进入本地 task store 的模型任务实例。该入口默认 `dry_run=true`，按 `trading_day`、`task_codes`、`owner_services`、`run_slots` 和 `max_instances` 从 `three_model_materializer_v1` 中筛选实例；非 dry-run 只写入 scheduler 本地 task store，`dispatch_immediately=true` 时也只调用 `research-service /research/model-execution/run`。默认复用原 `biz_key` 保持幂等；只有显式 `force_resubmit=true` 时才追加 `:catchup:<catch_up_run_id>`。模型四 `t_relay.observation.monitor.snapshot_5m` 的 catch-up payload 会把实际补偿时间写入 `as_of_time_utc`，并在 `_scheduler_materialized_instance` 中保留原始 `scheduled_at/run_slot`、`catch_up_run_id`、`captured_late` 和 `catch_up_checked_at`，不得把补偿快照解释为历史实时盘口事实。
+`POST /scheduler/model-schedule/catch-up` 返回 `scheduler_model_schedule_catch_up_v1`，用于补偿因服务未运行、发布窗口错过或迟到窗口过窄而没有进入本地 task store 的模型任务实例。该入口默认 `dry_run=true`，按 `trading_day`、`task_codes`、`owner_services`、`run_slots` 和 `max_instances` 从 `three_model_materializer_v1` 中筛选实例；非 dry-run 只写入 scheduler 本地 task store，`dispatch_immediately=true` 时也只调用 `research-service /research/model-execution/run`。默认复用原 `biz_key` 保持幂等；只有显式 `force_resubmit=true` 时才追加 `:catchup:<catch_up_run_id>`。模型四 `t_relay.observation.monitor.snapshot_5m` 与 `t_relay.live_result.compute_30m` 的 catch-up payload 会把实际补偿时间写入 `as_of_time_utc`，并在 `_scheduler_materialized_instance` 中保留原始 `scheduled_at/run_slot`、`catch_up_run_id`、`captured_late` 和 `catch_up_checked_at`；其中 5 分钟快照只表示实际补偿时刻的当前投影，30 分钟快照才表示模型结果版本，二者都不得被解释为原计划槽位的历史实时盘口事实。
 
 2026-06-27 热点调度合同修正：`hot.score.auction_confirmed`、`hot.release_gate.preopen`、`hot.buy_point.open_5m` 的 `model-schedule/catch-up` 与模型时间轮仍只负责物化时间槽、写本地 task store 和调用 `research-service /research/model-execution/run`。scheduler 可以在调度实例中保留 guard/sample symbol 作为审计上下文，但生产候选 fanout 必须由 research-service 从真实 `source.ths_paid_limit_up_probability_v1` 或已评分 `decision_hot.hot_decision_case_v1 + hot_score_fact_v1` 读取；不得把 `000063.SZ`、`SCHEDULER_GUARD_SYMBOL`、sample payload 或用户传入的单个占位 symbol 当作热点 release/buy-point 生产候选。
 

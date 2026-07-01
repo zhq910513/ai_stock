@@ -267,6 +267,13 @@ def test_live_dispatch_sample_api_exposes_scheduler_payload_and_owner_preview() 
     assert snapshot_body["owner_endpoint_path"] == "/t-board-relay/observation-monitor/snapshot"
     assert snapshot_body["owner_request_body_preview"]["payload"]["monitor_interval_minutes"] == 5
 
+    result_response = client.get("/scheduler/live-dispatch/sample/t_relay.live_result.compute_30m")
+    assert result_response.status_code == 200
+    result_body = result_response.json()
+    assert result_body["owner_endpoint_path"] == "/t-board-relay/observation-monitor/snapshot"
+    assert result_body["owner_request_body_preview"]["payload"]["monitor_interval_minutes"] == 30
+    assert result_body["owner_request_body_preview"]["payload"]["result_kind"] == "model_result_30m"
+
 
 def test_live_dispatch_sample_validation_api_covers_official_release_gates() -> None:
     response = TestClient(app).get("/scheduler/validate/live-dispatch-samples")
@@ -437,6 +444,11 @@ def test_materialize_three_model_day_has_deterministic_official_publish_instance
     assert snapshot_slots >= {"093000", "113000", "130000", "150000"}
     assert "123000" not in snapshot_slots
     assert observation_snapshots[0]["append_only"] is True
+    live_results = [item for item in plan["instances"] if item["task_code"] == "t_relay.live_result.compute_30m"]
+    live_result_slots = {item["run_slot"] for item in live_results}
+    assert len(live_results) == 10
+    assert live_result_slots >= {"093200", "100200", "130200", "150200"}
+    assert all(item["append_only"] is True for item in live_results)
     assert all(item["biz_key"].startswith(item["task_code"]) for item in plan["instances"])
     research = [item for item in plan["instances"] if item["run_slot"].startswith("research_")]
     assert research

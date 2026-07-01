@@ -93,8 +93,9 @@
 
 模型四当前实例化资产：
 - `three_model_materializer_v1` 对 `t_relay.day2.post_entry.monitor` 生成 Day2 开盘时段 `09:35-11:30`、`13:00-15:00` 每 5 分钟的本地调度实例。
-- `three_model_materializer_v1` 对 `t_relay.observation.monitor.snapshot_5m` 生成 `09:30-11:30`、`13:00-15:00` 每 5 分钟的本地调度实例，owner 端点为 `POST /t-board-relay/observation-monitor/snapshot`，业务写入表为 `decision_t_relay.t_board_observation_monitor_snapshot_v1`。
-- 这些实例只进入 scheduler 本地 task store / research execution 调度审计；封板维护事实仍由 `t-board-relay-service` 写入 `decision_t_relay.t_board_post_entry_monitor_v1`，观察台快照事实仍由 `t-board-relay-service` 写入 `decision_t_relay.t_board_observation_monitor_snapshot_v1`。
+- `three_model_materializer_v1` 对 `t_relay.observation.monitor.snapshot_5m` 生成 `09:30-11:30`、`13:00-15:00` 每 5 分钟的本地调度实例，owner 端点为 `POST /t-board-relay/observation-monitor/snapshot`，业务写入表为 `decision_t_relay.t_board_observation_monitor_snapshot_v1`，payload 语义为 `projection_snapshot_5m`。
+- `three_model_materializer_v1` 对 `t_relay.live_result.compute_30m` 生成 `09:32-11:32`、`13:02-15:02` 每 30 分钟的本地调度实例，owner 端点同为 `POST /t-board-relay/observation-monitor/snapshot`，业务写入表同为 `decision_t_relay.t_board_observation_monitor_snapshot_v1`，payload 必须带 `monitor_interval_minutes=30` 与 `result_kind=model_result_30m`。
+- 这些实例只进入 scheduler 本地 task store / research execution 调度审计；封板维护事实仍由 `t-board-relay-service` 写入 `decision_t_relay.t_board_post_entry_monitor_v1`，观察台快照和 30 分钟模型结果事实仍由 `t-board-relay-service` 写入 `decision_t_relay.t_board_observation_monitor_snapshot_v1`。
 - `t_relay.day2.watch.rolling_5m` 与 `t_relay.day2.trigger.rolling_5m` 仍保持 `09:30-10:30` 每 5 分钟，避免把触发前观察和触发后封板维护混成同一个资产。
 
 `scheduler_model_time_wheel_v1` 负责三/四模型 owner 任务的非临时调度入队和可选 live dispatch。它读取 `three_model_materializer_v1` 的交易日实例，写入本地 `ai_stock_scheduler_task_store.sqlite3::*` 调度审计表；开启 live dispatch 后只调用 `research-service /research/model-execution/run`，不直连 owner，不写 `decision_hot.*`、`decision_memory.*`、`decision_ambush.*`、`decision_t_relay.*` 或 `research_t_relay.*`。

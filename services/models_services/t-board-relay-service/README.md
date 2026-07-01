@@ -69,6 +69,13 @@ POST /t-board-relay/observation-monitor/snapshot
 GET  /t-board-relay/observation-monitor/snapshots
 ```
 
+当前观察台时间硬口径（2026-06-30 起执行，并覆盖旧的 snapshot 推动更新时间描述）：
+- `latest_data_fetch_at` 与 `last_data_captured_at` 指向最新真实抓取 / 阶段事实时间，优先来自 Day2 watch、trigger、post-entry、Day3、outcome 等真实阶段记录的 `as_of_time`、`captured_at`、`available_at` 或 `as_of_time_utc`；无阶段业务时间时才退回阶段记录自身 `updated_at/created_at`。
+- `latest_snapshot_time`、`updated_at`、`display_update_at` 在 `observation-board` 中保持真实阶段事实时间，不再被 5 分钟 `projection_snapshot_5m` 覆盖。
+- `latest_projection_snapshot_at` 只表示最近一次 5 分钟观察投影快照生成时间，用于 append-only 审计、恢复和排查调度是否继续留痕，不得解释成真实抓取时间，不得反写 Day2/Day3/outcome 阶段事实。
+- `last_model_output_at` 与 `model_evaluated_at` 表示最近一次 30 分钟 `model_result_30m` 模型结果产出时间；它可以更新模型判断、模型分和风险结论的可读投影，但不得覆盖真实抓取/阶段事实时间。
+- 普通用户前端“更新”列必须同时展示最后一次模型产出时间和最新真实抓取/阶段事实时间；数据服务中断导致真实抓取缺失时，模型四可以不产出新模型结果，但一旦真实抓取恢复并形成阶段事实，`latest_data_fetch_at` 必须随正式链路尽快推进。
+
 当前 owner service 已接入可选 Postgres repository。生产容器存在 `AI_STOCK_DATABASE_URL` 且 `PERSIST_DECISIONS=true` 时，POST 接口在完成规则计算后把阶段结果 append-only 写入 `decision_t_relay.*`；响应 `structured_output.repository_write` 返回真实写入状态、插入条数和主键。无数据库、schema 缺失或显式关闭持久化时，接口仍返回模型计算结果，但 `repository_write.persisted=false` 并保留明确 warning，禁止伪装为已落库。
 
 仓库状态：
@@ -91,14 +98,16 @@ POST /t-board-relay/observation-monitor/snapshot
 GET /t-board-relay/observation-monitor/snapshots
 ```
 
-`POST /t-board-relay/observation-monitor/snapshot` 只读当前 `observation-board` 投影，把每个 Day1 合格观察对象当前的模型分、当前判断、关键依据、风险结论、更新时间和完整投影 append-only 写入 `decision_t_relay.t_board_observation_monitor_snapshot_v1`。`GET /t-board-relay/observation-monitor/snapshots` 只读返回这些快照。该入口不调用 provider、不补事实、不生成 official signal，也不替代 Day2 watch、post-entry monitor 或 Day3 阶段事实表；`observation-board` 只在最新快照时间晚于阶段投影时间时，才用快照刷新用户可读字段和 `updated_at`。
+`POST /t-board-relay/observation-monitor/snapshot` 只读当前 `observation-board` 投影，把每个 Day1 合格观察对象当前的模型分、当前判断、关键依据、风险结论、真实数据时间和完整投影 append-only 写入 `decision_t_relay.t_board_observation_monitor_snapshot_v1`。`monitor_interval_minutes<30` 时快照语义为 `projection_snapshot_5m`，表示 5 分钟观察投影留痕；`observation-board` 读取最新 5 分钟快照后只输出 `latest_projection_snapshot_at` 和快照 id 作为审计/恢复 metadata，不再用它推动 `display_update_at/latest_snapshot_time`，不得把投影生成时间解释成真实抓取时间。`monitor_interval_minutes>=30` 时快照语义为 `model_result_30m`，表示 30 分钟模型结果版本，并写入 `last_model_output_at/model_evaluated_at`。`GET /t-board-relay/observation-monitor/snapshots` 只读返回这些快照。该入口不调用 provider、不补事实、不生成 official signal，也不替代 Day2 watch、post-entry monitor 或 Day3 阶段事实表；5 分钟快照不得覆盖 `latest_data_fetch_at/last_data_captured_at/display_update_at/latest_snapshot_time`，30 分钟模型快照时间不得冒充真实抓取时间。
 
 当前 Day2 滚动投影合同：
 - `observation-board` 在读取 Day2 触发、封板维护、Day3、outcome 和博弈假设前，必须同时读取每个 Day1 合格对象最新的 `decision_t_relay.t_board_day2_watch_snapshot_v1`。
 - Day2 尚未形成有效触发时，若已有五分钟 watch 快照，普通用户投影仍要展示 `day2_trade_date`、由 `as_of_time` 转成的 `day2_trigger_time`、当前判断、关键依据、风险结论和来自 watch 的 `latest_snapshot_time`。
+- Day2 `09:30-10:30` 窗口已过且没有有效 Day2 watch / trigger 事实时，`observation_status=data_wait`、`score_state=data_wait`、`model_score=NULL`，关键依据必须说明 Day2 五分钟监测事实缺失；不得继续显示“观察中”或用 Day1 旧事实冒充仍在观察。
 - `ASK` / `BID` 只允许保留在内部事实枚举中；普通用户文案必须翻译为“买盘主动扫掉卖盘”“卖盘主动砸向买盘”或“盘口方向待确认”。
 - Day2 有效触发后，`decision_t_relay.t_board_post_entry_monitor_v1` 继续 append-only 留存封板维护快照；触发后开板必须及时投影为停止观察，同时保留原始监测记录。
-- 观察台输出 `updated_at`、`last_monitor_at`、`monitor_interval_minutes` 和 `monitoring_summary`，由现有 Day2 watch、Day2 trigger、post-entry monitor、Day3 和 outcome 阶段记录只读派生；若底层阶段表没有真实计数字段，不伪造监测次数。
+- 观察台输出的时间分三层：`latest_data_fetch_at`、`last_data_captured_at`、`updated_at`、`display_update_at` 和 `latest_snapshot_time` 指向最近真实阶段事实时间，单条阶段记录优先使用 `as_of_time`、`captured_at`、`available_at` 或 `as_of_time_utc`，没有业务时间时才退回 `updated_at` / `created_at`；`latest_projection_snapshot_at` 只指向最近一次 5 分钟观察投影快照时间，用于审计和恢复排查，不驱动 `display_update_at/latest_snapshot_time`；30 分钟模型快照时间进入 `last_model_output_at/model_evaluated_at`，作为最后一次模型产出时间，不得冒充真实抓取时间。
+- 观察台输出 `last_monitor_at`、`monitor_interval_minutes` 和 `monitoring_summary`，由现有 Day2 watch、Day2 trigger、post-entry monitor、Day3 和 outcome 阶段记录只读派生；若底层阶段表没有真实计数字段，不伪造监测次数。
 - 观察台同步输出 `model_score`、`model_score_label`、`score_state` 和 `model_score_version=t_board_relay_observation_score_v1`。分数由模型四 owner 根据 Day1 封单/分歧吸收、Day2 五分钟滚动接近涨停、ASK 扫卖盘确认、BID 主动砸盘风险、触发后封板维护、Day3 去留和 outcome 阶段事实综合计算；关键事实缺失时 `model_score=NULL`、`score_state=data_wait`，不得用 0 或前端推断补齐。接口先构建最多 500 条 Day1 合格对象的评分排序窗口，再按 `model_score` 降序、无分后置、更新时间倒序返回 `limit` 条。
 
 `observation-board` 是模型四给前端消费的只读投影，不是新的事实写入表。它从 `decision_t_relay.*` append-only 阶段表读取当前最新事实后生成 `t_board_relay_observation_board_v1`：
@@ -107,7 +116,7 @@ GET /t-board-relay/observation-monitor/snapshots
 - 观察台查询阶段必须优先读取 Day1 合格对象进入评分排序窗口，再按 `model_score` 降序和 `limit` 截断展示；不得先按最新 Day1 行取前 N 条再过滤，否则 rejected 行可能挤掉真实合格观察对象，也不得让低分新记录在排序前挤掉高分观察对象。当前实现使用 `list_day1_observation_candidates` 只读查询 `decision_t_relay.t_board_day1_candidate_v1` 最新合格对象，并在 owner 内部构建最多 500 条评分窗口。
 - Day1、Day2、Day3 均按正常开市交易日顺序解释：Day2 必须晚于 Day1，Day3 必须晚于 Day2。若历史阶段记录出现 Day2 与 Day1 同日或 Day3 不晚于 Day2，观察台不把该阶段作为有效 Day2 / Day3 展示，只返回中文 `data_notice` 等待交易日校验。
 - 只用 `day1_candidate_id` 和 `entry_trigger_id` 做阶段关联，不按股票代码兜底合并，避免同股票不同交易日或 Day1 未通过记录被误拼成观察对象。
-- 输出面向普通用户的字段：`stock`、`day1_trade_date`、`day2_trade_date`、`day3_trade_date`、`observation_status`、`current_stage`、`current_conclusion`、`next_observation`、`key_reason`、`model_score`、`model_score_label`、`score_state`、`model_score_version`、`relay_strength_label`、`risk_tip`、`data_notice`、`data_gap_count`、`data_gap_labels`、`latest_snapshot_time`、`updated_at`、`last_monitor_at`、`monitor_interval_minutes`、`monitoring_summary`。其中 `current_stage`、`current_conclusion`、`next_observation`、`key_reason` 使用 `Day2` / `Day3` 描述阶段和原因，不用“次日”或“第三日”；`model_score` 是模型四 owner 给出的综合分，前端只能展示和排序；`ASK` / `BID` 只作为内部事实枚举保留，普通用户文案必须翻译为“买盘主动扫掉卖盘”或“卖盘主动砸向买盘”；`risk_tip` 是基于盘口方向、日内强度、封板维护、Day3 去留或缺口事实生成的风险结论，不得输出“仅作观察、不自动下单”这类免责提示；`monitoring_summary` 只描述已有阶段记录对应的最近监测进度，不用推断补齐不存在的监测次数；`data_gap_labels` 为中文业务提示，不暴露 `source_gap:*`。前端普通用户列表只展示去重后的核心列 `股票 / 模型分 / Day1 / Day2 / 监测时间 / 当前判断 / 接力强度 / 关键依据 / 风险结论 / 更新`，不展示 `current_stage`、`day3_trade_date`、`next_observation`、`data_notice` 或 `data_gap_labels`，这些字段仅保留给只读合同、审计和问题追溯。
+- 输出面向普通用户的字段：`stock`、`day1_trade_date`、`day2_trade_date`、`day3_trade_date`、`observation_status`、`current_stage`、`current_conclusion`、`next_observation`、`key_reason`、`model_score`、`model_score_label`、`score_state`、`model_score_version`、`relay_strength_label`、`risk_tip`、`data_notice`、`data_gap_count`、`data_gap_labels`、`latest_snapshot_time`、`updated_at`、`display_update_at`、`latest_data_fetch_at`、`last_data_captured_at`、`latest_projection_snapshot_at`、`latest_projection_snapshot_id`、`last_model_output_at`、`model_evaluated_at`、`model_result_interval_minutes`、`last_monitor_at`、`monitor_interval_minutes`、`monitoring_summary`。其中 `current_stage`、`current_conclusion`、`next_observation`、`key_reason` 使用 `Day2` / `Day3` 描述阶段和原因，不用“次日”或“第三日”；`model_score` 是模型四 owner 给出的综合分，前端只能展示和排序；`ASK` / `BID` 只作为内部事实枚举保留，普通用户文案必须翻译为“买盘主动扫掉卖盘”或“卖盘主动砸向买盘”；`risk_tip` 是基于盘口方向、日内强度、封板维护、Day3 去留或缺口事实生成的风险结论，不得输出“仅作观察、不自动下单”这类免责提示；`monitoring_summary` 只描述已有阶段记录对应的最近监测进度，不用推断补齐不存在的监测次数；`data_gap_labels` 为中文业务提示，不暴露 `source_gap:*`。前端普通用户列表只展示去重后的核心列 `股票 / 模型分 / Day1 / Day2 / 监测时间 / 当前判断 / 接力强度 / 关键依据 / 风险结论 / 更新`，其中 `更新` 必须并列展示 `last_model_output_at/model_evaluated_at` 对应的最后一次模型产出时间与 `latest_data_fetch_at/last_data_captured_at` 对应的最新真实抓取/阶段事实时间；`latest_projection_snapshot_at` 只保留给审计和恢复排查，不展示成抓取时间；不展示 `current_stage`、`day3_trade_date`、`next_observation`、`data_notice` 或 `data_gap_labels`，这些字段仅保留给只读合同、审计和问题追溯。
 - 该接口只读，不写 repository，不触发 scheduler，不调用 provider，不生成 official signal，不补齐缺失事实。
 - 查询 Day2/Day3/outcome/game hypothesis 阶段时使用轻量业务列投影，不读取或返回 `request_payload`、`result_payload`、`game_hypothesis_payload`、`evidence_json`、`related_payload` 等审计大字段；这些 JSONB 字段只保留给 repository 审计和问题追溯。
 
@@ -486,13 +495,26 @@ Day2 输出：
 
 - 冻结时间：2026-06-24 Asia/Shanghai。
 - 拍板人 / 确认来源：用户授权 Codex 判断模型四链路是否可拍板，并在本轮回复“批准”；Codex 基于 scheduler catch-up、research execution、owner snapshot、frontend compact API 和浏览器 DOM 验收判定可以冻结。
-- 锁定范围：`POST /t-board-relay/observation-monitor/snapshot` 只读当前 `observation-board`，每 5 分钟 append-only 写入 `decision_t_relay.t_board_observation_monitor_snapshot_v1`；`GET /t-board-relay/observation-board` 可在最新快照晚于阶段投影时用快照刷新普通用户字段、模型分、`latest_snapshot_time`、`updated_at` 和 `last_monitor_at`；快照不替代 Day2 watch、post-entry monitor、Day3 或 outcome 阶段事实。
+- 锁定范围：`POST /t-board-relay/observation-monitor/snapshot` 只读当前 `observation-board`，每 5 分钟 append-only 写入 `decision_t_relay.t_board_observation_monitor_snapshot_v1`；2026-07-01 起，该历史冻结仅保留 `projection_snapshot_5m` 留痕和恢复审计语义，字段优先级由 `t-board-relay-service -> observation-board -> dual time and 30m result projection` 覆盖，5 分钟快照不得推动 `latest_snapshot_time`、`display_update_at`、`updated_at`、`last_monitor_at` 或 `last_model_output_at`；快照不替代 Day2 watch、post-entry monitor、Day3 或 outcome 阶段事实。
 - 当前冻结证据：2026-06-24 通过 `POST /scheduler/model-schedule/catch-up` 对 `t_relay.observation.monitor.snapshot_5m` 执行 09:35 槽位补偿，research execution materialized；`decision_t_relay.t_board_observation_monitor_snapshot_v1` 从 4 行增至 8 行；owner `/t-board-relay/observation-monitor/snapshots?limit=20` 产生 4 条新快照；`/t-board-relay/observation-board?limit=20` 仍只返回 4 条 Day1 合格对象，且 4 行 `latest_snapshot_time/updated_at/last_monitor_at=2026-06-24T09:50:48.617447+00:00`，股票为 002297.SZ 博云新材、600769.SH 祥龙电业、301580.SZ 爱迪特、600172.SH 黄河旋风，模型分排序为 15/12/12/0。
 - 允许的只读验收：读取 `/t-board-relay/observation-board?limit=20`、`/t-board-relay/observation-monitor/snapshots?limit=20`、`/t-board-relay/repository/status`、scheduler/runtime/status、research `/readyz`、frontend `/api/model-list/tboard` 和 `#/model-tboard` DOM。
 - 禁止修改项：未获解锁不得把快照补偿时间伪装成历史实时盘口时间，不得让快照反写 Day2/Day3 阶段表，不得用快照补齐缺失盘口或交易事实，不得输出 official signal、交易、买点或前三模型事实，不得重启 `source-data-service` 回滚快照事实。
 - 解锁条件：观察台快照频率、快照表结构、owner `observation-board` 字段优先级、scheduler catch-up 语义、research execution 合同变化，或用户明确批准解锁。
 - 回滚方式：回退后续快照投影/文档变更；如曾发布 owner 镜像，仅 `--no-deps` 替换 t-board owner；不清库、不删除快照、不重启 source-data-service。
-- 验证清单：4 条 Day1 合格对象可读；快照表 append-only 增长；更新时间随快照推进；股票代码和名称完整；模型分由 owner 给出并降序展示；compact 不泄露审计 payload；前端页面不显示 `ASK`、`BID`、`source_gap:*`、`数据提示` 或无意义免责声明。
+- 验证清单：Day1 合格对象可读；快照表 append-only 增长；最新 5 分钟投影快照只出现在 `latest_projection_snapshot_at` / 快照 id，不冒充抓取时间或模型产出时间；股票代码和名称完整；模型分由 owner 给出并降序展示；compact 不泄露审计 payload；前端页面不显示 `ASK`、`BID`、`source_gap:*`、`数据提示` 或无意义免责声明。
+
+### t-board-relay-service -> observation-board -> dual time and 30m result projection
+
+- 冻结对象：`t-board-relay-service -> observation-board -> dual time and 30m result projection`。
+- 冻结时间：2026-07-01 Asia/Shanghai。
+- 拍板人 / 确认来源：用户在本轮模型四双时间与 30 分钟产出修复交付后回复“允许”，批准将该口径拍板冻结。
+- 锁定范围：`GET /t-board-relay/observation-board` 的时间字段语义、`POST /t-board-relay/observation-monitor/snapshot` 的 `projection_snapshot_5m` / `model_result_30m` 分流、`decision_t_relay.t_board_observation_monitor_snapshot_v1` append-only 留存和普通用户前端时间展示边界。`latest_data_fetch_at`、`last_data_captured_at`、`latest_snapshot_time`、`display_update_at` 必须来自真实阶段事实或真实抓取时间；`latest_projection_snapshot_at` 只代表 5 分钟投影审计；`last_model_output_at` / `model_evaluated_at` 只能由 `monitor_interval_minutes>=30` 且 `result_kind=model_result_30m` 的 30 分钟结果推动。该入口不调用 provider、不补盘口事实、不生成 official signal。
+- 当前冻结证据：2026-07-01 验收时 research requirements 为 26 个任务并包含 `t_relay.live_result.compute_30m`；scheduler `/readyz` ready，source/model task store `blocking_statuses=[]`；人工仅在备份后重排两条模型四死信任务并保留审计，重放后成功；owner 观察台和前端 compact 同时暴露 `last_model_output_at=2026-07-01T02:32:00+00:00`、`latest_projection_snapshot_at=2026-07-01T02:30:00+00:00`，而真实抓取 / 阶段事实时间仍保持为旧值，未被 5 分钟投影覆盖。
+- 允许的只读验收：读取 `/readyz`、`/t-board-relay/observation-board`、`/t-board-relay/observation-monitor/snapshots`、`/t-board-relay/repository/status`、research `/research/model-payload/requirements`、scheduler `/readyz` / runtime status、frontend `/api/model-list/tboard` 和 `#/model-tboard`。
+- 禁止修改项：未经解锁不得把 `latest_projection_snapshot_at` 合并到抓取时间、模型产出时间或 `display_update_at`；不得让 5 分钟快照覆盖阶段事实时间；不得隐藏真实抓取未推进、数据缺口或失败状态；不得删除快照审计、死信重排审计或绕过 source-data-service 正规取数链路；不得让模型四 owner 直接调用 provider/raw 或输出交易、买点、official signal。
+- 解锁条件：用户明确批准本冻结对象解锁；若涉及 owner 状态机、snapshot 表结构、scheduler 调度、research 任务注册、source 抓取链路、schema/Docker 或前端普通用户合同，必须分别说明影响范围、拟修改文件、回滚方式和验证清单。
+- 回滚方式：回退本对象后续 owner 时间字段 / snapshot 分流变更，并重新构建或重启受影响 owner 容器做 readyz、observation-board、snapshot 和 frontend compact 只读验收；不得通过清库、全栈重建或重启 `source-data-service` 回滚时间事实。
+- 验证清单：30 分钟模型结果能推动 `last_model_output_at/model_evaluated_at`；5 分钟快照只推动 `latest_projection_snapshot_at`；真实抓取/阶段事实时间不被投影覆盖；前端同时展示“模型”和“抓取”两段时间；模型四、research 和前端合同测试通过；scheduler/data-inspector/source 健康。
 
 ### t-board-relay-service -> observation-board -> Day2 post-entry failure projection
 
