@@ -46,7 +46,7 @@
 
 ## 模型四语义翻译边界
 
-`/api/model-list/tboard` 仍是模型四前端唯一普通用户列表入口，数据资产来自 owner `observation-board` 和 repository status。默认 compact 响应不主动返回 `observation_status=stopped` 且按 Asia/Shanghai 自然日计算已超过 3 天的失效对象；过滤锚点优先使用 `day3_trade_date`，其次 `day2_trade_date`、`day1_trade_date`、`latest_snapshot_time` / `updated_at`。该过滤只影响普通用户默认列表，不删除、不改写、不截断 owner `decision_t_relay.*` 或 monitor snapshot 事实；排查历史失效样本可显式读取 `GET /api/model-list/tboard?include_stale_stopped=true`。前端不写入 `decision_t_relay.*`、`research_t_relay.*`、source/raw、scheduler、release gate、交易、买点、outcome 或学习权重。
+`/api/model-list/tboard` 仍是模型四前端唯一普通用户列表入口，数据资产来自 owner `observation-board` 和 repository status。默认 compact 响应不主动返回 `observation_status=stopped` 的终止对象；`observation_status=data_wait` 仅在 Day2 09:30-10:30 验证窗口未过时保留，一旦窗口已过仍没有有效 Day2 监测事实，也从普通用户主列表下架。Day2 判断优先使用 owner 返回的 `day2_trade_date`，缺失时按 `day1_trade_date` 推导下一个工作日并周末顺延；该口径只用于前端默认可见性，不补交易日事实。该过滤只影响普通用户默认列表，不删除、不改写、不截断 owner `decision_t_relay.*` 或 monitor snapshot 事实；排查历史失效 / 缺口样本可显式读取 `GET /api/model-list/tboard?include_stale_stopped=true`。前端不写入 `decision_t_relay.*`、`research_t_relay.*`、source/raw、scheduler、release gate、交易、买点、outcome 或学习权重。
 
 模型四页面允许把 owner 已返回的终止态和关键依据翻译成更直白的展示词：封板维护失败展示为“封板失败 / 已开板，停止观察”，卖压占优展示为“卖压占优 / 卖盘往下砸，买入确认失败”，滚动监测未接近涨停展示为“未触发 / 5 分钟监测未接近涨停”，买盘主动扫掉卖盘展示为“已触发，继续看封板 / 接近涨停，买盘扫掉卖盘”。该翻译只影响浏览器展示和前端排序阅读体验，不修改 `model_score`、`score_state`、`current_conclusion`、`relay_strength_label`、`key_reason`、`risk_tip` 的后端事实来源。
 
@@ -104,7 +104,7 @@
 ### shence-frontend-service -> model-tboard -> live readonly observation board
 
 - 冻结时间：2026-06-24 Asia/Shanghai。
-- 数据资产范围：`/api/model-list/tboard` 只读聚合 owner `GET /t-board-relay/observation-board`；返回浏览器前剥离 `request_payload`、`result_payload`、`game_hypothesis_payload`、`evidence_json`、`related_payload`；页面只消费 10 个用户列，按 owner `model_score` 降序展示，并按 60 秒只读刷新。默认列表不主动展示超过 3 天的 `stopped` 失效对象，历史失效事实仍保留在 owner 和 append-only 快照中。
+- 数据资产范围：`/api/model-list/tboard` 只读聚合 owner `GET /t-board-relay/observation-board`；返回浏览器前剥离 `request_payload`、`result_payload`、`game_hypothesis_payload`、`evidence_json`、`related_payload`；页面只消费 10 个用户列，按 owner `model_score` 降序展示，并按 60 秒只读刷新。默认列表不主动展示 `stopped` 终止对象；`data_wait` 仅在 Day2 09:30-10:30 验证窗口未过时保留，窗口已过仍缺有效 Day2 监测事实时默认下架。历史失效和缺口事实仍保留在 owner 和 append-only 快照中。
 - 当前运行事实：compact 响应 `read_only=true`，且 `observation_board.data.items` 为 4 条 Day1 合格对象；`600172.SH` 已随 post-entry monitor 更新为“触发后开板，停止观察”；截图留存在 `services/shence-frontend-service/playwright-artifacts/model-tboard-20260624-final-validation.png`。
 - 数据边界：前端不写 `decision_t_relay.*`、`research_t_relay.*`、source/raw、scheduler、release gate、交易、买点、outcome 或学习权重；不把缺口补成 0/mock/示例 payload/前端推断；不直接展示 `ASK` / `BID` 或 `source_gap:*`。
 - 更新时间边界：模型四列表“更新”列并列展示 `last_model_output_at/model_evaluated_at`（最后一次 30 分钟模型结果产出时间）和 `latest_data_fetch_at/last_data_captured_at`（最新真实抓取 / 阶段事实时间）。`latest_projection_snapshot_at` 只表示最近 5 分钟投影快照生成时间，用于审计和排查，不得冒充抓取时间。
@@ -146,17 +146,19 @@
 - 回滚方式：回退本冻结对象对应的前端语义翻译、测试和文档变更，重新运行前端合同测试、JS 语法检查和页面验收；不清库、不重启 `source-data-service`，也不修改模型四 owner 数据。
 - 验证清单：compact 返回 `read_only=true` 且只包含 Day1 合格观察对象；页面显示“T 字接力观察台”标题条、10 个核心列和真实观察行；可见文本不含“数据提示”“下一步”“观察阶段”“ASK”“BID”“source_gap:*”“不自动下单”“接力机会提示仅作观察”“可买入观察”；开板失败风险使用“次日退出风险高”白话表达；前端合同测试、Python 编译检查和 JS 语法检查通过。
 
-### shence-frontend-service -> model-tboard -> stale stopped default visibility
+### shence-frontend-service -> model-tboard -> terminal default visibility
 
-- 冻结时间：2026-06-26 Asia/Shanghai。
-- 拍板人 / 确认来源：用户授权 Codex 判断是否拍板；Codex 基于前端合同测试、Python 编译、JS 语法检查、重启后 `/readyz` 和 `/api/model-list/tboard` 只读验收，判定可拍板。
-- 数据资产范围：`/api/model-list/tboard` 默认只读聚合 owner `observation-board` 后，不主动返回 `observation_status=stopped` 且超过 3 个 Asia/Shanghai 自然日的失效对象；`#/model-tboard` 页面同规则兜底过滤。失效日期锚点优先取 `day3_trade_date`，其次 `day2_trade_date`、`day1_trade_date`、`latest_snapshot_time` / `updated_at`。`include_stale_stopped=true` 只作为历史失效对象只读排查参数，不改变 owner 事实。
+- 冻结对象：`shence-frontend-service -> model-tboard -> terminal default visibility`。
+- 冻结时间：2026-07-02 Asia/Shanghai。
+- 拍板人 / 确认来源：用户在交付报告后明确回复“拍板”；此前用户指出“第二天或者第三天不符合就应该下架，而不是一直留着待观察”，并回复“继续”批准继续修复和发布验证。
+- 数据资产范围：`/api/model-list/tboard` 默认只读聚合 owner `observation-board` 后，不主动返回 `observation_status=stopped` 的终止对象；`observation_status=data_wait` 仅在 Day2 09:30-10:30 验证窗口未过时保留，一旦窗口已过仍没有有效 Day2 监测事实，也从普通用户主列表下架。Day2 判断优先使用 owner 返回的 `day2_trade_date`，缺失时按 `day1_trade_date` 推导下一个工作日并周末顺延；`include_stale_stopped=true` 只作为历史失效 / 缺口对象只读排查参数，不改变 owner 事实。
+- 当前冻结证据：2026-07-02 前端 8030 重启后 `/readyz=ready`；默认 `/api/model-list/tboard?limit=20` 返回 0 条普通用户可见对象；`/api/model-list/tboard?limit=20&include_stale_stopped=true` 返回 5 条审计对象，其中 `000823.SZ` 为 `data_wait` 且 `model_score=NULL`；owner 原始 `/t-board-relay/observation-board?limit=20` 中 `000823.SZ` 同为 `data_wait`，真实抓取 / 阶段事实时间仍为 `2026-06-26T07:53:37.143354+00:00`，最后模型产出时间为 `2026-07-02T07:02:00+00:00`；scheduler、data-inspector ready，`source-data-service` 未重启。
 - 数据边界：过滤只影响普通用户默认列表，不删除、不改写、不截断 `decision_t_relay.*`、`research_t_relay.*`、owner `observation-board`、monitor snapshot 或 append-only 审计事实；前端不写 source/raw、scheduler、release gate、交易、买点、outcome 或学习权重。
 - 允许的只读验收：读取 `/api/model-list/tboard`、读取 `/api/model-list/tboard?include_stale_stopped=true`、读取 owner `/t-board-relay/observation-board`、访问 `#/model-tboard`、检查 frontend `/readyz`、运行前端合同测试、Python 编译检查和 JS 语法检查。
-- 禁止修改项：未经解锁不得改变 3 天窗口、日期锚点顺序、默认隐藏口径、`include_stale_stopped=true` 只读排查参数或前端只读边界；不得将过期失效过滤下沉为 owner 事实删除、数据库清理、scheduler/source 动作或模型评分修改。
-- 解锁条件：用户明确批准本冻结对象解锁；若要改成“三个交易日”口径、改变 owner `observation-board` 字段或状态机、删除历史失效事实、调整 scheduler/source 逻辑，必须另行解锁对应服务。
+- 禁止修改项：未经解锁不得改变终止态默认下架、Day2 窗口错过后的 `data_wait` 默认下架、`include_stale_stopped=true` 只读排查参数或前端只读边界；不得将失效过滤下沉为 owner 事实删除、数据库清理、scheduler/source 动作或模型评分修改。
+- 解锁条件：用户明确批准本对象解锁；若要改变 owner `observation-board` 字段或状态机、删除历史失效事实、调整 scheduler/source 逻辑，必须另行解锁对应服务。
 - 回滚方式：回退本对象对应的 compact 默认过滤、页面兜底过滤、测试和文档变更，重新运行前端合同测试、Python 编译检查、JS 语法检查，并重启前端服务；不清库、不重启 `source-data-service`，也不修改模型四 owner 数据。
-- 验证清单：`python -m pytest -q services/shence-frontend-service/tests/test_frontend_contract.py` 通过；`python -m compileall -q services/shence-frontend-service/src services/shence-frontend-service/tests` 通过；`node --check services/shence-frontend-service/public/app.js` 通过；`git diff --check` 通过；前端 `8030` / `18080` 重启后 `/readyz` 为 ready；默认 `/api/model-list/tboard?limit=20` 可读，当前 4 条样本仍在三天窗口内所以继续展示；`source-data-service` 未重启。
+- 验证清单：`python -m pytest -q services/shence-frontend-service/tests/test_frontend_contract.py` 通过；`python -m compileall -q services/shence-frontend-service/src services/shence-frontend-service/tests` 通过；`node --check services/shence-frontend-service/public/app.js` 通过；`git diff --check` 通过；前端 `8030` 重启后 `/readyz` 为 ready；默认 `/api/model-list/tboard?limit=20` 不返回已终止或 Day2 窗口错过的 `data_wait` 对象；`include_stale_stopped=true` 可显式排查历史失效和缺口对象；`source-data-service` 未重启。
 
 ### shence-frontend-service -> model-tboard -> Day1 summary dedupe
 
@@ -183,3 +185,42 @@
 - 解锁条件：用户明确批准本冻结对象解锁；若 owner `observation-board` 字段、Day1 汇总口径、schema、scheduler/source 取数或模型四状态机变化，必须另行解锁对应服务。
 - 回滚方式：回退本对象对应的移动端卡片 CSS、合同测试和文档变更，重新运行前端合同测试、Python 编译检查、JS 语法检查和 Playwright 页面验收；不清库、不重启 `source-data-service`，也不修改模型四 owner 数据。
 - 验证清单：前端合同测试通过；Python 编译检查通过；JS 语法检查通过；尾随空白检查通过；Playwright 手机 DOM 验收显示 `rowDisplay=grid`、`cellDisplay=grid`、10 个 `data-label` 完整；frontend/scheduler/data-inspector `/readyz` 均 ready；`source-data-service` 未重启。
+
+## Admin 数据任务看板资产
+
+| 入口 | 读取资产 | 日生命周期 | 刷新 | 边界 |
+|---|---|---|---|---|
+| `/api/admin/daily-board` | `source/requirements`、`source/freshness/sla`、`source/readiness/matrix`、`source/repair-routes`、`source/fetch/queues/summary`、`source/ops/daily-data-summary`、`source/build/results`、`source/build/triggers`、`source/storage/policies`、`scheduler/source-schedule/registry`、`scheduler/materialize/source-schedule`、`scheduler/task-store/daily-summary`、`data-inspector inspection-runs/latest`、`data-inspector inspection-gaps` | `trade_date` | 首屏不自动读取；管理员展开审计/资产明细时按需只读读取；后端 10 秒短缓存合并同日期重复读取 | 仅 `admin`；不提交 fetch、不触发调度、不调用 provider、不写 source/raw/model/research；完整性验收未生成只能作为审计提示，不得把 scheduler 已执行任务清零 |
+| `/api/admin/task-board` | scheduler daily task-store summary, source daily data summary, source fetch/build evidence, data-inspector gap audit | `trade_date` | browser read-only refresh every 300 seconds; backend read timeout defaults to 90 seconds unless `SHENCE_FRONTEND_ADMIN_DASHBOARD_TIMEOUT_SECONDS` is set; browser and backend coalesce identical same-day reads with a 10 second short cache while manual refresh bypasses stale cache; task-board uses a lightweight read set and does not read build result/trigger/storage/readiness/inspection details; browser treats task-board as primary and daily-board as optional detail, with admin-specific loading copy only | admin only; summary must provide planned, completed, unfinished, not-yet-due, waiting submit, waiting raw/source output, scheduler failure, target data not produced, build failure, raw-audit warning, and repairable/non-repairable/pending counts; default screen stays aggregated |
+
+Daily lifecycle aggregation: planned tasks use scheduler materialized daily tasks and task-store reconciliation as denominator. `success` and `source_duplicate_skipped` only mean scheduler submitted or deduplicated. Frontend must overlay `/source/ops/daily-data-summary`: `final_data_failed=true`, `data_asset_status=failed`, or build failure counts as final data failure and is subtracted from completed; `data_asset_status=collecting` / queued / running / waiting, active or waiting raw jobs, and no target evidence (`source_row_count=0` plus `build_succeeded_count=0`) are counted as unfinished `collecting` / `awaiting_evidence` only while the row-level lifecycle is still open; after `orchestration_context.lifecycle_expires_at*` or the schedule-group fallback window has passed and there is no completion evidence, the row is `expired_closed`, not active waiting and not data failure; if source daily summary is unavailable, `source_facts_available=false`, source output counts stay null, and scheduler-completed source tasks are downgraded to `awaiting_evidence` rather than inferred expiry; `raw_failure_audit_only=true` or `completed_with_provider_audit` is raw-audit warning only and counts as completed only when target evidence exists. Missing target-day data-inspector run is an audit hint, not a reason to reset completed tasks.
+
+2026-07-15 admin browser action asset: `reload-admin-board` is the only manual refresh action for `#/admin-ops`; date input changes only mutate the admin board `trade_date` and reload the read-only board. Coverage alert text comes from admin summary/upstream fields only; model page refresh copy remains isolated in `refreshState`.
+2026-07-15 task-count asset boundary: `*_tasks` counters are scheduler task-row counters after source evidence overlay. Source build/raw result counters such as `build_failed_results` remain audit evidence (`build_failed_result_count`) and must not be added to task failure counts. Waiting states are split into `awaiting_dispatch_tasks` (待提交抓取) and `awaiting_evidence_tasks` (等待数据结果).
+2026-07-15 admin render contract: real task-board and daily-board payloads must be accepted by browser render helpers without throwing. Upstream read badges use `upstream_status.status`; admin block reasons use admin task/asset statuses only and must not import model-list state fields. The page must show Chinese empty/progress states instead of `页面不可读` when payloads are readable.
+2026-07-15 admin progress clarity: `/api/admin/task-board` exposes scheduler ledger progress separately from final source-data completion. The main board must show scheduler processed counts, final completed counts, raw waiting/active counts, and source output counts so `0%` final completion is not mistaken for no scheduler activity. Scheduler `success/source_duplicate_skipped` remains process evidence only; final completion still requires target source output.
+2026-07-15 admin label clarity: upstream status labels must use Chinese business names for daily source output and scheduler ledger. Missing target-day inspection is “未生成”, not read failure. `collecting` is displayed as “等待抓取/产出”/“等待产出” and means raw/source output is not closed; it must not be interpreted as active worker processing unless raw active counts are positive.
+2026-07-20 admin task-row overlay asset: `/api/admin/task-board` must use scheduler task rows plus source submit audit fields to classify each row. Same-table raw waiting does not demote all processed tasks; only rows with live source submissions are `collecting`, rows without completion evidence are `awaiting_evidence` while their lifecycle is open, lifecycle-expired rows are `expired_closed`, and rows with target source/build evidence or explicit completed asset state remain completed unless final data failure is reported. The main screen reports effective raw waiting/active counts for active unfinished rows only; source-wide residual queue totals remain in `raw_waiting_jobs_total/raw_active_jobs_total` audit fields.
+2026-07-15 admin request performance: `#/admin-ops` first screen must call `/api/admin/task-board` only; `/api/admin/daily-board` is an on-demand detail payload loaded when the audit/details panel opens. Duplicate same-date admin reads are de-duplicated in browser and coalesced in backend for 10 seconds; the cache is read-only and cannot mutate source, scheduler, provider, model, or research facts.
+
+补救标签口径：`可补` 只用于有正规 repair route、备源 provider 或 source build 重建路径的失败 / 缺失；`不可补` 只用于实时盘口快照、分钟线、逐笔成交、竞价快照、同花顺付费次日概率等窗口事实；`待确认` 表示当前合同没有明确补救路线。未到抓取时间、待提交抓取、等待抓取/产出和等待数据结果不展示可补 / 不可补标签。
+
+前端展示口径：主屏只展示中文业务词，不展示 `inspection_unknown`、`not_due` 等英文状态码；数据表名、缺口码、接口路径、JSON 字段名等技术标识不得作为默认主屏内容。完整资产和缺口明细只放在折叠审计区；任务明细默认只汇总为计数，不逐条铺开。
+
+### shence-frontend-service -> admin-ops -> aggregated daily lifecycle board
+
+- Current time: 2026-07-13 Asia/Shanghai.
+- 确认来源：用户确认按日周期任务总览、中文业务词和不逐条铺开任务的口径执行，并要求根据真实数据库数据和任务比对。
+- 数据资产范围：`/api/admin/daily-board`、`/api/admin/task-board` 与 `#/admin-ops` 的只读聚合展示；不改变 source/scheduler/data-inspector 的事实生成。
+- 时间展示口径：latest_task_update_at、latest_data_update_at 等后端时间字段保持原始事实；浏览器仅把带明确偏移的时间显示为北京时间 YYYY-MM-DD HH:mm:ss，不得改写、推断或用当前时间补事实。
+- 禁止项：未经解锁不得把未到抓取时间计为失败，不得把完整性验收未生成计为任务未完成，不得用构建成功、历史验收 run、0、当前时间、mock 或前端推断补目标日事实，不得让 admin 看板触发 source fetch、scheduler dispatch、provider 调用或任何后端事实写入。
+- Acceptance: default screen shows planned, completed, unfinished, not-yet-due, waiting submit, waiting raw/source output, scheduler failure, target data not produced, build failure, raw-audit warning, source output, and repairability counts; it does not expose raw English status codes or task rows by default. Raw failures with final source output do not count as failure; final source asset failures must reduce completed count and increase failed count.
+- 回滚：回退 admin 看板展示、聚合 helper、合同测试和本账本文档变更；只重启受影响服务验证，不清库，不改 source/scheduler/data-inspector 事实。
+
+## Admin Board Lifecycle State
+
+`/api/admin/task-board` preserves `raw_cancelled_jobs`, row-level `raw_cancelled_count`, and `expired_closed` status from `source/ops/daily-data-summary`, and it may also derive `expired_closed` from scheduler row lifecycle expiry. `expired_closed` means a normal source daily task has exceeded its lifecycle and is no longer displayed as an active job. It does not mean data completion and does not enter repairable/non-repairable failure classification by itself. Completed and expired rows may still have source-wide raw queue residuals; those residuals are audit totals only and are excluded from the main effective waiting count. If data must be filled, scheduler or data-inspector must submit a new formal source fetch, repair, or backfill task.
+
+### 2026-07-23 Admin Board Expired Task Aggregation
+
+The task board's aggregation now counts row-level scheduler lifecycle expiry, including tasks that were never submitted to source-data-service. `expired_closed_tasks` is separate from `awaiting_dispatch_tasks`, `collecting_tasks`, and final data failures. The state means the original daily task instance is no longer enabled; it does not fabricate completion and it does not by itself assign repairability. Failed or missing target data still receives repairability labels only when the row is classified as an actual data failure/missing output.

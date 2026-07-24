@@ -9,7 +9,12 @@ const FRONTEND_HOT_MODEL_LIST_LIMIT = 20;
 const FRONTEND_HOT_MODEL_LIST_TIMEOUT_MS = 24000;
 const FRONTEND_TBOARD_COMPACT_TIMEOUT_MS = 24000;
 const TBOARD_AUTO_REFRESH_MS = 60000;
-const TBOARD_STOPPED_DEFAULT_VISIBLE_DAYS = 3;
+const ADMIN_DASHBOARD_REFRESH_MS = 300000;
+const ADMIN_DASHBOARD_REQUEST_TIMEOUT_MS = 95000;
+const ADMIN_DAILY_BOARD_OPTIONAL_TIMEOUT_MS = 12000;
+const ADMIN_BOARD_CACHE_TTL_MS = 10000;
+const TBOARD_DEFAULT_HIDDEN_STATUSES = new Set(["stopped"]);
+const TBOARD_DAY2_WINDOW_END_MINUTES = 10 * 60 + 30;
 const FRONTEND_SOURCE_STATUS_TIMEOUT_MS = 24000;
 const PREFERRED_CANDIDATE_TRADE_DATE = null;
 const CANDIDATE_TRADE_DATE_FALLBACK_LABEL = "最新可见交易日";
@@ -21,6 +26,7 @@ const OPEN_ROUTES = [
   { key: "model-ambush", group: "四个模型", label: "潜伏抬头", icon: "伏", hash: "#/model-ambush" },
   { key: "model-tboard", group: "四个模型", label: "T字接力", icon: "T", hash: "#/model-tboard" },
   { key: "research-ambush-valley", group: "研究中心", label: "低谷图库", icon: "谷", hash: "#/research-ambush-valley" },
+  { key: "admin-ops", group: "\u7ba1\u7406", label: "\u6570\u636e\u4efb\u52a1\u770b\u677f", icon: "A", hash: "#/admin-ops", requiresRole: "admin" },
 ];
 
 const MODEL_PROFILES = {
@@ -51,7 +57,7 @@ const MODEL_PROFILES = {
   },
   "model-memory": {
     key: "memory",
-    title: "候选记忆模型",
+    title: "热点候选模型",
     subtitle: "追踪离开短窗口后的二波、慢趋势和延迟兑现价值。",
     service: "memory",
     modelCode: "candidate_memory",
@@ -75,7 +81,7 @@ const MODEL_PROFILES = {
   },
   "model-ambush": {
     key: "ambush",
-    title: "潜伏抬头模型",
+    title: "热点候选模型",
     subtitle: "深圳 A 股低位潜伏、弱转强和龙抬头结构扫描。",
     service: "ambush",
     modelCode: "ambush_watchlist",
@@ -290,7 +296,7 @@ const MODEL_FILTER_VALUE_FIELDS = {
   release_gate: "发布状态",
   memory_state: "记忆状态",
   appearance_count: "出现次数",
-  shape_type: "形态类型",
+  shape_type: "前端根据前复权日线窗口生成的可复核形态提示，不等同于正式模型结论。",
   observation_status: "观察状态",
 };
 
@@ -375,7 +381,7 @@ const STATUS_LABELS = {
   verification_data_gap: "验证数据缺口",
   monitoring: "监控中",
   mixed_reactivation: "混合再激活",
-  qualified: "已合格",
+  qualified: "合格",
   triggered: "已触发",
   not_near_limit: "未接近涨停",
   order_consumption_triggered: "盘口吃单触发",
@@ -453,6 +459,7 @@ const state = {
   user: null,
   authEpoch: 0,
   modelTboardRefreshTimer: null,
+  adminBoardRefreshTimer: null,
   modelReviewFilters: {},
   modelReviewRows: {},
   modelReviewExtras: {},
@@ -480,6 +487,16 @@ const state = {
     enrichmentError: null,
     error: null,
   },
+  adminBoard: {
+    tradeDate: null,
+    data: null,
+    task: null,
+    loading: false,
+    error: null,
+    detailLoading: false,
+    detailError: null,
+    detailsOpen: false,
+  },
   ambushValley: {
     loaded: false,
     loading: false,
@@ -504,6 +521,18 @@ function escapeHtml(value) {
 function normalizeRoute(hash) {
   const key = String(hash || "").replace(/^#\/?/, "") || "candidates";
   return OPEN_ROUTES.some((item) => item.key === key) ? key : "candidates";
+}
+
+function isAdminUser() {
+  return String(state.user?.role || "").toLowerCase() === "admin";
+}
+
+function canSeeRoute(route) {
+  return !route.requiresRole || String(route.requiresRole).toLowerCase() === String(state.user?.role || "").toLowerCase();
+}
+
+function visibleRoutes() {
+  return OPEN_ROUTES.filter(canSeeRoute);
 }
 
 async function api(path, options = {}) {
@@ -602,6 +631,7 @@ function bindLogin() {
       const result = await api("/api/auth/login", { method: "POST", body: JSON.stringify(payload) });
       if (authEpoch !== state.authEpoch) return;
       state.user = result.user;
+      clearAdminBoardRequestCache();
       setAuthState("authenticated");
       if (message) message.textContent = "";
       if (!location.hash) {
@@ -611,7 +641,7 @@ function bindLogin() {
       renderApp();
     } catch (error) {
       if (authEpoch !== state.authEpoch) return;
-      if (message) message.textContent = "账号或密码不正确，请重新输入。";
+      if (message) message.textContent = "";
     }
   });
 }
@@ -623,6 +653,7 @@ async function loadSession() {
     if (authEpoch !== state.authEpoch) return;
     if (session.authenticated) {
       state.user = session.user;
+      clearAdminBoardRequestCache();
       setAuthState("authenticated");
       renderApp();
     } else {
@@ -632,13 +663,15 @@ async function loadSession() {
     if (authEpoch !== state.authEpoch) return;
     setAuthState("anonymous");
     const message = $("#login-message");
-    if (message) message.textContent = "登录服务暂不可用，请确认前端服务在线。";
+      if (message) message.textContent = "";
   }
 }
 
 async function logout() {
   state.authEpoch += 1;
   clearTBoardAutoRefresh();
+  clearAdminBoardAutoRefresh();
+  clearAdminBoardRequestCache();
   try { await api("/api/auth/logout", { method: "POST", body: "{}" }); } catch {}
   state.user = null;
   setAuthState("anonymous");
@@ -649,6 +682,7 @@ function renderApp() {
   state.route = normalizeRoute(location.hash);
   state.pageEpoch = (state.pageEpoch || 0) + 1;
   clearTBoardAutoRefresh();
+  clearAdminBoardAutoRefresh();
   clearModelListChrome();
   const route = OPEN_ROUTES.find((item) => item.key === state.route) || OPEN_ROUTES[0];
   const isModelRoute = Boolean(MODEL_PROFILES[state.route]);
@@ -670,7 +704,7 @@ function renderApp() {
 }
 
 function renderSidebar() {
-  const grouped = OPEN_ROUTES.reduce((acc, item) => {
+  const grouped = visibleRoutes().reduce((acc, item) => {
     (acc[item.group] ||= []).push(item);
     return acc;
   }, {});
@@ -761,9 +795,771 @@ function scheduleTBoardAutoRefresh(pageEpoch, routeKey) {
   }, TBOARD_AUTO_REFRESH_MS);
 }
 
+function clearAdminBoardAutoRefresh() {
+  if (!state.adminBoardRefreshTimer) return;
+  window.clearTimeout(state.adminBoardRefreshTimer);
+  state.adminBoardRefreshTimer = null;
+}
+
+function scheduleAdminBoardAutoRefresh(pageEpoch, routeKey) {
+  clearAdminBoardAutoRefresh();
+  if (routeKey !== "admin-ops" || !state.user || !isAdminUser() || isStalePage(pageEpoch, routeKey)) return;
+  state.adminBoardRefreshTimer = window.setTimeout(() => {
+    state.adminBoardRefreshTimer = null;
+    if (state.route !== "admin-ops" || !state.user || !isAdminUser()) return;
+    if (document.hidden) {
+      scheduleAdminBoardAutoRefresh(state.pageEpoch, "admin-ops");
+      return;
+    }
+    renderAdminOpsPage({ pageEpoch: state.pageEpoch, routeKey: "admin-ops", silentRefresh: true }).catch((error) => {
+      if (isStalePage(state.pageEpoch, "admin-ops")) return;
+      state.adminBoard.error = frontendErrorLabel(error);
+      const status = $("[data-admin-refresh-status]");
+      if (status) status.textContent = `刷新失败，保留上次看板：${state.adminBoard.error}`;
+      scheduleAdminBoardAutoRefresh(state.pageEpoch, "admin-ops");
+    });
+  }, ADMIN_DASHBOARD_REFRESH_MS);
+}
+
+function adminBoardDefaultTradeDate() {
+  try {
+    const parts = new Intl.DateTimeFormat("zh-CN", {
+      timeZone: "Asia/Shanghai",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date()).reduce((acc, part) => ({ ...acc, [part.type]: part.value }), {});
+    return `${parts.year}-${parts.month}-${parts.day}`;
+  } catch {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+const adminBoardRequestCache = new Map();
+const adminBoardRequestInflight = new Map();
+
+function clearAdminBoardRequestCache() {
+  adminBoardRequestCache.clear();
+  adminBoardRequestInflight.clear();
+}
+
+function adminBoardCacheKey(kind, tradeDate) {
+  return `${kind}:${tradeDate || adminBoardDefaultTradeDate()}`;
+}
+
+async function loadAdminBoardEndpoint(kind, tradeDate, path, timeoutMs, options = {}) {
+  const key = adminBoardCacheKey(kind, tradeDate);
+  const pending = adminBoardRequestInflight.get(key);
+  if (pending) return pending;
+  const cached = adminBoardRequestCache.get(key);
+  if (!options.force && cached && cached.expiresAt > Date.now()) return cached.payload;
+  const request = api(path, { method: "GET", timeoutMs })
+    .then((payload) => {
+      adminBoardRequestCache.set(key, { payload, expiresAt: Date.now() + ADMIN_BOARD_CACHE_TTL_MS });
+      return payload;
+    })
+    .finally(() => adminBoardRequestInflight.delete(key));
+  adminBoardRequestInflight.set(key, request);
+  return request;
+}
+
+function buildAdminDailyBoardShell(task, tradeDate, detailState = "idle", error = null) {
+  return {
+    contract_kind: "shence_admin_daily_data_board_deferred_v1",
+    read_only: true,
+    role_required: "admin",
+    trade_date: task?.trade_date || tradeDate || adminBoardDefaultTradeDate(),
+    generated_at: task?.generated_at || null,
+    refresh_interval_seconds: task?.refresh_interval_seconds || ADMIN_DASHBOARD_REFRESH_MS / 1000,
+    summary: {
+      queue: task?.summary?.queue || {},
+      detail_state: detailState,
+      detail_message: error ? frontendErrorLabel(error) : "",
+    },
+    assets: [],
+    gaps: [],
+    upstream_status: error ? { daily_board_detail: { status: "unavailable", message: frontendErrorLabel(error) } } : {},
+  };
+}
+
+function adminDailyBoardLoaded(data) {
+  return data?.contract_kind === "shence_admin_daily_data_board_v1";
+}
+
+async function loadAdminTaskBoard(tradeDate, options = {}) {
+  const query = tradeDate ? `?trade_date=${encodeURIComponent(tradeDate)}` : "";
+  return loadAdminBoardEndpoint(
+    "task-board",
+    tradeDate,
+    `/api/admin/task-board${query}`,
+    ADMIN_DASHBOARD_REQUEST_TIMEOUT_MS,
+    options,
+  );
+}
+
+async function loadAdminDailyBoardDetail(tradeDate, options = {}) {
+  const query = tradeDate ? `?trade_date=${encodeURIComponent(tradeDate)}` : "";
+  return loadAdminBoardEndpoint(
+    "daily-board",
+    tradeDate,
+    `/api/admin/daily-board${query}`,
+    ADMIN_DAILY_BOARD_OPTIONAL_TIMEOUT_MS,
+    options,
+  );
+}
+
+async function loadAdminBoardData(tradeDate, options = {}) {
+  const task = await loadAdminTaskBoard(tradeDate, options);
+  const resolvedTradeDate = task?.trade_date || tradeDate || adminBoardDefaultTradeDate();
+  return { data: buildAdminDailyBoardShell(task, resolvedTradeDate), task };
+}
+
+async function renderAdminOpsPage(options = {}) {
+  const pageEpoch = options.pageEpoch ?? state.pageEpoch;
+  const routeKey = options.routeKey ?? "candidates";
+  const root = $("#page-root");
+  if (!root || isStalePage(pageEpoch, routeKey)) return;
+  if (!isAdminUser()) {
+    root.innerHTML = `<section class="notice-bar notice-bar--inline"><strong>无权限</strong><span>只有 admin 账户可以查看数据和任务看板。</span></section>`;
+    return;
+  }
+  const tradeDate = state.adminBoard.tradeDate || adminBoardDefaultTradeDate();
+  if (!options.silentRefresh) {
+    root.innerHTML = `<section class="panel"><strong>\u6b63\u5728\u8bfb\u53d6\u6570\u636e\u4efb\u52a1\u770b\u677f...</strong><span>\u7b49\u5f85\u6e90\u6570\u636e\u4e0e\u8c03\u5ea6\u8d26\u672c\u8fd4\u56de\uff0c\u4e0d\u4f7f\u7528\u5176\u4ed6\u9875\u9762\u6587\u6848\u3002</span></section>`;
+  }
+  state.adminBoard.loading = true;
+  try {
+    const keepDetailsOpen = Boolean(state.adminBoard.detailsOpen);
+    const { data, task } = await loadAdminBoardData(tradeDate, { force: Boolean(options.forceRefresh) });
+    if (isStalePage(pageEpoch, routeKey)) return;
+    const resolvedTradeDate = data?.trade_date || task?.trade_date || tradeDate;
+    state.adminBoard = { tradeDate: resolvedTradeDate, data, task, loading: false, error: null, detailLoading: false, detailError: null, detailsOpen: keepDetailsOpen };
+    root.innerHTML = renderAdminOpsWorkbench(data, task);
+    bindAdminOpsActions(pageEpoch, routeKey);
+    scheduleAdminBoardAutoRefresh(pageEpoch, routeKey);
+    if (state.adminBoard.detailsOpen && !adminDailyBoardLoaded(state.adminBoard.data)) {
+      hydrateAdminDailyBoard(pageEpoch, routeKey, { force: Boolean(options.forceRefresh) }).catch(() => {});
+    }
+  } catch (error) {
+    if (isStalePage(pageEpoch, routeKey)) return;
+    state.adminBoard.loading = false;
+    state.adminBoard.error = frontendErrorLabel(error);
+    if (options.silentRefresh && state.adminBoard.data && state.adminBoard.task) {
+      const status = $("[data-admin-refresh-status]");
+      if (status) status.textContent = `刷新失败，保留上次看板：${state.adminBoard.error}`;
+      scheduleAdminBoardAutoRefresh(pageEpoch, routeKey);
+      return;
+    }
+    renderPageError(error);
+  }
+}
+
+async function hydrateAdminDailyBoard(pageEpoch, routeKey, options = {}) {
+  const root = $("#page-root");
+  if (!root || isStalePage(pageEpoch, routeKey)) return;
+  if (state.adminBoard.detailLoading || adminDailyBoardLoaded(state.adminBoard.data)) return;
+  const tradeDate = state.adminBoard.tradeDate || adminBoardDefaultTradeDate();
+  const task = state.adminBoard.task;
+  state.adminBoard = {
+    ...state.adminBoard,
+    data: buildAdminDailyBoardShell(task, tradeDate, "loading"),
+    detailLoading: true,
+    detailError: null,
+    detailsOpen: true,
+  };
+  root.innerHTML = renderAdminOpsWorkbench(state.adminBoard.data, task);
+  bindAdminOpsActions(pageEpoch, routeKey);
+  try {
+    const data = await loadAdminDailyBoardDetail(tradeDate, options);
+    if (isStalePage(pageEpoch, routeKey)) return;
+    state.adminBoard = { ...state.adminBoard, data, detailLoading: false, detailError: null, detailsOpen: true };
+  } catch (error) {
+    if (isStalePage(pageEpoch, routeKey)) return;
+    state.adminBoard = {
+      ...state.adminBoard,
+      data: buildAdminDailyBoardShell(task, tradeDate, "error", error),
+      detailLoading: false,
+      detailError: frontendErrorLabel(error),
+      detailsOpen: true,
+    };
+  }
+  root.innerHTML = renderAdminOpsWorkbench(state.adminBoard.data, state.adminBoard.task);
+  bindAdminOpsActions(pageEpoch, routeKey);
+}
+
+function renderAdminOpsWorkbench(data, task) {
+  const dataSummary = data?.summary || {};
+  const taskSummary = task?.summary || {};
+  const queue = dataSummary.queue || taskSummary.queue || {};
+  const tradeDate = data?.trade_date || task?.trade_date || state.adminBoard.tradeDate || adminBoardDefaultTradeDate();
+  const refreshSeconds = Number(data?.refresh_interval_seconds || task?.refresh_interval_seconds || ADMIN_DASHBOARD_REFRESH_MS / 1000);
+  const upstream = { ...(data?.upstream_status || {}), ...(task?.upstream_status || {}) };
+  const assets = data?.assets || [];
+  const tasks = task?.tasks || [];
+  const gaps = data?.gaps || [];
+  const blocks = buildAdminDataBlockSummary(assets, tasks, gaps);
+  return `<section class="admin-board admin-board--summary" data-admin-board="true">
+    <div class="admin-board-toolbar panel">
+      <div>
+        <strong>今日任务看板 ${escapeHtml(tradeDate)}</strong>
+        <span data-admin-refresh-status>每 ${Math.max(Math.round(refreshSeconds / 60), 1)} 分钟自动刷新；生成 ${escapeHtml(formatDateTimeValue(data?.generated_at || task?.generated_at))}</span>
+      </div>
+      <div class="admin-board-actions">
+        <label class="admin-board-date"><span>日期</span><input id="admin-board-date" type="date" value="${escapeHtml(tradeDate)}"></label>
+        <button class="secondary-button" data-action="reload-admin-board">刷新</button>
+      </div>
+    </div>
+    ${renderAdminCoverageAlert(dataSummary, upstream)}
+    ${renderAdminCompletionOverview(dataSummary, taskSummary, queue, blocks)}
+    ${renderAdminDataBlockBoard(blocks)}
+    ${renderAdminExceptionList(blocks)}
+    <section class="admin-audit-compact panel">
+      <strong>规划与差异对比</strong>
+      <span>${escapeHtml(display(tasks.length, "0"))} 条任务已折叠为上方计数，不逐条铺开；需要排查时再展开只读审计明细。</span>
+    </section>
+    ${renderAdminAuditDetails(data, tasks, assets, gaps, dataSummary)}
+    <div class="admin-upstream-strip">${renderAdminUpstreamStatus(upstream)}</div>
+  </section>`;
+}
+
+function renderAdminAuditDetails(data, tasks, assets, gaps, dataSummary) {
+  const openAttr = state.adminBoard.detailsOpen ? " open" : "";
+  const loaded = adminDailyBoardLoaded(data);
+  if (!loaded) {
+    const detailState = state.adminBoard.detailLoading ? "loading" : state.adminBoard.detailError ? "error" : (dataSummary?.detail_state || "idle");
+    const message = detailState === "loading"
+      ? "\u6b63\u5728\u8bfb\u53d6\u6570\u636e\u8d44\u4ea7\u660e\u7ec6..."
+      : detailState === "error"
+        ? `\u6570\u636e\u8d44\u4ea7\u660e\u7ec6\u8bfb\u53d6\u5931\u8d25\uff1a${display(state.adminBoard.detailError || dataSummary?.detail_message)}`
+        : "\u5c55\u5f00\u540e\u8bfb\u53d6\u6570\u636e\u8d44\u4ea7\u660e\u7ec6\uff1b\u4e3b\u770b\u677f\u5df2\u6309\u4efb\u52a1\u770b\u677f\u5c55\u793a\u3002";
+    return `<details class="admin-audit-details" data-admin-audit-details="true"${openAttr}>
+      <summary>\u5c55\u5f00\u5ba1\u8ba1\u660e\u7ec6</summary>
+      <section class="admin-board-panel panel" data-admin-detail-placeholder="true">
+        <div class="panel__head"><h2 class="panel-title">\u6570\u636e\u8d44\u4ea7\u660e\u7ec6</h2><span>\u6309\u9700\u8bfb\u53d6</span></div>
+        <div class="admin-empty-state">${escapeHtml(message)}</div>
+      </section>
+    </details>`;
+  }
+  return `<details class="admin-audit-details" data-admin-audit-details="true"${openAttr}>
+      <summary>\u5c55\u5f00\u5ba1\u8ba1\u660e\u7ec6</summary>
+      <section class="admin-board-panel panel">
+        <div class="panel__head"><h2 class="panel-title">\u6570\u636e\u8d44\u4ea7\u660e\u7ec6</h2><span>\u9a8c\u6536\u6279\u6b21 ${escapeHtml(display(dataSummary.latest_inspection_run_id))} \u00b7 ${escapeHtml(formatDateTimeValue(dataSummary.latest_inspection_finished_at))}</span></div>
+        ${renderAdminAssetTable(assets)}
+      </section>
+      <section class="admin-board-panel panel">
+        <div class="panel__head"><h2 class="panel-title">\u4efb\u52a1\u660e\u7ec6\u5df2\u6c47\u603b</h2><span>${escapeHtml(display(tasks.length, "0"))} \u6761\u4efb\u52a1\u5df2\u6298\u53e0\u4e3a\u4e0a\u65b9\u8ba1\u6570\uff0c\u4e0d\u9010\u6761\u94fa\u5f00\u3002</span></div>
+        <div class="admin-empty-state">\u9700\u8981\u9010\u6761\u6392\u67e5\u65f6\u518d\u8bfb\u53d6\u540e\u7aef\u63a5\u53e3\uff1b\u9ed8\u8ba4\u9875\u9762\u53ea\u5c55\u793a\u4eca\u65e5\u751f\u547d\u5468\u671f\u805a\u5408\u7ed3\u679c\u3002</div>
+      </section>
+      <section class="admin-board-panel panel">
+        <div class="panel__head"><h2 class="panel-title">\u7f3a\u53e3\u660e\u7ec6</h2><span>${escapeHtml(display(gaps.length, "0"))} \u6761</span></div>
+        ${renderAdminGapTable(gaps)}
+      </section>
+    </details>`;
+}
+
+function renderAdminCoverageAlert(dataSummary, upstream) {
+  const inspection = dataSummary?.inspection_coverage || {};
+  if (inspection.covered === true) return "";
+  const message = dataSummary?.inspection_message || dataSummary?.message || upstream?.daily_acceptance?.message || "完整性验收还未生成，任务完成度仍以调度账本和数据产出为准。";
+  const label = "完整性验收未生成";
+  return `<section class="admin-coverage-alert panel admin-coverage-alert--warn">
+    <strong>${escapeHtml(label)}</strong>
+    <span>${escapeHtml(message)}</span>
+  </section>`;
+}
+
+function renderAdminCompletionOverview(dataSummary, taskSummary, queue, blocks) {
+  const totalTasks = Number(taskSummary.total_tasks || 0);
+  const completedTasks = Number(taskSummary.completed_tasks ?? taskSummary.built_tasks ?? 0);
+  const unfinishedTasks = Number(taskSummary.unfinished_tasks ?? Math.max(totalTasks - completedTasks, 0));
+  const schedulerCompletedTasks = Number(taskSummary.scheduler_completed_tasks ?? completedTasks);
+  const schedulerDueTasks = Number(taskSummary.scheduler_due_tasks ?? 0);
+  const schedulerNotDueTasks = Number(taskSummary.scheduler_not_due_tasks ?? taskSummary.not_due_tasks ?? 0);
+  const waitingTasks = Number(taskSummary.waiting_collection_tasks ?? taskSummary.not_due_tasks ?? schedulerNotDueTasks);
+  const collectingTasks = Number(taskSummary.collecting_tasks ?? taskSummary.queue_active_tasks ?? 0);
+  const awaitingDispatchTasks = Number(taskSummary.awaiting_dispatch_tasks || 0);
+  const awaitingEvidenceTasks = Number(taskSummary.awaiting_evidence_tasks || 0);
+  const expiredClosedTasks = Number(taskSummary.expired_closed_tasks || 0);
+  const executionFailedTasks = Number(taskSummary.execution_failed_tasks || 0);
+  const processingTasks = awaitingDispatchTasks + awaitingEvidenceTasks + collectingTasks;
+  const dataFailedJobs = Number(taskSummary.data_failed_jobs || 0);
+  const rawAuditWarnings = Number(taskSummary.raw_audit_warning_table_count || dataSummary.raw_audit_warning_table_count || 0);
+  const failedTasks = Number(taskSummary.failed_tasks ?? (executionFailedTasks + dataFailedJobs));
+  const repairableFailed = Number(taskSummary.repairable_failed_tasks || 0);
+  const unrepairableFailed = Number(taskSummary.unrepairable_failed_tasks || 0);
+  const contractPendingFailed = Number(taskSummary.contract_pending_failed_tasks || 0);
+  const sourceFactsAvailable = taskSummary.source_facts_available !== false;
+  const sourceRowsRaw = taskSummary.source_row_count ?? dataSummary.source_row_count;
+  const sourceRows = sourceFactsAvailable && sourceRowsRaw !== null && sourceRowsRaw !== undefined ? Number(sourceRowsRaw) : null;
+  const rawWaitingJobs = sourceFactsAvailable && taskSummary.raw_waiting_jobs !== null && taskSummary.raw_waiting_jobs !== undefined ? Number(taskSummary.raw_waiting_jobs) : null;
+  const rawActiveJobs = sourceFactsAvailable && taskSummary.raw_active_jobs !== null && taskSummary.raw_active_jobs !== undefined ? Number(taskSummary.raw_active_jobs) : null;
+  const rawCancelledJobs = sourceFactsAvailable && taskSummary.raw_cancelled_jobs !== null && taskSummary.raw_cancelled_jobs !== undefined ? Number(taskSummary.raw_cancelled_jobs) : null;
+  const latestDataUpdate = sourceFactsAvailable ? (taskSummary.latest_data_update_at || dataSummary.latest_data_update_at) : null;
+  const completionPct = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : null;
+  const tone = !sourceFactsAvailable ? "danger" : failedTasks ? "danger" : waitingTasks || processingTasks || expiredClosedTasks || rawAuditWarnings ? "warn" : "ok";
+  const completionText = !sourceFactsAvailable ? "\u5f85\u5224\u5b9a" : completionPct === null ? "-" : `${completionPct}%`;
+  const schedulerSub = schedulerDueTasks
+    ? `\u8c03\u5ea6\u8d26\u672c\u5df2\u5904\u7406 ${display(schedulerCompletedTasks, "0")} / \u5df2\u5230\u65f6\u95f4 ${display(schedulerDueTasks, "0")}\uff1b`
+    : schedulerCompletedTasks
+      ? `\u8c03\u5ea6\u8d26\u672c\u5df2\u5904\u7406 ${display(schedulerCompletedTasks, "0")}\uff1b`
+      : "";
+  const rawSub = rawWaitingJobs || rawActiveJobs
+    ? `\u4eca\u65e5\u539f\u59cb\u6293\u53d6\u7b49\u5f85 ${display(rawWaitingJobs, "0")}\u3001\u5904\u7406\u4e2d ${display(rawActiveJobs, "0")}\uff1b`
+    : "";
+  const expiredSub = expiredClosedTasks ? `\u5df2\u8fc7\u671f\u5173\u95ed ${display(expiredClosedTasks, "0")}\uff1b` : "";
+  const completionSub = !sourceFactsAvailable
+    ? `\u6e90\u6570\u636e\u6682\u4e0d\u53ef\u8bfb\uff0c\u4eca\u65e5\u5b8c\u6210\u5ea6\u4e0d\u80fd\u6309\u8c03\u5ea6\u8d26\u672c\u62cd\u677f\uff1b${schedulerSub}\u6682\u5217\u672a\u5b8c\u6210 ${display(unfinishedTasks, "0")} \u9879`
+    : `${schedulerSub}${rawSub}${expiredSub}\u6700\u7ec8\u6570\u636e\u5b8c\u6210 ${display(completedTasks, "0")} / \u4eca\u65e5\u8ba1\u5212 ${display(totalTasks, "0")}\uff1b\u672a\u5b8c\u6210 ${display(unfinishedTasks, "0")}`;
+  const lifecycleReasons = [];
+  if (!sourceFactsAvailable) lifecycleReasons.push({ reason: "\u6e90\u6570\u636e\u6682\u4e0d\u53ef\u8bfb", count: unfinishedTasks });
+  if (schedulerCompletedTasks > completedTasks) lifecycleReasons.push({ reason: "\u8c03\u5ea6\u5df2\u5904\u7406\uff0c\u7b49\u5f85\u6700\u7ec8\u6570\u636e", count: schedulerCompletedTasks - completedTasks });
+  if (rawWaitingJobs) lifecycleReasons.push({ reason: "\u539f\u59cb\u6293\u53d6\u7b49\u5f85", count: rawWaitingJobs });
+  if (waitingTasks) lifecycleReasons.push({ reason: "未到抓取时间", count: waitingTasks });
+  if (awaitingDispatchTasks) lifecycleReasons.push({ reason: "待提交抓取", count: awaitingDispatchTasks });
+  if (awaitingEvidenceTasks) lifecycleReasons.push({ reason: "等待数据结果", count: awaitingEvidenceTasks });
+  if (collectingTasks) lifecycleReasons.push({ reason: "等待抓取/产出", count: collectingTasks });
+  if (expiredClosedTasks) lifecycleReasons.push({ reason: "\u5df2\u8fc7\u671f\u5173\u95ed", count: expiredClosedTasks });
+  if (executionFailedTasks) lifecycleReasons.push({ reason: "\u8c03\u5ea6\u6267\u884c\u5931\u8d25", count: executionFailedTasks });
+  if (dataFailedJobs) lifecycleReasons.push({ reason: "\u6570\u636e\u4ea7\u51fa\u5931\u8d25", count: dataFailedJobs });
+  if (rawAuditWarnings) lifecycleReasons.push({ reason: "\u91c7\u96c6\u5ba1\u8ba1\u544a\u8b66", count: rawAuditWarnings });
+  const failedSub = failedTasks
+    ? `\u53ef\u8865 ${display(repairableFailed, "0")} \u00b7 \u4e0d\u53ef\u8865 ${display(unrepairableFailed, "0")} \u00b7 \u5f85\u786e\u8ba4 ${display(contractPendingFailed, "0")}`
+    : rawAuditWarnings
+      ? `\u91c7\u96c6\u5ba1\u8ba1\u544a\u8b66 ${display(rawAuditWarnings, "0")}\uff0c\u4e0d\u8ba1\u5931\u8d25`
+      : "\u6682\u65e0\u5931\u8d25\u4efb\u52a1\u6216\u5931\u8d25\u6570\u636e";
+  return `<section class="admin-overview panel admin-overview--${escapeClass(tone)}">
+    <div class="admin-overview-main">
+      <span>\u4eca\u65e5\u6570\u636e\u4efb\u52a1\u770b\u677f\uff1a\u53ea\u6309\u771f\u5b9e\u6e90\u6570\u636e\u548c\u8c03\u5ea6\u8d26\u672c\u5224\u5b9a\u5b8c\u6210\u5ea6\u3002</span>
+      <strong>${escapeHtml(completionText)}</strong>
+      <small>${escapeHtml(completionSub)}</small>
+      <div class="admin-progress admin-progress--${escapeClass(tone)}"><span style="width:${completionPct === null ? 0 : Math.max(0, Math.min(completionPct, 100))}%"></span></div>
+    </div>
+    <div class="admin-overview-grid admin-overview-grid--daily">
+      ${renderAdminStackMetric("今日计划任务", totalTasks, "按日周期应执行", "neutral")}
+      ${renderAdminStackMetric("\u8c03\u5ea6\u5df2\u5904\u7406", schedulerCompletedTasks, schedulerDueTasks ? `\u5df2\u5230\u65f6\u95f4 ${display(schedulerDueTasks, "0")}\uff1b\u672a\u5230\u65f6\u95f4 ${display(schedulerNotDueTasks, "0")}` : "\u8c03\u5ea6\u8d26\u672c\u5df2\u63d0\u4ea4\u6216\u53bb\u91cd", schedulerCompletedTasks ? "ok" : "neutral")}
+      ${renderAdminStackMetric("\u6700\u7ec8\u5b8c\u6210", completedTasks, "\u53ea\u8ba1\u76ee\u6807 source \u6570\u636e\u5df2\u4ea7\u51fa", completedTasks ? "ok" : "neutral")}
+      ${renderAdminStackMetric("\u672a\u5b8c\u6210", unfinishedTasks, "\u672a\u5230\u65f6\u95f4\u3001\u5f85\u63d0\u4ea4\u3001\u6267\u884c\u4e2d\u6216\u6570\u636e\u5931\u8d25", unfinishedTasks ? "warn" : "ok")}
+      ${renderAdminStackMetric("未到时间", waitingTasks, "还没到计划抓取时间", waitingTasks ? "warn" : "ok")}
+      ${renderAdminStackMetric("等待抓取/产出", processingTasks, "调度已处理但 raw/source 尚未闭环", processingTasks ? "warn" : "ok")}
+      ${renderAdminStackMetric("\u5df2\u8fc7\u671f\u5173\u95ed", expiredClosedTasks, rawCancelledJobs ? `\u539f\u59cb\u4efb\u52a1\u5173\u95ed ${display(rawCancelledJobs, "0")}` : "\u8d85\u8fc7\u65e5\u5468\u671f\u540e\u4e0d\u518d\u542f\u7528", expiredClosedTasks ? "warn" : "ok")}
+      ${renderAdminStackMetric("\u6570\u636e\u5931\u8d25", failedTasks, failedSub, failedTasks ? "danger" : rawAuditWarnings ? "warn" : "ok")}
+      ${renderAdminStackMetric("\u6570\u636e\u4ea7\u51fa", sourceRows, sourceFactsAvailable ? (latestDataUpdate ? `\u6700\u65b0 ${formatDateTimeValue(latestDataUpdate)}` : "\u7b49\u5f85 source \u4ea7\u51fa") : "\u6e90\u6570\u636e\u6682\u4e0d\u53ef\u8bfb", sourceFactsAvailable ? (sourceRows ? "ok" : "neutral") : "danger")}
+      ${renderAdminStackMetric("\u539f\u59cb\u6293\u53d6\u7b49\u5f85", rawWaitingJobs, rawActiveJobs ? `\u5904\u7406\u4e2d ${display(rawActiveJobs, "0")}` : "\u5c1a\u672a\u8fdb\u5165 source \u4ea7\u51fa", rawWaitingJobs ? "warn" : "ok")}
+    </div>
+    <div class="admin-reason-strip">${lifecycleReasons.length ? lifecycleReasons.map((item) => `<span class="admin-reason-chip admin-reason-chip--${adminReasonTone(item.reason)}">${escapeHtml(item.reason)} \u00b7 ${escapeHtml(display(item.count))}</span>`).join("") : `<span class="admin-reason-chip admin-reason-chip--ok">今日任务已完成</span>`}</div>
+  </section>`;
+}function renderAdminStackMetric(label, value, sub, tone = "neutral") {
+  return `<article class="admin-stack-metric admin-stack-metric--${escapeClass(tone)}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display(value))}</strong><small>${escapeHtml(sub || "")}</small></article>`;
+}
+
+function buildAdminDataBlockSummary(assets, tasks, gaps) {
+  const blockMap = new Map();
+  const ensureBlock = (key) => {
+    if (!blockMap.has(key)) {
+      const meta = adminAssetBlockMeta(key);
+      blockMap.set(key, {
+        key,
+        label: meta.label,
+        order: meta.order,
+        assetCount: 0,
+        dueCount: 0,
+        completedCount: 0,
+        completedDueCount: 0,
+        unresolvedCount: 0,
+        problemCount: 0,
+        unknownCount: 0,
+        repairableCount: 0,
+        unrepairableCount: 0,
+        contractPendingCount: 0,
+        notDueCount: 0,
+        taskCount: 0,
+        taskCompletedCount: 0,
+        taskWaitingCount: 0,
+        taskCollectingCount: 0,
+        taskPendingAcceptanceCount: 0,
+        taskAwaitingDispatchCount: 0,
+        taskAwaitingEvidenceCount: 0,
+        taskFailedCount: 0,
+        taskExpiredClosedCount: 0,
+        taskRepairableFailedCount: 0,
+        taskUnrepairableFailedCount: 0,
+        taskContractPendingFailedCount: 0,
+        assets: [],
+        gaps: [],
+        reasonCounts: new Map(),
+        modelSet: new Set(),
+      });
+    }
+    return blockMap.get(key);
+  };
+  (assets || []).forEach((asset) => {
+    const key = adminAssetBlockKey(asset.source_table_name);
+    const block = ensureBlock(key);
+    const gapSummary = asset.gap_summary || {};
+    const gapCount = Number(gapSummary.count || 0);
+    const reason = adminAssetProblemReason(asset);
+    const complete = adminAssetIsComplete(asset);
+    const notDue = asset?.status === "not_due";
+    const problem = adminAssetHasBlockingProblem(asset);
+    block.assetCount += 1;
+    block.dueCount += notDue ? 0 : 1;
+    block.completedCount += complete ? 1 : 0;
+    block.completedDueCount += complete && !notDue ? 1 : 0;
+    block.unresolvedCount += problem ? 1 : 0;
+    block.problemCount += problem ? 1 : 0;
+    block.unknownCount += asset?.status === "awaiting_data_result" ? 1 : 0;
+    block.repairableCount += problem && gapCount && asset.repairability?.code === "repairable_after_expiry" ? 1 : 0;
+    block.unrepairableCount += problem && gapCount && asset.repairability?.code === "non_repairable_after_window" ? 1 : 0;
+    block.contractPendingCount += problem && gapCount && asset.repairability?.code === "contract_pending" ? 1 : 0;
+    block.notDueCount += notDue ? 1 : 0;
+    block.assets.push(asset);
+    (asset.used_by_models || []).forEach((model) => block.modelSet.add(model));
+    if (problem) block.reasonCounts.set(reason, (block.reasonCounts.get(reason) || 0) + 1);
+  });
+  (tasks || []).forEach((task) => {
+    const key = adminAssetBlockKey(task.source_table_name);
+    const block = ensureBlock(key);
+    const repairCode = task.repairability?.code;
+    const status = String(task.status || "");
+    const completed = status === "completed" || status === "build_succeeded_target_check";
+    const waiting = status === "not_due";
+    const collecting = status === "collecting" || status === "queue_active";
+    const awaitingDispatch = status === "awaiting_dispatch";
+    const awaitingEvidence = status === "awaiting_evidence";
+    const expiredClosed = status === "expired_closed";
+    const failed = status === "failed" || status === "target_fact_missing" || status === "build_failed" || status === "data_failed";
+    block.taskCount += 1;
+    block.taskCompletedCount += completed ? 1 : 0;
+    block.taskWaitingCount += waiting ? 1 : 0;
+    block.taskCollectingCount += collecting ? 1 : 0;
+    block.taskAwaitingDispatchCount += awaitingDispatch ? 1 : 0;
+    block.taskAwaitingEvidenceCount += awaitingEvidence ? 1 : 0;
+    block.taskExpiredClosedCount += expiredClosed ? 1 : 0;
+    block.taskFailedCount += failed ? 1 : 0;
+    block.taskRepairableFailedCount += failed && repairCode === "repairable_after_expiry" ? 1 : 0;
+    block.taskUnrepairableFailedCount += failed && repairCode === "non_repairable_after_window" ? 1 : 0;
+    block.taskContractPendingFailedCount += failed && repairCode === "contract_pending" ? 1 : 0;
+    if (!completed) block.reasonCounts.set(adminTaskProblemReason(task), (block.reasonCounts.get(adminTaskProblemReason(task)) || 0) + 1);
+  });
+  (gaps || []).forEach((gap) => {
+    const table = gap.source_table_name || gap.target_table || gap.table_name || gap.asset_table || "";
+    const block = ensureBlock(adminAssetBlockKey(table));
+    block.gaps.push(gap);
+  });
+  return Array.from(blockMap.values()).sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
+}function adminAssetBlockKey(sourceTableName) {
+  const table = String(sourceTableName || "");
+  if (table.includes("trade_calendar") || table.includes("stock_master") || table.includes("stock_universe") || table.includes("trade_status")) return "foundation";
+  if (table.includes("daily_bar") || table.includes("adjustment_factor") || table.includes("limit_price") || table.includes("limit_event")) return "price_limit";
+  if (table.includes("realtime_quote") || table.includes("minute_bar") || table.includes("trade_tick") || table.includes("auction_snapshot")) return "intraday";
+  if (table.includes("ths_paid_limit_up_probability")) return "paid_probability";
+  if (table.includes("moneyflow") || table.includes("board")) return "flow_board";
+  if (table.includes("index_")) return "index_env";
+  if (table.includes("news")) return "news_event";
+  return "other";
+}
+
+function adminAssetBlockMeta(key) {
+  const map = {
+    foundation: { label: "基础日历/股票池", order: 10 },
+    price_limit: { label: "日线/价格/涨跌停", order: 20 },
+    intraday: { label: "盘中分钟/逐笔/竞价", order: 30 },
+    paid_probability: { label: "付费概率/候选补充", order: 40 },
+    flow_board: { label: "资金/板块", order: 50 },
+    index_env: { label: "指数环境", order: 60 },
+    news_event: { label: "新闻事件", order: 70 },
+    other: { label: "其他数据", order: 90 },
+  };
+  return map[key] || map.other;
+}
+
+function adminAssetIsComplete(asset) {
+  return Number(asset?.gap_summary?.count || 0) === 0 && asset?.status === "no_known_gap";
+}
+
+function adminAssetHasBlockingProblem(asset) {
+  if (!asset) return false;
+  if (["not_due", "awaiting_data_result"].includes(asset.status)) return false;
+  if (adminAssetIsComplete(asset)) return false;
+  if (["data_failed", "build_failed", "expired_unrepairable", "missing_repairable", "missing_unknown_repairability"].includes(asset.status)) return true;
+  if (Number(asset?.gap_summary?.count || 0) > 0) return true;
+  return (asset?.readiness_blocking_reasons || []).length > 0;
+}
+
+function adminAssetProblemReason(asset) {
+  const status = String(asset?.status || "");
+  const gapCount = Number(asset?.gap_summary?.count || 0);
+  if (status === "data_failed") return "数据产出失败";
+  if (status === "build_failed") return "构建失败";
+  if (status === "not_due") return "未到抓取时间";
+  if (status === "awaiting_data_result") return "等待数据结果";
+  if (gapCount > 0) {
+    if (asset?.repairability?.code === "non_repairable_after_window") return "不可补数据缺失";
+    if (asset?.repairability?.code === "repairable_after_expiry") return "可补数据缺失";
+    if (asset?.repairability?.code === "contract_pending") return "补救方式待确认";
+    return "数据缺失待确认";
+  }
+  if ((asset?.readiness_blocking_reasons || []).length) return "准入条件未满足";
+  return "等待数据结果";
+}
+
+function adminTaskProblemReason(task) {
+  const status = String(task?.status || "");
+  if (status === "not_due") return "未到抓取时间";
+  if (status === "awaiting_dispatch") return "待提交抓取";
+  if (status === "awaiting_evidence") return "等待数据结果";
+  if (status === "collecting" || status === "queue_active") return "等待抓取/产出";
+  if (status === "expired_closed") return "\u5df2\u8fc7\u671f\u5173\u95ed";
+  if (status === "build_failed") return "构建失败";
+  if (status === "target_fact_missing" || status === "data_failed") return "目标数据未产出";
+  if (status === "failed") return "调度执行失败";
+  if (status === "completed" || status === "build_succeeded_target_check") return "";
+  return "等待数据结果";
+}
+function adminReasonTone(reason) {
+  const text = String(reason || "");
+  if (text.includes("失败") || text.includes("缺失") || text.includes("不可补")) return "danger";
+  if (text.includes("\u8fc7\u671f")) return "warn";
+  if (text.includes("blocked") || text.includes("reject") || text.includes("failed") || text.includes("invalid")) return "blocked";
+  return "ok";
+}function adminTopReasonSummary(blocks, limit = 4) {
+  const counts = new Map();
+  (blocks || []).forEach((block) => {
+    block.reasonCounts.forEach((count, reason) => counts.set(reason, (counts.get(reason) || 0) + count));
+  });
+  return Array.from(counts.entries())
+    .map(([reason, count]) => ({ reason, count }))
+    .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason))
+    .slice(0, limit);
+}
+
+function renderAdminDataBlockBoard(blocks) {
+  const visibleBlocks = (blocks || []).filter(adminBlockNeedsAttention);
+  if (!visibleBlocks.length) {
+    return `<section class="admin-block-board" data-admin-block-board="true"><div class="admin-empty-state">今日任务均已完成，暂无需要展开的数据块。</div></section>`;
+  }
+  return `<section class="admin-block-board" data-admin-block-board="true">
+    ${visibleBlocks.map(renderAdminDataBlockCard).join("")}
+  </section>`;
+}
+function adminBlockNeedsAttention(block) {
+  return Number(block.taskWaitingCount || 0) > 0
+    || Number(block.taskCollectingCount || 0) > 0
+    || Number(block.taskPendingAcceptanceCount || 0) > 0
+    || Number(block.taskAwaitingDispatchCount || 0) > 0
+    || Number(block.taskAwaitingEvidenceCount || 0) > 0
+    || Number(block.taskExpiredClosedCount || 0) > 0
+    || Number(block.taskFailedCount || 0) > 0
+    || Number(block.problemCount || 0) > 0;
+}
+
+function renderAdminDataBlockCard(block) {
+  const unfinished = Math.max(Number(block.taskCount || 0) - Number(block.taskCompletedCount || 0), 0);
+  const pct = Number(block.taskCount || 0) > 0 ? Math.round((Number(block.taskCompletedCount || 0) / Number(block.taskCount || 0)) * 100) : null;
+  const failureCount = Number(block.taskFailedCount || 0) + Number(block.problemCount || 0);
+  const tone = failureCount || block.unrepairableCount ? "danger" : unfinished ? "warn" : "ok";
+  const reasons = Array.from(block.reasonCounts.entries()).sort((a, b) => b[1] - a[1]).slice(0, 3);
+  const statusLabel = failureCount ? "\u6570\u636e\u5931\u8d25" : unfinished ? "\u672a\u5b8c\u6210" : "\u5df2\u5b8c\u6210";
+  const failedTags = failureCount || block.repairableCount || block.unrepairableCount || block.contractPendingCount
+    ? `<div class="admin-block-card__counts"><span>可补 ${escapeHtml(display(block.taskRepairableFailedCount + block.repairableCount, "0"))}</span><span>不可补 ${escapeHtml(display(block.taskUnrepairableFailedCount + block.unrepairableCount, "0"))}</span><span>待确认 ${escapeHtml(display(block.taskContractPendingFailedCount + block.contractPendingCount, "0"))}</span></div>`
+    : "";
+  return `<article class="admin-block-card admin-block-card--${escapeClass(tone)}">
+    <div class="admin-block-card__head">
+      <div><strong>${escapeHtml(block.label)}</strong><span>\u4eca\u65e5\u8ba1\u5212 ${escapeHtml(display(block.taskCount, "0"))} \u00b7 \u5df2\u5b8c\u6210 ${escapeHtml(display(block.taskCompletedCount, "0"))} \u00b7 \u672a\u5b8c\u6210 ${escapeHtml(display(unfinished, "0"))}</span></div>
+      ${adminStatusBadge(statusLabel, tone)}
+    </div>
+    <div class="admin-progress admin-progress--${escapeClass(tone)}"><span style="width:${pct === null ? 0 : Math.max(0, Math.min(pct, 100))}%"></span></div>
+    <div class="admin-block-card__counts">
+      <span>未到时间 ${escapeHtml(display(block.taskWaitingCount, "0"))}</span><span>等待产出 ${escapeHtml(display(block.taskCollectingCount, "0"))}</span><span>待提交 ${escapeHtml(display(block.taskAwaitingDispatchCount, "0"))}</span><span>待结果 ${escapeHtml(display(block.taskAwaitingEvidenceCount, "0"))}</span><span>失败 ${escapeHtml(display(failureCount, "0"))}</span>
+    </div>
+    ${failedTags}
+    <div class="admin-block-card__reasons">${reasons.length ? reasons.map(([reason, count]) => `<span class="admin-reason-chip admin-reason-chip--${adminReasonTone(reason)}">${escapeHtml(reason)} \u00b7 ${escapeHtml(display(count))}</span>`).join("") : `<span class="admin-reason-chip admin-reason-chip--${unfinished ? "warn" : "ok"}">${unfinished ? "等待后续采集" : "已完成"}</span>`}</div>
+  </article>`;
+}
+function renderAdminExceptionList(blocks) {
+  const failedBlocks = (blocks || []).filter((block) => block.taskFailedCount || block.problemCount || block.repairableCount || block.unrepairableCount || block.contractPendingCount);
+  if (!failedBlocks.length) {
+    return `<section class="admin-exception-panel panel"><div class="panel__head"><h2 class="panel-title">失败补救</h2><span>0 块</span></div><div class="admin-empty-state">当前没有失败任务或失败数据；未到时间、待提交和等待产出不贴可补/不可补标签。</div></section>`;
+  }
+  return `<section class="admin-exception-panel panel">
+    <div class="panel__head"><h2 class="panel-title">失败补救</h2><span>${escapeHtml(display(failedBlocks.length))} 块需要处理</span></div>
+    <div class="admin-exception-list">${failedBlocks.map(renderAdminExceptionItem).join("")}</div>
+  </section>`;
+}
+
+function renderAdminExceptionItem(block) {
+  const reasons = Array.from(block.reasonCounts.entries()).sort((a, b) => b[1] - a[1]);
+  const action = adminBlockActionText(block);
+  const failureCount = Number(block.taskFailedCount || 0) + Number(block.problemCount || 0);
+  return `<article class="admin-exception-item">
+    <div class="admin-exception-item__main">
+      <strong>${escapeHtml(block.label)}</strong>
+      <span>${escapeHtml(action)}</span>
+    </div>
+    <div class="admin-exception-item__metrics">
+      <span>失败 ${escapeHtml(display(failureCount, "0"))}</span><span>可补 ${escapeHtml(display(block.taskRepairableFailedCount + block.repairableCount, "0"))}</span><span>不可补 ${escapeHtml(display(block.taskUnrepairableFailedCount + block.unrepairableCount, "0"))}</span><span>待确认 ${escapeHtml(display(block.taskContractPendingFailedCount + block.contractPendingCount, "0"))}</span>
+    </div>
+    <div class="admin-exception-item__reasons">${reasons.length ? reasons.map(([reason, count]) => `<span class="admin-reason-chip admin-reason-chip--${adminReasonTone(reason)}">${escapeHtml(reason)} · ${escapeHtml(display(count))}</span>`).join("") : `<span class="admin-reason-chip admin-reason-chip--warn">等待补救判断</span>`}</div>
+  </article>`;
+}
+
+function adminBlockActionText(block) {
+  if (block.taskUnrepairableFailedCount > 0 || block.unrepairableCount > 0) return "窗口型数据已经错过当时采集点，不允许用事后数据冒充当时事实。";
+  if (block.taskRepairableFailedCount > 0 || block.repairableCount > 0) return "可走正规补采，补完后等待今日验收。";
+  if (block.taskContractPendingFailedCount > 0 || block.contractPendingCount > 0) return "补救方式还没在合同里说清楚，需要先确认补救路径。";
+  if (block.taskFailedCount > 0 || block.problemCount > 0) return "存在失败或目标数据缺失，需要排查采集结果。";
+  return "等待后续采集结果。";
+}function renderAdminKpi(label, value, sub, tone = "neutral") {
+  return `<article class="admin-kpi admin-kpi--${escapeClass(tone)}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display(value))}</strong><small>${escapeHtml(sub || "")}</small></article>`;
+}
+
+function renderAdminUpstreamStatus(upstream) {
+  const entries = Object.entries(upstream || {});
+  if (!entries.length) return `<span class="admin-status admin-status--muted">上游读取状态未知</span>`;
+  return entries.map(([key, item]) => {
+    const status = String(item?.status || "").toLowerCase();
+    const ok = status === "ok" || status === "ready" || status === "available" || status === "read";
+    const missingInspection = key === "inspection_latest" && (status === "missing" || status === "not_found" || String(item?.message || "").includes("未生成"));
+    const tone = ok ? "ok" : missingInspection ? "warn" : "danger";
+    const label = ok ? "可读" : missingInspection ? "未生成" : "读取失败";
+    return `<span class="admin-status admin-status--${tone}">${escapeHtml(adminUpstreamLabel(key))} · ${escapeHtml(label)}</span>`;
+  }).join("");
+}function adminUpstreamLabel(key) {
+  const map = {
+    requirements: "数据合同",
+    freshness_sla: "时效合同",
+    readiness_matrix: "准入矩阵",
+    repair_routes: "补救路径",
+    queue_summary: "采集队列",
+    build_results: "构建结果",
+    build_triggers: "构建触发",
+    storage_policies: "存储策略",
+    source_schedule_registry: "任务计划",
+    source_schedule_materialized: "今日任务",
+    scheduler_runtime: "调度运行",
+    source_daily_summary: "今日数据产出",
+    scheduler_daily_summary: "调度账本",
+    inspection_latest: "今日验收",
+    inspection_gaps: "缺口明细",
+  };
+  return map[key] || "上游服务";
+}
+function adminStatusTone(status) {
+  const text = String(status || "").toLowerCase();
+  if (text.includes("danger") || text.includes("missing") || text.includes("expired") || text.includes("failed") || text.includes("blocked") || text.includes("dead") || text.includes("失败") || text.includes("缺失")) return "danger";
+  if (text.includes("warn") || text.includes("unknown") || text.includes("stale") || text.includes("unavailable") || text.includes("repairable") || text.includes("active") || text.includes("awaiting") || text.includes("not_due") || text.includes("等待") || text.includes("未到") || text.includes("采集")) return "warn";
+  if (text.includes("ok") || text.includes("succeeded") || text.includes("no_known_gap") || text.includes("ready") || text.includes("完成")) return "ok";
+  return "muted";
+}
+function adminStatusBadge(label, status) {
+  return `<span class="admin-status admin-status--${adminStatusTone(status || label)}">${escapeHtml(display(label || businessStatusLabel(status)))}</span>`;
+}
+function renderAdminAssetTable(rows) {
+  return `<div class="admin-table-wrap"><table class="admin-table admin-table--assets">
+          <thead><tr><th>准备度维度</th><th>优先级</th><th>权重</th><th>覆盖</th><th>缺失分</th></tr></thead>
+    <tbody>${renderAdminAssetRows(rows)}</tbody>
+  </table></div>`;
+}
+
+function renderAdminAssetRows(rows) {
+  if (!rows.length) return renderEmptyTableRow(8, "没有读到数据资产合同。");
+  return rows.map((row) => {
+    const fields = (row.fields || []).slice(0, 4).join(" / ");
+    const missing = row.known_missing_field_count ?? row.gap_summary?.count ?? null;
+    const total = row.required_field_count ?? null;
+    const build = row.latest_build;
+    const buildText = build ? `${businessStatusLabel(build.status)} · ${formatDateTimeValue(build.finished_at)}` : "-";
+    const buildRows = build ? `raw ${display(build.raw_row_count)} / source ${display(build.source_row_count)} / lineage ${display(build.lineage_row_count)}` : "";
+    const gapCodes = (row.gap_summary?.top_codes || []).join(" / ");
+    return `<tr>
+      <td data-label="数据资产"><strong>${escapeHtml(display(row.asset_label || row.source_table_name))}</strong><small>${escapeHtml(display(row.source_table_name))}${fields ? ` · ${escapeHtml(fields)}` : ""}</small></td>
+      <td data-label="优先级">${escapeHtml(display(row.priority))}</td>
+      <td data-label="生命周期"><strong>${escapeHtml(display(row.lifecycle?.label))}</strong><small>${escapeHtml(display(row.lifecycle?.expected_at))} - ${escapeHtml(display(row.lifecycle?.latest_acceptable_at))}</small></td>
+      <td data-label="补全属性"><strong>${escapeHtml(display(row.repairability?.label))}</strong><small>${escapeHtml(display(row.repairability?.reason))}</small></td>
+      <td data-label="完成/缺失"><strong>${escapeHtml(display(row.known_completed_field_count))}/${escapeHtml(display(total))}</strong><small>缺失 ${escapeHtml(display(missing))}</small></td>
+      <td data-label="最新构建"><strong>${escapeHtml(buildText)}</strong><small>${escapeHtml(buildRows || build?.note || "-")}</small></td>
+      <td data-label="巡检缺口"><strong>P0 ${escapeHtml(display(row.gap_summary?.p0_count))} / P1 ${escapeHtml(display(row.gap_summary?.p1_count))}</strong><small>${escapeHtml(gapCodes || "-")}</small></td>
+      <td data-label="状态">${adminStatusBadge(row.status_label, row.status)}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderAdminTaskTable(rows) {
+  return `<div class="admin-table-wrap"><table class="admin-table admin-table--tasks">
+        <thead><tr><th>股票</th><th>梯队</th><th>首次涨停时间</th><th>最后涨停时间</th><th>形态</th><th>涨停原因</th><th>同花顺次日概率</th><th>状态</th></tr></thead>
+    <tbody>${renderAdminTaskRows(rows)}</tbody>
+  </table></div>`;
+}
+
+function renderAdminTaskRows(rows) {
+  if (!rows.length) return renderEmptyTableRow(7, "今天没有读到已物化调度任务。");
+  return rows.map((row) => {
+    const scope = [row.universe_scope, row.symbol_count ? `${row.symbol_count} 只` : null, row.trigger_type].filter(Boolean).join(" · ") || "-";
+    const buildText = [row.fetch_batch_id ? `batch ${row.fetch_batch_id}` : null, row.latest_build_status ? businessStatusLabel(row.latest_build_status) : null].filter(Boolean).join(" · ") || "-";
+    const target = `P0 ${display(row.gap_summary?.p0_count)} / 缺口 ${display(row.gap_summary?.count)}`;
+    return `<tr>
+      <td data-label="任务"><strong>${escapeHtml(display(row.schedule_code))}</strong><small>${escapeHtml(display(row.schedule_group))}</small></td>
+      <td data-label="数据资产"><strong>${escapeHtml(display(row.asset_label || row.source_table_name))}</strong><small>${escapeHtml(display(row.source_table_name))}</small></td>
+      <td data-label="计划时间"><strong>${escapeHtml(formatDateTimeValue(row.scheduled_at_local || row.scheduled_at))}</strong><small>${escapeHtml(display(row.run_slot || row.trading_day))}</small></td>
+      <td data-label="范围">${escapeHtml(scope)}</td>
+      <td data-label="抓取/构建"><strong>${escapeHtml(buildText)}</strong><small>${escapeHtml(formatDateTimeValue(row.latest_build_finished_at))}</small></td>
+      <td data-label="目标事实"><strong>${escapeHtml(target)}</strong><small>source ${escapeHtml(display(row.source_row_count))} / lineage ${escapeHtml(display(row.lineage_row_count))}</small></td>
+      <td data-label="状态">${adminStatusBadge(row.status_label, row.status)}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderAdminGapTable(rows) {
+  return `<div class="admin-table-wrap"><table class="admin-table admin-table--gaps">
+          <thead><tr><th>准备度维度</th><th>优先级</th><th>权重</th><th>覆盖</th><th>缺失分</th></tr></thead>
+    <tbody>${renderAdminGapRows(rows)}</tbody>
+  </table></div>`;
+}
+
+function renderAdminGapRows(rows) {
+  if (!rows.length) return renderEmptyTableRow(6, "当前巡检没有返回缺口明细。");
+  return rows.map((row) => {
+    const table = row.source_table_name || row.target_table || row.table_name || row.asset_table || "-";
+    const subject = [row.canonical_symbol || row.symbol, row.trade_date || row.as_of_date || row.as_of_trading_day].filter(Boolean).join(" · ") || "-";
+    const actions = Array.isArray(row.repair_actions) ? row.repair_actions.map((item) => item.action_code || item.code || item.action || item).join(" / ") : (row.repair_action || row.recommended_action || row.remediation || "-");
+    return `<tr>
+      <td data-label="数据资产"><strong>${escapeHtml(display(table))}</strong><small>${escapeHtml(display(row.domain || row.scope))}</small></td>
+      <td data-label="字段">${escapeHtml(display(row.field_name || row.canonical_field_name || row.target_field))}</td>
+      <td data-label="等级">${adminStatusBadge(row.severity || row.priority, row.severity || row.priority)}</td>
+      <td data-label="缺口码"><strong>${escapeHtml(display(row.gap_code || row.gap_type || row.domain_code))}</strong><small>${escapeHtml(display(row.message || row.description))}</small></td>
+      <td data-label="对象">${escapeHtml(subject)}</td>
+      <td data-label="补救动作">${escapeHtml(display(actions))}</td>
+    </tr>`;
+  }).join("");
+}
+
+function bindAdminOpsActions(pageEpoch, routeKey) {
+  const reloadButton = $("[data-action='reload-admin-board']");
+  const dateInput = $("#admin-board-date");
+  const detailPanel = $("[data-admin-audit-details='true']");
+  reloadButton?.addEventListener("click", async () => {
+    const value = dateInput?.value || adminBoardDefaultTradeDate();
+    state.adminBoard.tradeDate = value;
+    renderAdminOpsPage({ pageEpoch, routeKey, forceRefresh: true });
+  });
+  dateInput?.addEventListener("change", (event) => {
+    state.adminBoard.tradeDate = event.target.value || adminBoardDefaultTradeDate();
+    state.adminBoard.detailsOpen = false;
+    state.adminBoard.detailError = null;
+    renderAdminOpsPage({ pageEpoch, routeKey, forceRefresh: true });
+  });
+  detailPanel?.addEventListener("toggle", (event) => {
+    state.adminBoard.detailsOpen = Boolean(event.target.open);
+    if (state.adminBoard.detailsOpen && !adminDailyBoardLoaded(state.adminBoard.data)) {
+      hydrateAdminDailyBoard(pageEpoch, routeKey).catch(() => {});
+    }
+  });
+}
+
 async function renderPage(pageEpoch = state.pageEpoch, routeKey = state.route) {
   if (routeKey === "candidates") return renderCandidatePage({ pageEpoch, routeKey });
   if (routeKey === "research-ambush-valley") return renderAmbushValleyResearchPage({ pageEpoch, routeKey });
+  if (routeKey === "admin-ops") return renderAdminOpsPage({ pageEpoch, routeKey });
   if (MODEL_PROFILES[routeKey]) return renderModelPage(MODEL_PROFILES[routeKey], { pageEpoch, routeKey });
   state.route = "candidates";
   location.hash = "#/candidates";
@@ -868,6 +1664,24 @@ function formatDateTimeValue(value) {
   if (value === null || value === undefined || value === "") return "-";
   const text = String(value).trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  const normalized = text.replace(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})/, "$1T$2");
+  if (/(?:Z|[+-]\d{2}:?\d{2})$/.test(normalized)) {
+    const parsed = new Date(normalized);
+    if (!Number.isNaN(parsed.getTime())) {
+      const parts = new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "Asia/Shanghai",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23",
+      }).formatToParts(parsed);
+      const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+      return `${byType.year}-${byType.month}-${byType.day} ${byType.hour}:${byType.minute}:${byType.second}`;
+    }
+  }
   return text.replace("T", " ").replace(/\.\d+(?:Z|[+-]\d{2}:?\d{2})?$/, "").replace(/(?:Z|[+-]\d{2}:?\d{2})$/, "");
 }
 
@@ -963,7 +1777,7 @@ function candidateReadDetail() {
     return `没有读到 ${candidateRequestedTradeDateLabel()} 的候选；系统只看到 ${source.fallbackTradeDate || "其他日期"} 的历史记录，当前页不拿历史记录冒充当前候选。`;
   }
   if (source.sourceReadState === "read_failed") return "候选事实暂时不可读，页面保持空态。";
-  return "正在等待当天涨停事实。";
+    return "读取失败，页面已保留中文空态。";
 }
 
 function modelBusinessName(value) {
@@ -1077,7 +1891,7 @@ function programStatusFallback(key) {
   if (key.includes("watch")) return "观察中";
   if (key.includes("passed")) return "通过";
   if (key.includes("ready")) return "就绪";
-  return "待核验状态";
+    return "读取失败，页面已保留中文空态。";
 }
 
 function isClosedLimitCandidate(row) {
@@ -1211,7 +2025,7 @@ function formatRatioPercent(value) {
 function hotTierLabel(value) {
   const number = Number(value);
   if (Number.isFinite(number) && number > 0) return `${number}板`;
-  return "梯队暂未发布";
+    return "读取失败，页面已保留中文空态。";
 }
 
 function candidateBatchTypeLabel(value) {
@@ -1227,7 +2041,7 @@ function candidateStatusLabel(status) {
   const map = {
     standard_source_loaded: "已读到候选",
     waiting_probability: "等待自动抓取",
-    empty: "暂无候选",
+  empty: "空",
     partial_source: "部分数据降级",
   };
   return map[String(status || "")] || businessStatusLabel(status || "waiting");
@@ -1235,12 +2049,12 @@ function candidateStatusLabel(status) {
 
 function candidateAuditLabel(status) {
   const map = {
-    ready: "概率已入库",
-    passed: "已通过",
+  ready: "就绪",
+  passed: "通过",
     blocked: "阻断",
     pending: "等待抓取",
     not_applicable: "等待候选",
-    warning: "待复核",
+  warning: "预警",
     fetching: "自动抓取中",
     partial: "部分入库",
     pending_cookie: "等待登录 Cookie",
@@ -1273,7 +2087,7 @@ function paidProbabilityCookieStatusLabel(status) {
     valid: "Cookie 可用",
     expired: "已失效",
     invalid: "不可用",
-    read_failed: "状态读取中",
+    read_failed: "读取失败",
   };
   return map[String(status || "missing")] || "待核验";
 }
@@ -1284,9 +2098,9 @@ function paidProbabilityBatchStatusLabel(status) {
     pending_cookie: "等待登录 Cookie",
     fetching: "自动抓取中",
     partial: "部分入库",
-    ready: "概率已入库",
+  ready: "就绪",
     cookie_expired: "登录 Cookie 已失效",
-    abandoned_no_probability_before_deadline: "已放弃本批",
+    abandoned_no_probability_before_deadline: "本批已放弃",
     status_unknown: "状态读取中",
   };
   return map[String(status || "status_unknown")] || "状态读取中";
@@ -1345,7 +2159,7 @@ function paidProbabilityRowStatusInfo(item) {
   if (status === "partial") {
     return { label: "部分入库", tone: "warning", detail: `截止 ${paidProbabilityDeadlineLabel(batchStatus)} 前继续抓取` };
   }
-  return { label: "自动抓取中", tone: "warning", detail: `未到 ${paidProbabilityDeadlineLabel(batchStatus)} 不放弃` };
+    return { label: "部分入库", tone: "warning", detail: `截止 ${paidProbabilityDeadlineLabel(batchStatus)} 前继续抓取` };
 }
 
 function formatLimitUpTime(value) {
@@ -1372,9 +2186,9 @@ function buildLimitUpPatternTag(item) {
   const last = formatLimitUpTime(item.last_limit_up_at || item.last_limit_up_time || item.first_limit_up_at || item.first_limit_up_time || item.limit_up_time);
   if (limitUpType.includes("一字")) return "一字板";
   if (limitUpType.includes("T字")) return "T字板";
-  if (Number.isFinite(openCount) && openCount > 0) return `开板${openCount}次`;
+  if (Number.isFinite(openCount) && openCount > 0) return `开板${openCount}次回封`;
   if (first !== "等待真实时间" && last !== "等待真实时间" && first !== last) return "回封";
-  if (limitUpType.includes("换手")) return "换手板";
+  if (limitUpType.includes("一字")) return "一字板";
   return "封板";
 }
 
@@ -1801,7 +2615,7 @@ function candidateEditorFooterText(stats) {
   if (stats.cookieStatus === "read_failed" || stats.batchStatus === "status_unknown") return "状态暂未读到，不判定 Cookie 失效；页面不会展示编辑入口。";
   if (stats.missingCount) return `还缺 ${stats.missingCount} 只概率，未到放弃时间前保持阻断等待。`;
   if (stats.invalidProbability) return "存在超出 0-100 的概率，请先修正。";
-  return "付费概率已入库，候选榜展示保持只读。";
+    return "读取失败，页面已保留中文空态。";
 }
 
 function renderCandidateProbabilityRow(item, index) {
@@ -1862,7 +2676,7 @@ function renderCandidateSourceEvidencePanel(items) {
 function candidateSourceEvidenceRows(items) {
   return [...(items || [])]
     .map((item) => {
-      const openCount = Number(item.limit_up_open_count ?? item.open_num);
+  const openCount = Number(item.limit_up_open_count ?? item.open_num);
       return {
         item,
         openCount: Number.isFinite(openCount) ? openCount : null,
@@ -2144,16 +2958,16 @@ function renderModelComparisonPlan(profile) {
     ],
     memory: [
       ["旧前端", "展示记忆池、二波触发、有效期、买点和结果。"],
-      ["当前可用", "可从历史收盘封板候选构建记忆种子和出现次数；正式记忆实体尚未只读物化。"],
+      ["缺口处理", "缺概率、缺买点或闸门阻断时直接写明待补事实。"],
       ["本轮落地", "把列表改为候选记忆种子视图，展示首次/最近候选日、出现次数、自然日龄和缺口。"],
     ],
     ambush: [
       ["旧前端", "展示谷底观察、有效抬头、回落风险和买点。"],
-      ["当前可用", "前复权日线可形成低谷样本窗口；模型三决策列表尚未物化。"],
+      ["缺口处理", "缺概率、缺买点或闸门阻断时直接写明待补事实。"],
       ["本轮落地", "构建低谷候选列表；图形打标后续放在研究中心-低谷图库，不放在模型列表。"],
     ],
     tboard: [
-      ["旧前端", "旧版没有模型四页面。"],
+      ["旧前端", "旧版没有模型四页。"],
       ["当前可用", "模型四只读观察台只纳入 Day1 通过对象。"],
       ["本轮落地", "页面只保留模型分、Day1、Day2、监测时间、当前判断、接力强度、关键依据、风险结论和更新。"],
     ],
@@ -2180,12 +2994,12 @@ function renderModelDecisionBrief(profile, rows) {
     memory: [
       ["当前答案", rows.length ? `${rows.length} 个记忆种子` : "等待历史种子", "由历史涨停候选按股票聚合，未冒充正式记忆实体。"],
       ["优质机会", rows.filter((row) => Number(row.appearance_count || 0) > 1).length ? `${rows.filter((row) => Number(row.appearance_count || 0) > 1).length} 只复现候选` : "等待二波证据", "多次出现只表示候选复现，不等于二波激活。"],
-      ["证据风险", gaps ? `${gaps} 个缺口` : "标准事实无缺口", "交易日龄、有效期、模型分、买点和结果未物化时保持空态。"],
+      ["待补事实", gaps ? `${gaps} 个待补事实` : "事实完整", "概率、买点、验证或闸门缺失时逐行说明。"],
     ],
     ambush: [
-      ["当前答案", rows.length ? `${rows.length} 个低谷样本` : "等待日线样本", "由前复权日线构建低谷图库候选。"],
+      ["当前答案", rows.length ? `${rows.length} 个记忆种子` : "等待历史种子", "由历史涨停候选按股票聚合，未冒充正式记忆实体。"],
       ["优质机会", rows.filter((row) => ["valley_stabilization", "horizontal_breakout_watch"].includes(row.shape_type)).length ? `${rows.filter((row) => ["valley_stabilization", "horizontal_breakout_watch"].includes(row.shape_type)).length} 个可复核结构` : "等待图库成熟", "结构分层用于人工复核，不直接改模型正式结论。"],
-      ["证据风险", gaps ? `${gaps} 个缺口` : "标准事实无缺口", "模型三决策仓库和标注仓库未接入前保持空态。"],
+      ["待补事实", gaps ? `${gaps} 个待补事实` : "事实完整", "概率、买点、验证或闸门缺失时逐行说明。"],
     ],
     tboard: [
       ["观察对象", rows.length ? `${rows.length} 条` : "暂无", "Day1 通过才显示。"],
@@ -2330,8 +3144,8 @@ function renderModelFieldCoverage(profile, rows) {
   return `<section class="model-field-coverage">
     <div class="model-field-coverage__head">
       <div>
-        <strong>字段覆盖矩阵</strong>
-        <span>把旧前端主列拆成事实来源、覆盖率和缺口处理；缺数据只显示缺口，不补事实。</span>
+      <strong>规划与差异对比</strong>
+      <span>旧前端只作布局和字段密度参考；新页面只展示当前标准事实和模型服务事实。</span>
       </div>
       <b>${escapeHtml(String(total))} 行</b>
     </div>
@@ -2339,7 +3153,7 @@ function renderModelFieldCoverage(profile, rows) {
     <div class="model-field-coverage__grid">
       <div class="model-iteration-table-wrap">
         <table class="model-iteration-table model-field-coverage-table">
-          <thead><tr><th>字段块</th><th>事实来源</th><th>覆盖</th><th>状态</th><th>处理</th></tr></thead>
+          <thead><tr><th>准备度维度</th><th>优先级</th><th>权重</th><th>覆盖</th><th>缺失分</th></tr></thead>
           <tbody>${coverageRows.map(([label, source, count, emptyStatus, handling]) => {
             const status = coverageStatus(count, total, emptyStatus);
             return `<tr>
@@ -2480,7 +3294,7 @@ function modelReviewKpis(profile, rawRows, visibleRows) {
   if (profile.key === "memory") {
     const multi = rawRows.filter((row) => Number(row.appearance_count || 0) > 1).length;
     return [
-      { label: "记忆种子", value: visibleRows.length, tone: visibleRows.length ? "ready" : "warning", sub: "筛选后" },
+      { label: "列表记录", value: visibleRows.length, tone: visibleRows.length ? "ready" : "warning", sub: "筛选后" },
       { label: "多次出现", value: multi, tone: multi ? "ready" : "warning", sub: "候选复现" },
       { label: "未物化", value: rawRows.filter((row) => row.memory_state === "blocked_data_gap").length, tone: "warning", sub: "保留缺口" },
       { label: "数据缺口", value: gapRows.length, tone: gapRows.length ? "warning" : "ready", sub: "逐行保留" },
@@ -2488,15 +3302,15 @@ function modelReviewKpis(profile, rawRows, visibleRows) {
   }
   if (profile.key === "ambush") {
     return [
-      { label: "低谷样本", value: visibleRows.length, tone: visibleRows.length ? "ready" : "warning", sub: "筛选后" },
+      { label: "列表记录", value: visibleRows.length, tone: visibleRows.length ? "ready" : "warning", sub: "筛选后" },
       { label: "图库样本", value: rawRows.length, tone: rawRows.length ? "ready" : "warning", sub: "只读候选" },
       { label: "图形打标", value: "研究中心", tone: "warning", sub: "后续低谷图库" },
       { label: "数据缺口", value: gapRows.length, tone: gapRows.length ? "warning" : "ready", sub: "逐行保留" },
     ];
   }
   return [
-    { label: "列表记录", value: visibleRows.length, tone: visibleRows.length ? "ready" : "warning", sub: "筛选后" },
-    { label: "数据缺口", value: gapRows.length, tone: gapRows.length ? "warning" : "ready", sub: "逐行保留" },
+      { label: "列表记录", value: visibleRows.length, tone: visibleRows.length ? "ready" : "warning", sub: "筛选后" },
+      { label: "数据缺口", value: gapRows.length, tone: gapRows.length ? "warning" : "ready", sub: "逐行保留" },
   ];
 }
 
@@ -2659,12 +3473,49 @@ function tBoardTerminalDateKey(item) {
   );
 }
 
-function tBoardIsStaleStopped(item) {
+function marketTimeMinutes() {
+  try {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Asia/Shanghai",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(new Date()).reduce((acc, part) => {
+      acc[part.type] = part.value;
+      return acc;
+    }, {});
+    if (parts.hour && parts.minute) return Number(parts.hour) * 60 + Number(parts.minute);
+  } catch (_) {
+    // If timezone formatting is unavailable, fall back to local clock time.
+  }
+  const now = new Date();
+  return now.getHours() * 60 + now.getMinutes();
+}
+
+function nextWeekdayDateKey(dayKey) {
+  const match = String(dayKey || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return "";
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  do {
+    date.setUTCDate(date.getUTCDate() + 1);
+  } while (date.getUTCDay() === 0 || date.getUTCDay() === 6);
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
+}
+
+function tBoardDay2WindowElapsed(item) {
+  const day1 = dateKey(item?.day1_trade_date);
+  const expectedDay2 = dateKey(item?.day2_trade_date) || nextWeekdayDateKey(day1);
+  const today = marketDateKey();
+  if (!expectedDay2 || !today) return false;
+  if (today > expectedDay2) return true;
+  if (today < expectedDay2) return false;
+  return marketTimeMinutes() >= TBOARD_DAY2_WINDOW_END_MINUTES;
+}
+
+function tBoardShouldHideDefault(item) {
   const status = String(item?.observation_status || "").toLowerCase();
-  if (status !== "stopped") return false;
-  const terminalDate = tBoardTerminalDateKey(item);
-  const ageDays = dateDiffDays(terminalDate, marketDateKey());
-  return ageDays !== null && ageDays > TBOARD_STOPPED_DEFAULT_VISIBLE_DAYS;
+  if (TBOARD_DEFAULT_HIDDEN_STATUSES.has(status)) return true;
+  return status === "data_wait" && tBoardDay2WindowElapsed(item);
 }
 
 function valueWithGap(row, key) {
@@ -2748,7 +3599,7 @@ function valleyMaturityHint(barCount, daysSinceLow, reboundPct) {
   if (barCount < 20) return "样本不足";
   if (daysSinceLow <= 2) return "刚抬头";
   if (daysSinceLow <= 8 && Number(reboundPct || 0) <= 12) return "观察成熟";
-  return "需复核";
+    return "读取失败，页面已保留中文空态。";
 }
 
 function turnFreshnessBucket(daysSinceLow) {
@@ -2925,9 +3776,9 @@ function tBoardRelayStrengthText(item) {
 
 function tBoardConclusionText(item) {
   const reason = tBoardStoppedReason(item);
-  if (reason === "board_open") return "已开板，停止观察";
-  if (reason === "sell_pressure") return "卖压占优，停止观察";
-  if (reason === "not_triggered") return "未触发，停止观察";
+  if (reason === "board_open") return "封板失败";
+  if (reason === "sell_pressure") return "卖压占优";
+  if (reason === "not_triggered") return "未触发";
   const status = String(item?.observation_status || "").toLowerCase();
   if (status === "opportunity") return "已触发，继续看封板";
   if (status === "continue_watch") return "继续观察";
@@ -2941,7 +3792,7 @@ function tBoardKeyReasonText(item) {
   const keyReason = String(item?.key_reason || "").trim();
   const fullText = tBoardFactText(item);
   const reason = tBoardStoppedReason(item);
-  if (reason === "board_open") return "触发后开板，封板没守住";
+  if (reason === "board_open") return "封板失败";
   if (reason === "sell_pressure") return "接近涨停，卖盘往下砸";
   if (reason === "not_triggered") return "5 分钟监测未接近涨停";
   if (["买盘主动扫掉卖盘", "主动买盘扫掉卖盘", "买盘扫卖盘"].some((token) => fullText.includes(token))) return "接近涨停，买盘扫掉卖盘";
@@ -2955,17 +3806,17 @@ function tBoardKeyReasonText(item) {
 function tBoardRiskText(item) {
   const risk = String(item?.risk_tip || "").trim();
   const reason = tBoardStoppedReason(item);
-  if (reason === "board_open") return "封板没守住，次日退出风险高";
-  if (reason === "sell_pressure") return "卖盘往下砸，买入确认失败";
-  if (reason === "not_triggered") return "没有接近涨停，接力不足";
+  if (reason === "board_open") return "封板失败";
+  if (reason === "sell_pressure") return "卖压占优";
+  if (reason === "not_triggered") return "未触发";
   const emptyDisclaimerTokens = ["仅作" + "观察", "不自动" + "下单", "不代表" + "买入建议", "不构成" + "投资建议"];
   const emptyDisclaimer = emptyDisclaimerTokens.some((token) => risk.includes(token));
   if (risk && !emptyDisclaimer) return risk;
   const status = String(item?.observation_status || "").toLowerCase();
   if (status === "opportunity") return "已触发，重点看收盘前能否封住";
   if (status === "continue_watch") return "还没触发，等下一次 5 分钟监测";
-  if (status === "data_wait") return "盘口数据不齐，先不确认";
-  if (status === "stopped") return "条件失效，停止跟踪";
+  if (status === "data_wait") return "数据缺口";
+  if (status === "stopped") return "已停止";
   return risk;
 }
 
@@ -2977,7 +3828,7 @@ function tBoardUpdateText(lastModelOutputAt, latestDataFetchAt) {
 
 function buildTBoardListRows(extra) {
   const items = arrayFromResponse(extra.observation_board?.data)
-    .filter((item) => !tBoardIsStaleStopped(item));
+    .filter((item) => !tBoardShouldHideDefault(item));
   return items.map((item) => {
     const latestDataFetchAt = item.latest_data_fetch_at || item.last_data_captured_at || null;
     const lastModelOutputAt = item.last_model_output_at || item.model_evaluated_at || null;
@@ -3300,9 +4151,9 @@ function renderAmbushValleyResearchWorkbench() {
   return `<section class="research-workbench ambush-valley-workbench">
     <div class="research-hero ${cases.length ? "research-hero--ready" : "research-hero--empty"}">
       <div>
-        <span class="hot-mini-label">模型三研究中心</span>
-        <strong>低谷图形标注中心</strong>
-        <p>把人工低谷经验沉淀为可复核、可训练、可研究的结构化样本。这里写入研究资产，不改模型分数、发布状态或交易事实。</p>
+      <span class="hot-mini-label">当前候选草稿</span>
+      <strong>规划与差异对比</strong>
+        <p>把人工低谷经验沉淀为可复核、可追溯、可研究的结构化样本。这里写入研究资产，不改模型分数、发布状态或交易事实。</p>
       </div>
       <dl>
         <div><dt>样本数量</dt><dd>${escapeHtml(cases.length)}</dd></div>
@@ -3347,7 +4198,7 @@ function renderAmbushValleyCaseCreateForm() {
     <label>样本日期<input name="${AMBUSH_VALLEY_FORM_KEYS.sampleDate}" class="field" type="date"></label>
     <label>低点日期<input name="${AMBUSH_VALLEY_FORM_KEYS.valleyLowDate}" class="field" type="date"></label>
     <label>抬头日期<input name="${AMBUSH_VALLEY_FORM_KEYS.turnDate}" class="field" type="date"></label>
-    <button class="primary-button" type="submit">登记样本</button>
+      <button class="primary-button" type="submit">保存并抓取</button>
   </form>`;
 }
 
@@ -3444,7 +4295,7 @@ function renderAmbushTaxonomyCheck(item) {
 
 function renderAmbushTaxonomyPreview(taxonomy) {
   return `<div class="research-taxonomy-preview">
-    <strong>当前可用标注项</strong>
+      <strong>规划与差异对比</strong>
     <div>${taxonomy.length ? taxonomy.slice(0, 8).map((item) => `<span>${escapeHtml(item.tag_name)}</span>`).join("") : "<span>等待研究服务</span>"}</div>
   </div>`;
 }
@@ -3479,7 +4330,7 @@ async function submitAmbushValleyCase(event) {
   const symbol = String(formData.get(AMBUSH_VALLEY_FORM_KEYS.stockCode) || "").trim().toUpperCase();
   const tradeDate = String(formData.get(AMBUSH_VALLEY_FORM_KEYS.sampleDate) || "").trim();
   if (!symbol || !tradeDate) {
-    toast("请填写股票代码和样本日期。");
+    toast("暂未读到可抓取的候选交易日。");
     return;
   }
   const payload = {
@@ -3494,7 +4345,7 @@ async function submitAmbushValleyCase(event) {
   };
   try {
     const result = await researchApi("research/ambush/valley-chart/cases", { method: "POST", body: payload, timeoutMs: FRONTEND_DEFAULT_TIMEOUT_MS });
-    toast("低谷样本已登记。");
+    toast("暂未读到可抓取的候选交易日。");
     state.ambushValley.loaded = false;
     state.ambushValley.selectedCaseId = result.item?.chart_case_id || state.ambushValley.selectedCaseId;
     await renderAmbushValleyResearchPage({ pageEpoch: state.pageEpoch, routeKey: state.route });
@@ -3527,7 +4378,7 @@ async function submitAmbushValleyLabel(event) {
   };
   try {
     await researchApi(`research/ambush/valley-chart/cases/${encodeURIComponent(chartCaseId)}/labels`, { method: "POST", body: payload, timeoutMs: FRONTEND_DEFAULT_TIMEOUT_MS });
-    toast("标注已保存到研究资产。");
+    toast("暂未读到可抓取的候选交易日。");
     state.ambushValley.loaded = false;
     await renderAmbushValleyResearchPage({ pageEpoch: state.pageEpoch, routeKey: state.route });
   } catch (error) {

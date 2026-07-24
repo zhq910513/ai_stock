@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -260,6 +260,13 @@ def _day2_watch_window_complete(day2_watch: dict[str, Any]) -> bool:
     return seconds is not None and seconds >= DAY2_WATCH_WINDOW_END.hour * 3600 + DAY2_WATCH_WINDOW_END.minute * 60
 
 
+def _next_weekday(day_value: date) -> date:
+    next_day = day_value + timedelta(days=1)
+    while next_day.weekday() >= 5:
+        next_day += timedelta(days=1)
+    return next_day
+
+
 def _day2_window_elapsed(day1_trade_date: Any) -> bool:
     day1 = _parse_iso_date(day1_trade_date)
     if day1 is None:
@@ -267,7 +274,12 @@ def _day2_window_elapsed(day1_trade_date: Any) -> bool:
     now = datetime.now(MARKET_TIMEZONE)
     if now.date().weekday() >= 5:
         return False
-    return now.date() > day1 and now.time() >= DAY2_WATCH_WINDOW_END
+    day2 = _next_weekday(day1)
+    if now.date() > day2:
+        return True
+    if now.date() < day2:
+        return False
+    return now.time() >= DAY2_WATCH_WINDOW_END
 
 
 def _last_monitor_time(
@@ -969,6 +981,16 @@ def _is_model_result_snapshot(snapshot: dict[str, Any]) -> bool:
     return _snapshot_interval_minutes(snapshot) >= MODEL_RESULT_INTERVAL_MINUTES
 
 
+def _monitor_snapshot_can_override_projection_fields(item: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+    current_status = str(item.get("observation_status") or "").lower()
+    snapshot_status = str(snapshot.get("observation_status") or "").lower()
+    if current_status in {"stopped", "completed"} and snapshot_status != current_status:
+        return False
+    if current_status == "data_wait" and snapshot_status in {"continue_watch", "opportunity", ""}:
+        return False
+    return True
+
+
 def _apply_projection_snapshot_metadata(item: dict[str, Any], snapshot: dict[str, Any] | None) -> dict[str, Any]:
     if not snapshot:
         return item
@@ -984,24 +1006,25 @@ def _apply_monitor_snapshot(item: dict[str, Any], snapshot: dict[str, Any] | Non
     if not snapshot or not _is_model_result_snapshot(snapshot) or not _snapshot_newer_than_item(snapshot, item):
         return item
     merged = dict(item)
-    for field in (
-        "observation_status",
-        "current_stage",
-        "current_conclusion",
-        "next_observation",
-        "key_reason",
-        "risk_tip",
-        "model_score",
-        "model_score_label",
-        "score_state",
-        "model_score_version",
-        "relay_strength_label",
-        "monitoring_summary",
-        "data_gap_count",
-        "data_gap_labels",
-    ):
-        if snapshot.get(field) is not None:
-            merged[field] = snapshot.get(field)
+    if _monitor_snapshot_can_override_projection_fields(item, snapshot):
+        for field in (
+            "observation_status",
+            "current_stage",
+            "current_conclusion",
+            "next_observation",
+            "key_reason",
+            "risk_tip",
+            "model_score",
+            "model_score_label",
+            "score_state",
+            "model_score_version",
+            "relay_strength_label",
+            "monitoring_summary",
+            "data_gap_count",
+            "data_gap_labels",
+        ):
+            if snapshot.get(field) is not None:
+                merged[field] = snapshot.get(field)
     snapshot_time = snapshot.get("captured_at") or snapshot.get("as_of_time")
     merged["last_model_output_at"] = snapshot_time
     merged["model_evaluated_at"] = snapshot_time

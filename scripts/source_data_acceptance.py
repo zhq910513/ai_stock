@@ -297,7 +297,8 @@ def materialize_probe_params(row: dict[str, Any], trade_date: str, today: date |
     provider = row.get("provider")
     api_name = row.get("api_name")
     if provider == "baostock" and api_name == "query_adjust_factor":
-        params["code"] = "sz.000001"
+        # Use a historically adjusted A-share sample; sz.000001 can legitimately return zero adjustment rows.
+        params["code"] = "sz.000063"
         params["start_date"] = "1990-01-01"
         params["end_date"] = iso_date
     if provider == "baostock" and api_name == "query_all_stock":

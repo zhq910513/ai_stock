@@ -99,6 +99,51 @@ def _session_minute_ranges(
     return tuple(item for start, end in sessions for item in _minute_range(start, end, step_seconds))
 
 
+def _same_day_at(local_dt: datetime, value: time) -> datetime:
+    return datetime.combine(local_dt.date(), value).replace(tzinfo=local_dt.tzinfo)
+
+
+def _lifecycle_expires_at_local(spec: SourceFetchScheduleSpec, local_dt: datetime) -> datetime:
+    if spec.schedule_group in {"minute_auction", "minute_intraday", "t_relay_day2_window"}:
+        return local_dt + timedelta(minutes=10)
+    if spec.schedule_group == "daily_preopen":
+        return _same_day_at(local_dt, time(23, 59, 59))
+    if spec.schedule_group in {"t_relay_day1_window", "t_relay_day1_candidate_facts"}:
+        return local_dt + timedelta(minutes=20)
+    if spec.schedule_group in {"daily_close", "daily_research_context"}:
+        return local_dt + timedelta(hours=2)
+    if spec.schedule_group == "daily_close_paid_probability":
+        return local_dt + timedelta(hours=4)
+    if spec.schedule_group == "daily_preopen_paid_probability_guard":
+        return local_dt + timedelta(minutes=30)
+    return _same_day_at(local_dt, time(23, 59, 59))
+
+
+def _orchestration_context_for(
+    spec: SourceFetchScheduleSpec,
+    *,
+    trading_day: date,
+    scheduled_at: datetime,
+    scheduled_at_local: datetime,
+    run_slot: str,
+    biz_key: str,
+) -> dict[str, Any]:
+    lifecycle_expires_at_local = _lifecycle_expires_at_local(spec, scheduled_at_local)
+    return {
+        "request_source": "scheduler-service",
+        "schedule_code": spec.schedule_code,
+        "schedule_group": spec.schedule_group,
+        "frequency": spec.frequency,
+        "biz_key": biz_key,
+        "run_slot": run_slot,
+        "trading_day": trading_day.isoformat(),
+        "scheduled_at": scheduled_at.isoformat(),
+        "scheduled_at_local": scheduled_at_local.isoformat(),
+        "lifecycle_expires_at": lifecycle_expires_at_local.astimezone(timezone.utc).isoformat(),
+        "lifecycle_expires_at_local": lifecycle_expires_at_local.isoformat(),
+    }
+
+
 T_RELAY_STAGE_MONITOR_TIMES_LOCAL = _session_minute_ranges(
     ((time(9, 30), time(11, 30)), (time(13, 0), time(15, 0))),
     300,
@@ -513,6 +558,15 @@ def materialize_source_fetch_schedule(
             biz_key = f"{spec.schedule_code}:{trading_day.isoformat()}:{run_slot}"
             idempotency_key = f"scheduler:{biz_key}"
             request_body = _request_body_for(spec, trading_day=trading_day, symbols=request_symbols, idempotency_key=idempotency_key)
+            if spec.owner_endpoint_path == "/source/fetch/submit":
+                request_body["orchestration_context"] = _orchestration_context_for(
+                    spec,
+                    trading_day=trading_day,
+                    scheduled_at=scheduled_at,
+                    scheduled_at_local=local_dt,
+                    run_slot=run_slot,
+                    biz_key=biz_key,
+                )
             instances.append(
                 SourceFetchInstance(
                     schedule_code=spec.schedule_code,

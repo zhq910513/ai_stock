@@ -36,7 +36,7 @@
 供 scheduler 默认 `current_closure` 和 legacy 启动守卫调用。该 scope 只检查 source 底座，不调用 scheduler 或三模型，避免启动循环依赖：
 
 1. source production readiness passed 且无 blocking/warning。
-2. source fetch 队列无 leased/dead-letter 阻断任务。
+2. source fetch 队列无 dead-letter 终态阻断任务；queued/leased 表示待处理和处理中进度，failed 表示 provider/job 审计，均不直接等同服务不可用。
 3. source 字段合同可见。
 4. `source.adjusted_daily_bar_v1` 与 `governance.source_lineage_v1` 有真实持久化行。
 5. 五条 source release preflight passed：`hot_candidates/preopen_release_gate`、`candidate_memory/outcome_label`、`ambush_watchlist/release_gate`、`t_board_relay/day1_scan`、`t_board_relay/day2_trigger`。模型四 preflight 使用 `t_board_default_symbol`，默认 `000759.SZ`。
@@ -220,7 +220,7 @@ PYTHONPATH=services/data-inspector-service/src python -m pytest -q services/data
 
 ## 当前闭环结论
 
-本服务已按新数据源、三模型、模型四和调度服务重新设计为 source-first 巡检服务，并已进入核心闭环候选状态。当前实现覆盖 source production readiness、队列、字段合同、source lineage、三模型 release preflight、模型四 Day1/Day2 preflight、scheduler ready、四个模型 owner ready 和模型四 repository presence；不会直接采集 provider，不会读取 raw 作为模型输入，不会反写模型或调度事实。后续如扩展买点、outcome、Jarvis 上下文和模型决策回顾，必须先获得用户批准解锁或定向扩展，继续把事实入口限定为 source/preflight/decision 审计表和 owner service 只读接口，并在本 README 覆盖更新。
+本服务已按新数据源、三模型、模型四和调度服务重新设计为 source-first 巡检服务，并已进入核心闭环候选状态。当前实现覆盖 source production readiness、队列、字段合同、source lineage、三模型 release preflight、模型四 Day1/Day2 preflight、scheduler ready、四个模型 owner ready 和模型四 repository presence；source queue health 只把 dead-letter 视为 P0 阻断，queued/leased/failed 作为采集进度和失败审计保留在 diagnostics 中；不会直接采集 provider，不会读取 raw 作为模型输入，不会反写模型或调度事实。后续如扩展买点、outcome、Jarvis 上下文和模型决策回顾，必须先获得用户批准解锁或定向扩展，继续把事实入口限定为 source/preflight/decision 审计表和 owner service 只读接口，并在本 README 覆盖更新。
 
 ## Research Payload Assembly 巡检
 

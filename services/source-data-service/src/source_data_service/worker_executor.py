@@ -10,7 +10,7 @@ from source_data_service.models import (
     FetchWorkerRunOnceResult,
     SourceBuildWorkerRunOnceRequest,
 )
-from source_data_service.fetch_persistence import persist_worker_heartbeat_if_enabled
+from source_data_service.fetch_persistence import persist_worker_heartbeat_if_enabled, queue_persistence_summary
 from source_data_service.provider_runtime import execute_provider_fetch
 from source_data_service.source_repository import ingest_raw_fetch_result, run_source_build_worker_once
 
@@ -49,7 +49,8 @@ def run_worker_once(request: FetchWorkerRunOnceRequest) -> FetchWorkerRunOnceRes
     succeeded = 0
     failed = 0
     errors: list[str] = []
-    before_triggers = len(list_source_build_triggers())
+    count_build_triggers = not queue_persistence_summary().ready_for_production_queue
+    before_triggers = len(list_source_build_triggers()) if count_build_triggers else 0
     processed_job_ids: list[str] = []
     if not lease.jobs and not request.dry_run_provider:
         build = run_source_build_worker_once(
@@ -73,9 +74,8 @@ def run_worker_once(request: FetchWorkerRunOnceRequest) -> FetchWorkerRunOnceRes
             note=f"processing:{job.job_item_id}",
         )
         try:
-            # Backup plans are orchestration metadata, not provider parameters.
-            params = dict(job.request_params)
-            params.pop("__backup_plans", None)
+            # Double-underscore keys are orchestration metadata, not provider parameters.
+            params = {key: value for key, value in dict(job.request_params).items() if not str(key).startswith("__")}
             heartbeat_fetch_job(
                 job.job_item_id,
                 FetchJobHeartbeatRequest(
@@ -156,7 +156,7 @@ def run_worker_once(request: FetchWorkerRunOnceRequest) -> FetchWorkerRunOnceRes
                 status="alive" if not lease.jobs else "busy",
                 note=f"completed:{job.job_item_id}",
             )
-    after_triggers = len(list_source_build_triggers())
+    after_triggers = len(list_source_build_triggers()) if count_build_triggers else before_triggers
     persist_worker_heartbeat_if_enabled(
         worker_id=request.worker_id,
         queue_names=[queue.value for queue in request.queue_names] if request.queue_names else [],

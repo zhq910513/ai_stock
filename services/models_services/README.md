@@ -15,6 +15,8 @@
 
 模型四当前集合层合同：Day2 未触发前由 `t_board_day2_watch_snapshot_v1` 五分钟滚动事实驱动普通用户观察台；触发确认以“买盘主动扫掉卖盘”为主，卖盘主动砸向买盘是风险 / 失效条件；触发后封板维护按开盘时段每 5 分钟留存至收盘；`observation-board` 同步输出 `model_score`、`model_score_label`、`score_state` 和 `model_score_version=t_board_relay_observation_score_v1`，由模型四 owner 基于阶段事实综合计算，缺关键事实时保持 `model_score=NULL`，不补 0；Day2 10:30 后缺有效五分钟事实时必须落 `data_wait`，不得继续显示观察中；`t_relay.observation.monitor.snapshot_5m` 每 5 分钟通过 `POST /t-board-relay/observation-monitor/snapshot` 留存 `projection_snapshot_5m`，只作为观察投影留痕和恢复审计，不覆盖真实阶段事实时间；`t_relay.live_result.compute_30m` 每 30 分钟留存 `model_result_30m`，写入 `model_evaluated_at/last_model_output_at`，二者都 append-only 写入 `decision_t_relay.t_board_observation_monitor_snapshot_v1`；前端只读消费 `observation-board` 投影和模型分降序，`更新` 列必须同时展示最后一次模型产出时间 `last_model_output_at/model_evaluated_at` 与最新真实抓取/阶段事实时间 `latest_data_fetch_at/last_data_captured_at`，`latest_projection_snapshot_at` 仅作审计，不得冒充真实抓取时间，前端不生成、不修改模型事实。
 
+当前 Day2 窗口过期判断按 Asia/Shanghai 从 Day1 推导预期 Day2 工作日，周末顺延；当前日期已经晚于预期 Day2 时，窗口视为已过，不再受当天是否到 10:30 影响。30 分钟 `model_result_30m` 只能刷新模型产出时间；当 owner 当前投影已判为 `data_wait`、`stopped` 或 `completed` 时，历史快照不得把状态、分数或风险结论复活为 `continue_watch` / `opportunity`。
+
 2026-07-01 用户回复“允许”后，模型四集合层双时间合同进入拍板冻结：5 分钟 `projection_snapshot_5m` 只能证明观察台投影链路仍在运行，30 分钟 `model_result_30m` 才能推动 `last_model_output_at/model_evaluated_at`，真实抓取 / 阶段事实时间只能来自 owner 阶段事实。未经解锁不得合并三类时间，不得把投影时间显示成抓取时间或模型产出时间，不得移除 `t_relay.live_result.compute_30m`，不得让前端、research、scheduler 或 Jarvis 补写模型四事实。
 
 模型服务均是 owner service：只接收已组装 payload，执行模型合同计算并返回结构化结果；不直接并发调用 BaoStock、AKShare、Tencent、Tushare、EastMoney、Baidu、CNINFO 等 provider；不直接读取 `raw_*`；不直接修改前端、Jarvis、交易、学习权重或人工状态。

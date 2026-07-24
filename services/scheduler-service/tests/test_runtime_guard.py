@@ -286,6 +286,7 @@ class CurrentClosureClient:
         blocked_scope: str = "startup_guard",
         core_closure_self_gap_only: bool = False,
         unreachable_models: set[str] | None = None,
+        queue_rows: list[dict[str, Any]] | None = None,
     ) -> None:
         self.preflight_blocked = preflight_blocked
         self.preflight_blocking_reasons = preflight_blocking_reasons
@@ -295,6 +296,7 @@ class CurrentClosureClient:
         self.blocked_scope = blocked_scope
         self.core_closure_self_gap_only = core_closure_self_gap_only
         self.unreachable_models = unreachable_models or set()
+        self.queue_rows = queue_rows
         self.gets: list[tuple[str, float]] = []
         self.posts: list[tuple[str, dict[str, Any], float]] = []
 
@@ -345,7 +347,8 @@ class CurrentClosureClient:
             return FakeResponse(
                 200,
                 {
-                    "rows": [
+                    "rows": self.queue_rows
+                    or [
                         {"queue_name": "urgent_release_gate_queue", "leased_count": 0, "dead_letter_count": 0},
                         {"queue_name": "normal_daily_ingest_queue", "leased_count": 0, "dead_letter_count": 0},
                     ]
@@ -436,6 +439,54 @@ def test_current_closure_guard_requires_source_model_queue_and_preflight_ready()
     t_board_posts = [post for post in preflight_posts if post[1]["model_code"] == "t_board_relay"]
     assert {post[1]["model_phase"] for post in t_board_posts} == {"day1_scan", "day2_trigger"}
     assert all(post[1]["symbols"] == ["000759.SZ"] for post in t_board_posts)
+
+
+def test_current_closure_guard_treats_active_source_leases_as_progress() -> None:
+    client = CurrentClosureClient(
+        queue_rows=[
+            {"queue_name": "urgent_release_gate_queue", "leased_count": 0, "dead_letter_count": 0},
+            {"queue_name": "normal_daily_ingest_queue", "leased_count": 7, "dead_letter_count": 0},
+        ]
+    )
+    runtime = SchedulerRuntime(
+        client=client,
+        poll_seconds=1,
+        request_timeout_seconds=1,
+        source_time_wheel_enabled=False,
+        task_store=SchedulerSQLiteTaskStore(),
+    )
+
+    runtime.run_startup_cycle()
+    snapshot = runtime.ready_snapshot()
+
+    assert snapshot["status"] == "ready"
+    details = snapshot["checks"]["closure_guard"]["details"]
+    assert details["queue"]["rows"][1]["leased_count"] == 7
+    assert details["queue_readyz_policy"]["leased_count"].startswith("active source-data-worker progress")
+
+
+def test_current_closure_guard_still_blocks_source_dead_letters() -> None:
+    client = CurrentClosureClient(
+        queue_rows=[
+            {"queue_name": "urgent_release_gate_queue", "leased_count": 0, "dead_letter_count": 0},
+            {"queue_name": "normal_daily_ingest_queue", "leased_count": 0, "dead_letter_count": 1},
+        ]
+    )
+    runtime = SchedulerRuntime(
+        client=client,
+        poll_seconds=1,
+        request_timeout_seconds=1,
+        source_time_wheel_enabled=False,
+        task_store=SchedulerSQLiteTaskStore(),
+    )
+
+    runtime.run_startup_cycle()
+    snapshot = runtime.ready_snapshot()
+
+    assert snapshot["status"] == "not_ready"
+    assert snapshot["checks"]["closure_guard"]["status"] == "failed"
+    assert "normal_daily_ingest_queue" in snapshot["checks"]["closure_guard"]["error"]
+    assert "dead-letter" in snapshot["checks"]["closure_guard"]["error"]
 
 
 def test_current_closure_guard_skips_policy_disabled_model_readyz() -> None:

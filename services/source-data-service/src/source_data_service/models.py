@@ -706,6 +706,7 @@ class FetchPlanRequest(BaseModel):
     dry_run: bool = True
     prefer_batch: bool = True
     callback_url: str | None = None
+    orchestration_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class FetchBackupPlan(BaseModel):

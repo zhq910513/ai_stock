@@ -12,10 +12,11 @@
 |---|---|---|
 | `source-data-service /readyz` | source 服务健康 | 只读 |
 | `/source/ops/production-readiness` | source 拍板门禁 | 只读 |
-| `/source/fetch/queues/summary` | 队列阻断 | 只读 |
+| `/source/fetch/queues/summary` | 队列阻断与采集进度 | 只读；`dead_letter_count` 阻断 readyz，`leased_count` 只表示 source-data-worker 正在采集，展示但不阻断 |
 | `/source/fetch/plan`、`/source/fetch/submit` | 非临时和临时 source fetch orchestration | scheduler 只提交合同体，provider 并发由 source-data-worker 控制 |
 | `/source/ths/paid-probability/fetch-current-batch`、`/source/ths/paid-probability/deadline-check` | 同花顺付费概率批次抓取和截止守卫 | scheduler 只调 source-data-service 受控端点，不接触 Cookie、provider 参数或 THS 响应 |
 | `POST /scheduler/source-schedule/catch-up` | 非临时 source schedule 正式追补/对账入口 | 只复用 `source_fetch_schedule_registry_v1` 物化实例和本地 task store；默认 dry-run，不属于 temporary fetch |
+| `GET /scheduler/task-store/daily-summary` | source 日生命周期执行对账 | 只读；按当日 materialized source schedule 与 `task_instance_v1` 的 `biz_key` 对账，输出计划、已执行、未到抓取时间、待提交抓取、执行中和失败计数；不提交 fetch，不写 source/raw/lineage |
 | `POST /scheduler/task-store/archive-obsolete-source-dead-letters` | 本地旧合同 dead-letter 审计归档 | 默认 dry-run；只允许把已被当前调度/source 合同替代的旧 source schedule dead-letter 标记为 `obsolete_contract_replaced`，不得删除 `task_dead_letter_v1`，不得写 source/raw/lineage |
 | `/source/release/preflight` | 三模型 official 和模型四 Day1/Day2 source 门禁 | 只读 |
 | `data-inspector-service /readyz`、`POST /inspection-runs` | startup_guard 和 core_closure | 只读触发巡检审计 |
@@ -51,6 +52,7 @@
 | `SCHEDULER_REQUIRED_MODEL_SERVICES` | Staged model availability policy. Code default is `all`; current hot-model recovery plus Model 4 continuous-monitoring Compose default is `hot_candidates,t_board_relay`. Allowed values include `all`, `none`, model codes, owner service names, and aliases such as `hot` / `hot_candidates` / `t_board_relay` / `model4`. | Disabled models are reported as `disabled_by_policy` and are not probed through DNS. Required model readyz failures still block `/readyz`. With the current Compose default, hot candidates and Model 4 owners are required; source readiness, queues, startup_guard and source release preflight remain hard gates. |
 | `checks.closure_guard.details.model_availability_policy` | Exposes required/disabled model codes and owner services. | Audit-only runtime evidence; it does not mark any model output successful. |
 | `scheduler_source_time_wheel_v1` submit result | `/source/fetch/submit` 2xx is recorded as `source_result_status=submit_accepted_pending_source_build`. | scheduler does not declare source rows, raw rows or lineage produced; source-data-service build/preflight remains authoritative. |
+| `scheduler_source_time_wheel_v1` source submit timeout / exception | Source submit uses `max(SCHEDULER_RUNTIME_REQUEST_TIMEOUT_SECONDS * 6, 30)` seconds and local lease uses at least twice that budget. Non-2xx responses are `submit_failed`; client exceptions/timeouts are `submit_exception` with `status_code=0`, and both immediately mark the task failure/retry audit. | Full A-share batches can be accepted by source-data-service without being killed by the quick ready probe timeout; failures are visible to admin dashboards immediately instead of staying as stale `running`. Completion still depends on Postgres queue, worker, raw/source/build/lineage and preflight. |
 | `scheduler_source_schedule_catch_up_v1` | Missed non-temporary windows are reconciled by materializing registry instances and preserving the original schedule `biz_key` / `idempotency_key`; `force_resubmit=true` appends `:catchup:<run_id>` only after source row/build/lineage reconciliation proves old success did not produce facts. | Dry-run writes nothing; non-dry-run writes scheduler local task rows and may dispatch only to source-data-service controlled endpoints. |
 | `ai_stock_scheduler_task_store.sqlite3::task_run_log_v1` | Source submit success/failure is local scheduler audit only. | Production source facts still live in Postgres queue/raw/source/lineage under source-data-service. |
 
@@ -71,6 +73,8 @@
 |---|---|---|---|---|---|
 | `one_time_initial` | `source.trade_calendar_v1`、`source.stock_master_v1` | 首次上线/季度补齐 | `none` / `full_a_share` | `explicit_symbols` / `full_a_share` | `/source/fetch/submit` |
 | `daily_preopen` | `source.stock_universe_daily_v1`、`source.trade_status_v1`、`source.limit_price_v1` | 每日 09:05-09:12 | `full_a_share` | `full_a_share` | `/source/fetch/submit` |
+
+`daily_preopen` ?? A ???????? 30 ???????scheduler ??? `orchestration_context.lifecycle_expires_at` ???????? Asia/Shanghai `23:59:59`??????????????????????????????? raw/source/lineage ????????????????? repair/backfill?
 | `daily_close_paid_probability` | `source.ths_paid_limit_up_probability_v1` | 每日 15:20、16:05、18:00、20:30 | `none` | `explicit_symbols` | `/source/ths/paid-probability/fetch-current-batch` |
 | `daily_preopen_paid_probability_guard` | `governance.ths_paid_probability_batch_status_v1` | 每日 09:01；检查下一交易日 09:00 后仍未补齐的候选批次 | `none` | `explicit_symbols` | `/source/ths/paid-probability/deadline-check` |
 | `daily_close` | `source.daily_bar_v1`、`source.adjusted_daily_bar_v1` | 每日 15:35-15:45 | `full_a_share` | `full_a_share` | `/source/fetch/submit` |
@@ -339,3 +343,8 @@ postgres af846a793868
 | 冻结对象 | 数据资产范围 | 发布后验收证据 | 只读验收 | 解锁条件 |
 |---|---|---|---|---|
 | `scheduler-service -> task store/time wheel -> expired running lease recovery and catch-up safety` | `ai_stock_scheduler_task_store.sqlite3::task_instance_v1/task_lease_v1/task_run_log_v1/task_dead_letter_v1`；`recover_expired_running`；source/model time wheel 周期前恢复；`checks.task_store.source/model`；`POST /scheduler/source-schedule/catch-up` 正式追补入口 | scheduler 容器 `15bcce53dba6` 加载 `runtime_version=scheduler_runtime_guard_v2` 和 `recover_expired_running`；source task store `success=5250/obsolete_contract_replaced=148`；model task store `success=135/blocked_data_gap=561`；两侧 `retry_ready/dead_letter/stale_running=0`；source queues queued/leased/dead_letter 全 0；data-inspector `core_closure` run `2174` ready；scheduler tests `72 passed`、data-inspector tests `10 passed` | `/readyz`、`/scheduler/runtime/status`、task store 只读统计、`/scheduler/validate/source-schedule`、`/scheduler/validate/three-models`、catch-up dry-run、`/source/fetch/queues/summary`、data-inspector latest run 查询 | task store lease/retry/dead-letter 语义变化、readyz 阻断策略变化、source-data-service fetch submit 合同变化、research execution 合同变化、task store 持久化路径变化、真实历史补跑 dead-letter、或用户明确批准解锁 |
+2026-07-20 source schedule lifecycle asset: source time-wheel materialized tasks write per-instance `orchestration_context` into normal `/source/fetch/submit` payloads and daily task summaries expose source submit audit fields. The scheduler still owns only scheduling/task-ledger facts; raw/source/build/lineage completion remains owned by source-data-service.
+
+### 2026-07-23 Scheduler Lifecycle Closure Contract
+
+Scheduler materialized source tasks carry lifecycle metadata into the task-store read model. Daily execution summaries classify due tasks with no successful submit and a past lifecycle as `expired_closed`; this is a read-only lifecycle state, not source completion. Source catch-up also applies the same lifecycle guard: expired instances are excluded with `reason=lifecycle_expired` and must not be enqueued through the original scheduler instance. Formal repair/backfill creates new source fetch evidence and keeps raw/source/lineage audit separate from the expired scheduler row.

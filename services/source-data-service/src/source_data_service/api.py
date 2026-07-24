@@ -136,6 +136,7 @@ from source_data_service.fetch_orchestrator import (
     requeue_expired_leases,
     submit_fetch_batch,
 )
+from source_data_service.fetch_persistence import durable_daily_data_summary_if_enabled
 from source_data_service.worker_executor import run_worker_once
 from source_data_service.ths_paid_credentials import cookie_status, save_active_cookie
 from source_data_service.ths_paid_probability import deadline_check, evaluate_batch_status, fetch_current_batch, probe_cookie
@@ -421,6 +422,15 @@ def fetch_callbacks_dispatch(request: FetchCallbackDispatchRequest) -> FetchCall
 def fetch_persistence_status() -> FetchQueuePersistenceStatusOut:
     return queue_persistence_status()
 
+@app.get("/source/ops/daily-data-summary")
+def source_ops_daily_data_summary(trade_date: str) -> dict:
+    from datetime import date
+
+    try:
+        day = date.fromisoformat(trade_date[:10])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="trade_date must be YYYY-MM-DD") from exc
+    return durable_daily_data_summary_if_enabled(day)
 
 @app.get("/source/fetch/queues/summary", response_model=FetchQueueSummaryOut)
 def fetch_queues_summary() -> FetchQueueSummaryOut:

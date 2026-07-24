@@ -49,3 +49,14 @@
 - 解锁条件：用户明确批准本冻结对象解锁；若涉及 source 付费概率表、Cookie 留存、provider probe、scheduler source schedule 或前端 Cookie 表单，必须同时解锁对应 source-data-service、scheduler-service 或 shence-frontend-service 对象。
 - 回滚方式：回退本服务 DATA_ASSETS/README 中冻结对象的后续变更，恢复当前只读 source 标准层和 append-only `decision_hot.*` 合同口径；回滚后重新验证 source preflight、scheduler 热点计划和模型一单测。
 - 验证清单：`python -m pytest -q -p no:cacheprovider services/models_services/hot-candidates-service/tests`；`GET /scheduler/validate/hot-candidates`；`GET /scheduler/validate/source-schedule`；`GET /source/ths/paid-probability/cookie/status`；`GET /source/ths/paid-probability/batch-status?trade_date=2026-06-18`。
+
+### hot-candidates-service -> model1 reset -> 2026-07-08 data asset state
+
+- 记录时间：2026-07-08 Asia/Shanghai。
+- 确认来源：用户批准“按此范围清理模型一数据，无需备份历史数据”，随后用户回复“你来决定”，由 Codex 判定本轮清理事实可拍板记录。
+- 已清数据资产：`decision_hot.*` 全部模型一事实表清零；`governance.research_model_execution_audit_v1` 中模型一相关执行审计清零。
+- 保留数据资产：`source.ths_paid_limit_up_probability_v1`、`raw_ths.paid_limit_up_probability_v1`、`governance.ths_paid_probability_batch_status_v1`、`governance.ths_paid_probability_cookie_v1`、source lineage、source queue、scheduler task store 均保留。
+- 验收事实：`decision_hot_total=0`、模型一 execution audit 剩余 `0`、research hot list `item_count=0`；source 概率 `279` 行、raw 概率 `309` 行、批次状态 `17` 行、Cookie `3` 行仍在；source queue `queued=0/leased=0/dead_letter=0`。
+- 当前等待资产状态：`2026-07-08` 付费概率批次 `status=no_candidates`、`candidate_count=0`、`fetched_count=0`、`cookie_status=expired`、deadline `2026-07-09T01:00:00Z`。模型一重新产出只能由真实候选批次、有效 Cookie、source build/lineage、research execution 和 owner materialization 正式链路生成。
+- 禁止事项：不得手写 `decision_hot.*`、不得直接写 `source.*` 或 `raw_ths.*`、不得补 0/空字符串/mock/GPT 推断、不得跳过 source preflight 或把当前空表解释为已恢复产出。
+- 回滚方式：本轮按用户要求未备份历史模型一数据，删除事实不可从备份恢复；后续只能通过正式 source/scheduler/research/model 链路重新产生新事实。

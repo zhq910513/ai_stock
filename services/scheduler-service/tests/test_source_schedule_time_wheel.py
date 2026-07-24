@@ -59,6 +59,12 @@ class FailingSourceSubmitClient(SourceSubmitClient):
         return FakeResponse(503, {"status": "not_ready"}, text="source not ready")
 
 
+class TimeoutSourceSubmitClient(SourceSubmitClient):
+    def post(self, url: str, *, json: dict[str, Any], timeout: float) -> FakeResponse:
+        self.posts.append((url, json, timeout))
+        raise TimeoutError("source submit timed out")
+
+
 class DuplicateSourceSubmitClient(SourceSubmitClient):
     def post(self, url: str, *, json: dict[str, Any], timeout: float) -> FakeResponse:
         self.posts.append((url, json, timeout))
@@ -130,6 +136,17 @@ def test_source_schedule_materializes_fetch_submit_contracts() -> None:
         "event_time",
     ]
     assert auction.request_body["idempotency_key"].startswith("scheduler:source.minute.auction_snapshot")
+    auction_context = auction.request_body["orchestration_context"]
+    assert auction_context["request_source"] == "scheduler-service"
+    assert auction_context["schedule_code"] == "source.minute.auction_snapshot"
+    assert auction_context["run_slot"] == "091500"
+    assert auction_context["biz_key"] == "source.minute.auction_snapshot:2026-06-12:091500"
+    assert auction_context["lifecycle_expires_at_local"] == "2026-06-12T09:25:00+08:00"
+    minute_bars = [item for item in result if item.schedule_code == "source.minute.minute_bar"]
+    assert [item.request_body["orchestration_context"]["run_slot"] for item in minute_bars[:2]] == ["093000", "093100"]
+    assert minute_bars[0].request_body["idempotency_key"] != minute_bars[1].request_body["idempotency_key"]
+    assert minute_bars[0].request_body["orchestration_context"]["lifecycle_expires_at_local"] == "2026-06-12T09:40:00+08:00"
+    assert minute_bars[1].request_body["orchestration_context"]["lifecycle_expires_at_local"] == "2026-06-12T09:41:00+08:00"
     assert not auction.source_table_name.startswith("raw_")
     stock_master = next(item for item in result if item.schedule_code == "source.init.stock_master")
     limit_price = next(item for item in result if item.schedule_code == "source.daily.limit_price_preopen")
@@ -140,6 +157,7 @@ def test_source_schedule_materializes_fetch_submit_contracts() -> None:
     assert limit_price.request_body["priority"] == "P0_urgent_release"
     assert limit_price.request_body["symbols"] == []
     assert limit_price.request_body["universe_scope"] == "full_a_share"
+    assert limit_price.request_body["orchestration_context"]["lifecycle_expires_at_local"] == "2026-06-12T23:59:59+08:00"
     assert limit_event.request_body["source_table_name"] == "source.limit_event_v1"
     assert limit_event.request_body["trigger_type"] == "model_release_preflight"
     assert limit_event.request_body["symbols"] == []
@@ -195,6 +213,7 @@ def test_runtime_source_schedule_catch_up_dry_run_does_not_submit() -> None:
         schedule_codes=["source.daily.preopen_universe"],
         dispatch_immediately=True,
         dry_run=True,
+        now=datetime(2026, 6, 22, 2, 0, tzinfo=timezone.utc),
     )
 
     assert result["contract_kind"] == "scheduler_source_schedule_catch_up_v1"
@@ -356,7 +375,7 @@ def test_source_schedule_catch_up_api_exposes_dry_run_preview() -> None:
     response = client.post(
         "/scheduler/source-schedule/catch-up",
         json={
-            "trading_day": "2026-06-22",
+            "trading_day": "2099-06-22",
             "schedule_codes": ["source.daily.limit_price_preopen"],
             "dry_run": True,
         },
@@ -452,6 +471,30 @@ def test_runtime_source_time_wheel_blocks_on_submit_failure() -> None:
     assert snapshot["details"]["dispatched"][0]["status_code"] == 503
 
 
+def test_runtime_source_time_wheel_marks_submit_exception_without_stale_running() -> None:
+    client = TimeoutSourceSubmitClient()
+    store = SchedulerSQLiteTaskStore()
+    runtime = SchedulerRuntime(
+        client=client,
+        guard_mode="legacy_data_inspector",
+        source_data_base_url="http://source-data-service:8041",
+        source_time_wheel_enabled=True,
+        source_time_wheel_live_submit=True,
+        source_time_wheel_symbols=["000063.SZ"],
+        source_time_wheel_lateness_seconds=60,
+        task_store=store,
+        poll_seconds=1,
+        request_timeout_seconds=1,
+    )
+
+    snapshot = runtime.run_source_time_wheel_once(now=datetime(2026, 6, 12, 1, 15, tzinfo=timezone.utc))
+
+    assert snapshot["status"] == "failed"
+    assert snapshot["details"]["dispatched"][0]["source_result_status"] == "submit_exception"
+    assert snapshot["details"]["dispatched"][0]["status_code"] == 0
+    counts = store.status_counts(owner_services=("source-data-service",))
+    assert counts["retry_ready"] == 1
+    assert counts.get("running", 0) == 0
 def test_temporary_source_fetch_dry_run_and_reject_scheduled_periodic() -> None:
     test_app = FastAPI()
     test_app.include_router(router)
@@ -503,3 +546,35 @@ def test_temporary_source_fetch_dry_run_and_reject_scheduled_periodic() -> None:
     assert rejected.status_code == 409
     assert rejected_non_source.status_code == 409
     assert rejected_missing_fields.status_code == 409
+
+
+
+def test_runtime_source_schedule_catch_up_excludes_expired_lifecycle_instances() -> None:
+    runtime = SchedulerRuntime(
+        client=SourceSubmitClient(),
+        guard_mode="legacy_data_inspector",
+        task_store=SchedulerSQLiteTaskStore(),
+        poll_seconds=1,
+        request_timeout_seconds=1,
+    )
+
+    expired = runtime.catch_up_source_schedule(
+        trading_day=date(2026, 6, 12),
+        schedule_codes=["source.minute.auction_snapshot"],
+        dry_run=True,
+        now=datetime(2026, 6, 12, 2, 0, tzinfo=timezone.utc),
+        max_instances=100,
+    )
+    still_open_daily = runtime.catch_up_source_schedule(
+        trading_day=date(2026, 6, 12),
+        schedule_codes=["source.daily.limit_price_preopen"],
+        dry_run=True,
+        now=datetime(2026, 6, 12, 2, 0, tzinfo=timezone.utc),
+        max_instances=100,
+    )
+
+    assert expired["selected_count"] == 0
+    assert expired["excluded_count"] == 21
+    assert {item["reason"] for item in expired["excluded"]} == {"lifecycle_expired"}
+    assert still_open_daily["selected_count"] == 1
+    assert still_open_daily["excluded_count"] == 0

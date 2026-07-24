@@ -60,6 +60,7 @@
 - `GET /scheduler/validate/source-schedule`
 - `GET /scheduler/materialize/source-schedule?trading_day=YYYY-MM-DD&symbols=000063.SZ,000759.SZ&include_one_time=false`
 - `POST /scheduler/source-schedule/catch-up`
+- `GET /scheduler/task-store/daily-summary?trading_day=YYYY-MM-DD&owner_service=source-data-service`
 - `POST /scheduler/task-store/archive-obsolete-source-dead-letters`
 - `POST /scheduler/source-time-wheel/run-once`
 - `POST /scheduler/model-time-wheel/run-once`
@@ -68,7 +69,8 @@
 - `POST /scheduler/model-payload/preflight`
 - `POST /scheduler/model-payload/assemble-preflight`
 - `POST /scheduler/source-fetch/temporary`
-- `GET /scheduler/live-dispatch/sample/{task_code}`
+- `GET /scheduler/task-store/daily-summary?trading_day=YYYY-MM-DD&owner_service=source-data-service` also exposes the latest source submit audit fields from `task_run_log_v1`: `source_fetch_batch_id`, `source_fetch_status`, `source_fetch_queue_name`, `source_submitted_job_count`, `source_skipped_duplicate_count`, and `source_producer_ack`. These fields let admin dashboards distinguish a scheduler-completed no-op/duplicate from a task that really has an open source job waiting for raw/source output.
+`GET /scheduler/live-dispatch/sample/{task_code}`
 - `GET /scheduler/validate/live-dispatch-samples`
 - `GET /scheduler/validate/docs-sync?project_root=.`
 - `POST /scheduler/trigger`
@@ -86,6 +88,7 @@
 
 调度连通不等于官方信号通过。owner service 返回 2xx 只表示接口合同和编排链路调通；如果模型根据真实缺口返回 `blocked`、`research_only`、`source_gap_codes` 或 `contract_gaps`，scheduler 必须保留该结果，不得改写为发布成功。
 
+`GET /scheduler/task-store/daily-summary?trading_day=YYYY-MM-DD&owner_service=source-data-service` 返回 `scheduler_daily_source_execution_summary_v1`，只读对账 scheduler 当日 source schedule 物化实例与本地 `task_instance_v1`。该接口不提交 fetch、不触发 time wheel、不调用 provider/raw，只按 `biz_key` 合并任务账本：`success` 与 `source_duplicate_skipped` 计为 `completed`，`running` 计为 `collecting`，`retry_ready` / `failed` / `dead_letter` / `blocked_data_gap` 计为 `failed`，未到计划时间计为 `not_due`，已到计划时间但无任务实例计为 `awaiting_dispatch`。下游 admin 看板只能使用该接口做日生命周期执行计数，source fact 是否产出仍以 source-data-service 的 raw/build/source/lineage 和 release preflight 为准。
 `GET /scheduler/live-dispatch/sample/{task_code}` 返回 `scheduler_live_dispatch_sample_v1`，包含 scheduler 触发层 payload 和 owner request body 预览，用于验证 live dispatch 包装合同。当前内置样例覆盖三条官方 release gate 和模型四关键 non-official 任务：
 
 - `hot.release_gate.preopen`
@@ -155,7 +158,7 @@ python scripts/core_services_acceptance.py --require-postgres --real-provider-pr
 - `data-inspector-service` 在 `SCHEDULER_GUARD_TRADE_DATE` 对应交易日内最新持久化 `startup_guard` 和 `core_closure` 巡检均为 ready/passed/ok/completed 且 P0/P1 缺口为 0。
 - `source-data-service /readyz` 返回 ready 或 ok。
 - `/source/ops/production-readiness?require_postgres=true&require_real_provider_probe=true` 返回 passed 且 `can拍板=true`。
-- `/source/fetch/queues/summary` 所有队列无 leased 或 dead-letter 任务。
+- `/source/fetch/queues/summary` 所有队列 `dead_letter_count=0`；`leased_count` 表示 `source-data-worker` 正在处理中的采集进度，必须在 runtime details 中展示，但不再作为 scheduler readyz 硬阻断。
 - `scheduler_source_time_wheel_v1` 常驻启用，当前窗口内的非临时 source 调度只提交 source-data-service 受控端点；过期窗口不由 time wheel 自动追发，发现缺口、发布滞后或错过窗口时必须使用 `POST /scheduler/source-schedule/catch-up` 复用正式 registry 实例追补，不得把 temporary fetch 当作非临时闭环。
 - `hot-candidates-service`、`candidate-memory-service`、`ambush-watchlist-service`、`t-board-relay-service` 的 `/readyz` 返回 ready 或 ok。
 - 三条 source release preflight 全部 `can_release_official_signal=true` 且 `blocking_reasons=[]`：`hot_candidates/preopen_release_gate`、`candidate_memory/outcome_label`、`ambush_watchlist/release_gate`。若 `SCHEDULER_GUARD_TRADE_DATE` 是历史验收/回放日期，且 coverage passed、blocking reasons 全部为 `:late`，scheduler 可把该 late 作为历史可见性审计而非服务 readyz 阻断；source preflight 原始结果仍必须保留 blocked。
@@ -195,7 +198,7 @@ python scripts/core_services_acceptance.py --require-postgres --real-provider-pr
 - `SCHEDULER_REQUIRED_MODEL_SERVICES`：代码默认 `all`，生产严格模式下四个模型 owner `/readyz` 都是 `current_closure` 硬依赖；当前热点模型恢复与模型四连续监测阶段 Compose 默认 `hot_candidates,t_board_relay`，表示热点 owner 与模型四 owner 必须 ready 并可进入 model time wheel live dispatch，candidate_memory/ambush 在 `/scheduler/runtime/status` 中记录为 `disabled_by_policy`，不触发模型 DNS 探测，不阻断 source/scheduler 底座 ready。可填写 `none`、`t_board_relay`、`hot_candidates,t_board_relay`、`hot_candidates,candidate_memory` 或 owner service 名；只有列为 required 的模型 owner readyz 不可达才阻断 `/readyz`。
 - `DATA_INSPECTOR_SERVICE_BASE_URL`：默认 `http://data-inspector-service:8025`。
 - `SCHEDULER_RUNTIME_POLL_SECONDS`：后台循环间隔，默认 30 秒。
-- `SCHEDULER_RUNTIME_REQUEST_TIMEOUT_SECONDS`：ready 快速探针超时，默认 5 秒。
+- `SCHEDULER_RUNTIME_REQUEST_TIMEOUT_SECONDS`：ready 快速探针超时，默认 5 秒；source time wheel 提交 `/source/fetch/submit` 使用独立预算 `max(request_timeout * 6, 30)` 秒，任务 lease 使用 `max(submit_timeout * 2, 60)` 秒，避免全 A 批量计划展开时被 ready 快速探针预算误杀。submit 非 2xx 或客户端异常/超时必须立即写入本地 task store failure/retry 审计，并在 `scheduler_source_time_wheel_v1.details.dispatched[]` 暴露 `submit_failed` 或 `submit_exception`，不得让任务长期停留在 `running` 等待 lease 过期。
 - `DATA_INSPECTION_STARTUP_GUARD_TIMEOUT_SECONDS`：启动巡检请求超时，默认 60 秒。
 - `DATA_INSPECTION_STARTUP_GUARD_SCOPE`：默认 `startup_guard`。
 - `DATA_INSPECTION_LOOKBACK_DAYS`：默认 20。
@@ -315,6 +318,8 @@ t_relay_day1_candidate_facts -> 12 instances for two explicit symbols; without s
 时间轮只 materialize 当前 UTC 时间落在 `scheduled_at - SCHEDULER_SOURCE_TIME_WHEEL_LATENESS_SECONDS <= now <= scheduled_at` 的任务；重启后不会自动追发已经过期的竞价、开盘 5 分钟或 Day2 窗口任务。`POST /scheduler/source-schedule/catch-up` 是非临时 source 调度的正式追补/对账入口，必须从 `source_fetch_schedule_registry_v1` 物化实例，支持按 `schedule_codes`、`schedule_groups`、`source_table_names`、`run_slots`、`include_one_time` 和交易日筛选，默认 `dry_run=true`；非 dry-run 只写入 scheduler 本地 task store，并在 `dispatch_immediately=true` 时转交 source-data-service 受控端点。该入口不属于 temporary fetch，不允许绕过 registry、provider、raw、quality gate 或 lineage。默认复用原始 schedule `biz_key`/`idempotency_key`；当对账证明旧 scheduler task 已 success 但 source row/build/lineage 未产出时，可显式传 `force_resubmit=true` 和 `catch_up_run_id`，生成带 `:catchup:<run_id>` 后缀的新 task/source 幂等键重提。同花顺付费概率抓取和 deadline guard 默认被 catch-up 阻断，必须显式传入 `allow_ths_paid_probability_fetch=true` 或 `allow_ths_paid_probability_deadline_guard=true` 才能选择对应受控端点，避免误触发历史付费批次。常规 `/source/fetch/submit` 提交体必须包含 `source_table_name`、`canonical_fields`、`trigger_type`、`priority`、`request_source=scheduler-service` 和稳定 `idempotency_key`；同花顺付费概率两个受控端点只携带 source-data-service 定义的批次请求体和内部 `__source_endpoint_path`，runtime 提交前必须移除该内部键。
 
 `scheduler_source_time_wheel_v1` 收到 `/source/fetch/submit` 2xx 只表示 source fetch batch 已被 source-data-service 接收；runtime details 使用 `source_result_status=submit_accepted_pending_source_build`，不得把该状态解释为 raw/source/lineage 已经产出。只有 source-data-service 的 raw ingest、quality gate、`source_build_trigger`、source build 和 lineage 成功后，下游 preflight 才能认定 source rows 可用。
+
+`daily_preopen` ??? A ????????? universe????????????????????????`orchestration_context.lifecycle_expires_at` ??????? Asia/Shanghai `23:59:59`?????????????????????????????????????????? raw/source/lineage??????????????????? repair/backfill??????????????????????????????????????????
 
 临时取数入口：
 
@@ -951,6 +956,7 @@ PYTHONPATH=services/scheduler-service/src python -m pytest -q services/scheduler
 
 旧合同 dead-letter 维护入口：
 
+- `GET /scheduler/task-store/daily-summary?trading_day=YYYY-MM-DD&owner_service=source-data-service`
 - `POST /scheduler/task-store/archive-obsolete-source-dead-letters` 只用于归档已被当前代码合同明确替代的 source schedule dead-letter，默认 `dry_run=true`。
 - 当前默认只匹配 `source.minute.auction_snapshot`、`source.auction_snapshot_v1`、旧字段 `price/volume/amount/captured_at/provider_definition`；归档后 task instance 状态为 `obsolete_contract_replaced`，不再阻断 readyz。
 - 该入口不得删除 `task_dead_letter_v1`，必须在 `task_run_log_v1` 写入 `dead_letter_archived`，并返回匹配任务、旧字段、新字段和状态计数。
@@ -1039,3 +1045,9 @@ tests:
 | 服务 -> 模块 -> 功能 | 冻结时间 | 确认来源 | 锁定范围 | 允许的只读验收 | 禁止修改项 | 解锁条件 | 回滚方式 | 验证清单 |
 |---|---|---|---|---|---|---|---|---|
 | `scheduler-service -> task store/time wheel -> expired running lease recovery and catch-up safety` | 2026-06-26 22:43 Asia/Shanghai | 用户明确回复“拍板” | `recover_expired_running`、`task_lease_v1` 过期 lease 恢复、`task_run_log_v1.lease_recovered` 审计、source/model time wheel 周期前恢复、`checks.task_store.source/model` readyz 暴露、`retry_ready/dead_letter/stale_running` 阻断、`/scheduler/source-schedule/catch-up` 正式追补入口 | `/readyz`、`/scheduler/runtime/status`、`/scheduler/validate/source-schedule`、`/scheduler/validate/three-models`、`/source/fetch/queues/summary`、catch-up dry-run、task store 只读统计、data-inspector `core_closure` run 只读查询 | 未获解锁不得改 task store lease/retry/dead-letter 语义，不得删除或重置 `scheduler_task_store` 卷，不得把 `blocked_data_gap` 改写为 success，不得取消 readyz 对 `retry_ready/dead_letter/stale_running` 的阻断，不得让 scheduler 直接调 provider/raw/owner，不得把 temporary fetch 当作非临时补数闭环 | source-data-service fetch submit 合同变化、research execution 合同变化、task store 持久化路径变化、readyz 误阻断/漏阻断、恢复后重复提交或漏提交、需要真实历史补跑 dead-letter，或用户明确批准解锁 | 回退 scheduler 镜像到上一稳定版本并 `docker compose -f infra/docker-compose.yml up -d --no-deps scheduler-service`；保留 `scheduler_task_store` 卷审计，必要时从备份 sqlite 恢复；不触碰 `source-data-service`、Postgres、data-inspector 或模型 owner | scheduler `/readyz=ready`；startup_guard run `2173` P0/P1=0；core_closure run `2174` ready；source/model task store `blocking_statuses=[]`、`stale_running_count=0`；source queues queued/leased/dead_letter 全 0；source schedule valid；three-model plan valid；scheduler tests `72 passed` |
+
+### 2026-07-23 Source Catch-Up Lifecycle Guard
+
+`/scheduler/source-schedule/catch-up` now enforces the per-instance `orchestration_context.lifecycle_expires_at*` value before both dry-run preview and real enqueue. Expired instances are returned only in `excluded` with `reason=lifecycle_expired`; they are not selected, not enqueued, and `force_resubmit` does not revive them. Recoverable data after this point must be submitted as a new formal repair/backfill/fetch request rather than pretending the original time-window task is still alive.
+
+`/scheduler/task-store/daily-summary` now reports due-but-never-submitted or pending tasks as `execution_status=expired_closed` when their lifecycle is past. The response includes row-level `lifecycle_expires_at`, `lifecycle_expired`, table-level `expired_closed_task_count`, and summary `expired_closed_task_count`. These rows remain unfinished audit facts, but they are no longer active waiting/dispatch work.

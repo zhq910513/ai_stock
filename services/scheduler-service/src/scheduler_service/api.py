@@ -250,6 +250,33 @@ def materialize_source_schedule(
         "instances": [item.to_dict() for item in instances],
     }
 
+@router.get("/scheduler/task-store/daily-summary")
+def scheduler_task_store_daily_summary(
+    trading_day: date,
+    owner_service: str = "source-data-service",
+    symbols: str = "",
+    include_one_time: bool = False,
+) -> dict[str, Any]:
+    if owner_service != "source-data-service":
+        raise HTTPException(status_code=409, detail="daily task-store summary currently supports source-data-service only")
+    parsed_symbols = [item.strip() for item in symbols.split(",") if item.strip()]
+    instances = materialize_source_fetch_schedule(
+        trading_day=trading_day,
+        symbols=parsed_symbols,
+        stage_candidate_symbols_by_source={
+            EXPLICIT_MODEL_STAGE_CANDIDATE_SOURCE: parsed_symbols,
+            T_RELAY_LIMIT_EVENT_STAGE_CANDIDATE_SOURCE: parsed_symbols,
+        }
+        if parsed_symbols
+        else {},
+        include_one_time=include_one_time,
+    )
+    return runtime.task_store.daily_source_execution_summary(
+        trading_day=trading_day,
+        materialized_instances=[item.to_dict() for item in instances],
+        now=datetime.now(timezone.utc),
+        owner_service=owner_service,
+    )
 
 @router.post("/scheduler/source-schedule/catch-up")
 def catch_up_source_schedule(request: SourceScheduleCatchUpRequest) -> dict[str, Any]:

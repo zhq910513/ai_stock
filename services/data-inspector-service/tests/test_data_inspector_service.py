@@ -72,10 +72,12 @@ class FakeClient:
         blocked_preflight: str | None = None,
         scheduler_ready: bool = True,
         blocked_research_task: str | None = None,
+        queue_rows: list[dict[str, Any]] | None = None,
     ) -> None:
         self.blocked_preflight = blocked_preflight
         self.scheduler_ready = scheduler_ready
         self.blocked_research_task = blocked_research_task
+        self.queue_rows = queue_rows
         self.source_posts: list[tuple[str, dict[str, Any]]] = []
         self.scheduler_gets: list[str] = []
         self.scheduler_posts: list[tuple[str, dict[str, Any]]] = []
@@ -92,7 +94,7 @@ class FakeClient:
             return ServiceResult(
                 ok=True,
                 status_code=200,
-                data={"rows": [{"queue_name": "urgent_release_gate_queue", "queued_count": 0, "leased_count": 0, "dead_letter_count": 0}]},
+                data={"rows": self.queue_rows or [{"queue_name": "urgent_release_gate_queue", "queued_count": 0, "leased_count": 0, "failed_count": 0, "dead_letter_count": 0}]},
             )
         if path == "/source/contracts":
             return ServiceResult(ok=True, status_code=200, data=[{"source_table_name": "source.adjusted_daily_bar_v1"}])
@@ -247,6 +249,55 @@ def test_startup_guard_is_source_first_and_does_not_call_scheduler() -> None:
     assert "source_lineage_presence" in run.subjects[0].summary["observed_domains"]
 
 
+
+def test_startup_guard_treats_active_source_queue_as_progress() -> None:
+    client = FakeClient(
+        queue_rows=[
+            {
+                "queue_name": "normal_daily_ingest_queue",
+                "queued_count": 7100,
+                "leased_count": 7,
+                "failed_count": 5384,
+                "dead_letter_count": 0,
+            }
+        ]
+    )
+    inspector = DataInspector(settings=_settings(), repository=MemoryRepository(), client=client)  # type: ignore[arg-type]
+
+    run = inspector.build_inspection(InspectionRunCreate(scope="startup_guard", persist=False))
+
+    assert run.status == "ready"
+    assert run.p0_gap_count == 0
+    assert "source_queue_health" in run.subjects[0].summary["observed_domains"]
+    assert run.subjects[0].summary["diagnostics"]["source_foundation"]["queue_totals"] == {
+        "queued": 7100,
+        "leased": 7,
+        "failed": 5384,
+        "dead_letter": 0,
+    }
+
+
+def test_startup_guard_blocks_source_queue_dead_letters() -> None:
+    client = FakeClient(
+        queue_rows=[
+            {
+                "queue_name": "normal_daily_ingest_queue",
+                "queued_count": 0,
+                "leased_count": 0,
+                "failed_count": 0,
+                "dead_letter_count": 1,
+            }
+        ]
+    )
+    inspector = DataInspector(settings=_settings(), repository=MemoryRepository(), client=client)  # type: ignore[arg-type]
+
+    run = inspector.build_inspection(InspectionRunCreate(scope="startup_guard", persist=False))
+
+    assert run.status == "blocked"
+    assert run.p0_gap_count == 1
+    gap = run.gaps[0]
+    assert gap.domain_code == "source_queue_health"
+    assert gap.details["queue_totals"]["dead_letter"] == 1
 def test_core_closure_checks_scheduler_models_preflight_and_lineage() -> None:
     client = FakeClient()
     repo = MemoryRepository()

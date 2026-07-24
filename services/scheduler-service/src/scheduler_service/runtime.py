@@ -505,6 +505,20 @@ class SchedulerRuntime:
                     }
                 )
                 continue
+            lifecycle_expires_at = self._source_instance_lifecycle_expires_at(instance)
+            if lifecycle_expires_at is not None and checked_at > lifecycle_expires_at:
+                excluded.append(
+                    {
+                        "schedule_code": instance.schedule_code,
+                        "schedule_group": instance.schedule_group,
+                        "source_table_name": instance.source_table_name,
+                        "run_slot": instance.run_slot,
+                        "scheduled_at": instance.scheduled_at.isoformat(),
+                        "lifecycle_expires_at": lifecycle_expires_at.isoformat(),
+                        "reason": "lifecycle_expired",
+                    }
+                )
+                continue
             selected.append(instance)
         if max_instances < 1:
             raise ValueError("max_instances must be >= 1")
@@ -1020,9 +1034,14 @@ class SchedulerRuntime:
 
             queue = self._get_json(f"{self.source_data_base_url}/source/fetch/queues/summary")
             details["queue"] = queue
+            details["queue_readyz_policy"] = {
+                "leased_count": "active source-data-worker progress; visible but not a scheduler readyz blocker",
+                "dead_letter_count": "terminal source queue failure; blocks scheduler readyz",
+            }
             for row in queue.get("rows", []):
-                if int(row.get("leased_count") or 0) or int(row.get("dead_letter_count") or 0):
-                    blockers.append(f"source queue {row.get('queue_name')} has leased/dead_letter jobs")
+                dead_letter_count = int(row.get("dead_letter_count") or 0)
+                if dead_letter_count:
+                    blockers.append(f"source queue {row.get('queue_name')} has dead-letter jobs")
 
             for model_code, base_url in self.model_base_urls.items():
                 if not self._model_code_required(model_code):
@@ -1228,13 +1247,14 @@ class SchedulerRuntime:
                 now=checked_at,
                 owner_service="source-data-service",
             )
+        source_submit_timeout = max(self.request_timeout_seconds * 6, 30)
         for task in tasks:
             task_id = str(task["task_instance_id"])
             lease = self.task_store.acquire_lease(
                 task_id,
                 lease_owner=lease_owner,
                 now=checked_at,
-                lease_seconds=max(int(self.request_timeout_seconds * 3), 30),
+                lease_seconds=max(int(source_submit_timeout * 2), 60),
             )
             if not lease.acquired:
                 details["skipped"].append(
@@ -1248,13 +1268,34 @@ class SchedulerRuntime:
             endpoint_path = str(payload.pop("__source_endpoint_path", "/source/fetch/submit") or "/source/fetch/submit")
             if not endpoint_path.startswith("/source/"):
                 endpoint_path = "/source/fetch/submit"
-            response = self.client.post(
-                f"{self.source_data_base_url}{endpoint_path}",
-                json=payload,
-                timeout=self.request_timeout_seconds,
-            )
-            status_code = int(getattr(response, "status_code", 0))
-            body = self._response_json(response)
+            try:
+                response = self.client.post(
+                    f"{self.source_data_base_url}{endpoint_path}",
+                    json=payload,
+                    timeout=source_submit_timeout,
+                )
+                status_code = int(getattr(response, "status_code", 0))
+                body = self._response_json(response)
+            except Exception as exc:  # noqa: BLE001
+                status_code = 0
+                body = {"error": str(exc)}
+                details["dispatched"].append(
+                    {
+                        "task_instance_id": task_id,
+                        "task_code": task.get("task_code"),
+                        "source_endpoint_path": endpoint_path,
+                        "status_code": status_code,
+                        "source_result_status": "submit_exception",
+                        "timeout_seconds": source_submit_timeout,
+                        "error": str(exc),
+                    }
+                )
+                self.task_store.mark_failure(
+                    task_id,
+                    error_code="source_fetch_submit_exception",
+                    error_message=str(exc),
+                )
+                continue
             source_result_status = "submit_accepted_pending_source_build" if 200 <= status_code < 300 else "submit_failed"
             if 200 <= status_code < 300 and self._is_source_duplicate_noop(body):
                 source_result_status = "submit_duplicate_no_new_job"
@@ -1266,6 +1307,7 @@ class SchedulerRuntime:
                 "source_fetch_batch_id": body.get("fetch_batch_id"),
                 "queue_name": body.get("queue_name"),
                 "source_result_status": source_result_status,
+                "timeout_seconds": source_submit_timeout,
             }
             details["dispatched"].append(dispatched)
             if 200 <= status_code < 300:
@@ -1294,6 +1336,25 @@ class SchedulerRuntime:
         except (TypeError, ValueError):
             return False
         return submitted == 0 and skipped > 0
+
+    @staticmethod
+    def _source_instance_lifecycle_expires_at(instance: Any) -> datetime | None:
+        request_body = getattr(instance, "request_body", {})
+        if not isinstance(request_body, dict):
+            return None
+        context = request_body.get("orchestration_context")
+        if not isinstance(context, dict):
+            return None
+        value = context.get("lifecycle_expires_at") or context.get("lifecycle_expires_at_local")
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     def _stage_candidate_symbols_by_source(
         self,

@@ -1010,8 +1010,15 @@ class PostgresRawSourceRepository:
             "build_result_count": build_result_count,
         }
 
-    def read_source_rows(self, source_table_name: str | None = None, symbol: str | None = None, trade_date: str | None = None) -> list[SourceCanonicalRowOut]:  # pragma: no cover - requires runtime Postgres
-        # Keep this intentionally narrow for source daily bars used by acceptance.
+    def read_source_rows(
+        self,
+        source_table_name: str | None = None,
+        symbol: str | None = None,
+        trade_date: str | None = None,
+        limit: int | None = 1000,
+    ) -> list[SourceCanonicalRowOut]:  # pragma: no cover - requires runtime Postgres
+        # Keep the public read path bounded by default; internal scheduler/source
+        # planning can explicitly request a larger/unbounded source universe.
         if not self.ready or not source_table_name:
             return []
         schema, table = _schema_table(source_table_name)
@@ -1034,7 +1041,9 @@ class PostgresRawSourceRepository:
             sql = f'SELECT * FROM "{schema}"."{table}"'
             if where:
                 sql += " WHERE " + " AND ".join(where)
-            sql += " LIMIT 1000"
+            if limit is not None:
+                sql += " LIMIT %s"
+                params.append(max(1, int(limit)))
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()

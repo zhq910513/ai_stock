@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -460,6 +461,76 @@ def test_observation_board_marks_elapsed_day2_without_watch_as_data_wait(monkeyp
     assert item["display_update_at"] == "2026-06-29T07:00:00"
     assert item["latest_data_fetch_at"] == "2026-06-29T07:00:00"
     assert "Day2" in item["key_reason"]
+
+
+def _patch_market_now(monkeypatch, current: datetime) -> None:  # noqa: ANN001
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ANN001
+            return current if tz is None else current.astimezone(tz)
+
+    monkeypatch.setattr(api, "datetime", FakeDateTime)
+
+
+def test_day2_elapsed_uses_expected_day2_not_current_clock_only(monkeypatch) -> None:  # noqa: ANN001
+    _patch_market_now(monkeypatch, datetime(2026, 6, 29, 10, 20, tzinfo=api.MARKET_TIMEZONE))
+    assert api._day2_window_elapsed("2026-06-26") is False
+
+    _patch_market_now(monkeypatch, datetime(2026, 6, 29, 10, 31, tzinfo=api.MARKET_TIMEZONE))
+    assert api._day2_window_elapsed("2026-06-26") is True
+
+    _patch_market_now(monkeypatch, datetime(2026, 7, 2, 10, 20, tzinfo=api.MARKET_TIMEZONE))
+    assert api._day2_window_elapsed("2026-06-26") is True
+
+
+def test_model_result_snapshot_does_not_revive_elapsed_data_wait(monkeypatch) -> None:  # noqa: ANN001
+    class FakeRepository:
+        def status(self):
+            return {"repository_attached": True, "warning_codes": []}
+
+        def list_day1_observation_candidates(self, *, limit=100):  # noqa: ANN001, ARG002
+            return [
+                {
+                    "day1_candidate_id": "day1-qualified",
+                    "canonical_symbol": "000823.SZ",
+                    "stock_name": "超声电子",
+                    "trade_date": "2026-06-26",
+                    "candidate_status": "qualified",
+                    "is_t_board": True,
+                    "float_market_cap_pass": True,
+                    "created_at": "2026-06-26T07:53:37+00:00",
+                }
+            ]
+
+        def list_observation_rows(self, entity, *, limit=100):  # noqa: ANN001, ARG002
+            return []
+
+        def list_observation_monitor_snapshots(self, *, limit=100):  # noqa: ANN001, ARG002
+            return [
+                {
+                    "observation_snapshot_id": "snapshot-continue-watch",
+                    "day1_candidate_id": "day1-qualified",
+                    "monitor_interval_minutes": 30,
+                    "captured_at": "2026-07-02T02:02:00+00:00",
+                    "observation_status": "continue_watch",
+                    "current_conclusion": "等待Day2开盘后滚动观察",
+                    "model_score": 48,
+                    "model_score_label": "低",
+                    "score_state": "scored",
+                }
+            ]
+
+    monkeypatch.setattr(api, "_repository", lambda: FakeRepository())
+    monkeypatch.setattr(api, "_day2_window_elapsed", lambda day1_trade_date: True)
+
+    item = TestClient(app).get("/t-board-relay/observation-board").json()["items"][0]
+
+    assert item["observation_status"] == "data_wait"
+    assert item["current_conclusion"] == "Day2 监测数据未落库，暂不继续观察"
+    assert item["model_score"] is None
+    assert item["score_state"] == "data_wait"
+    assert item["last_model_output_at"] == "2026-07-02T02:02:00+00:00"
+    assert item["latest_data_fetch_at"] == "2026-06-26T07:53:37+00:00"
 
 
 def test_observation_columns_exclude_audit_payloads() -> None:

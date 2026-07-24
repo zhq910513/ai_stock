@@ -104,9 +104,11 @@ GET /t-board-relay/observation-monitor/snapshots
 - `observation-board` 在读取 Day2 触发、封板维护、Day3、outcome 和博弈假设前，必须同时读取每个 Day1 合格对象最新的 `decision_t_relay.t_board_day2_watch_snapshot_v1`。
 - Day2 尚未形成有效触发时，若已有五分钟 watch 快照，普通用户投影仍要展示 `day2_trade_date`、由 `as_of_time` 转成的 `day2_trigger_time`、当前判断、关键依据、风险结论和来自 watch 的 `latest_snapshot_time`。
 - Day2 `09:30-10:30` 窗口已过且没有有效 Day2 watch / trigger 事实时，`observation_status=data_wait`、`score_state=data_wait`、`model_score=NULL`，关键依据必须说明 Day2 五分钟监测事实缺失；不得继续显示“观察中”或用 Day1 旧事实冒充仍在观察。
+- Day2 窗口是否已过必须先按 Asia/Shanghai 从 Day1 推导预期 Day2 工作日，周末顺延；当前日期已经晚于该预期 Day2 时，视为窗口已过，不再受当前钟点是否到 10:30 影响。缺交易日历时该工作日口径只是保守近似，不能用来补事实。
 - `ASK` / `BID` 只允许保留在内部事实枚举中；普通用户文案必须翻译为“买盘主动扫掉卖盘”“卖盘主动砸向买盘”或“盘口方向待确认”。
 - Day2 有效触发后，`decision_t_relay.t_board_post_entry_monitor_v1` 继续 append-only 留存封板维护快照；触发后开板必须及时投影为停止观察，同时保留原始监测记录。
 - 观察台输出的时间分三层：`latest_data_fetch_at`、`last_data_captured_at`、`updated_at`、`display_update_at` 和 `latest_snapshot_time` 指向最近真实阶段事实时间，单条阶段记录优先使用 `as_of_time`、`captured_at`、`available_at` 或 `as_of_time_utc`，没有业务时间时才退回 `updated_at` / `created_at`；`latest_projection_snapshot_at` 只指向最近一次 5 分钟观察投影快照时间，用于审计和恢复排查，不驱动 `display_update_at/latest_snapshot_time`；30 分钟模型快照时间进入 `last_model_output_at/model_evaluated_at`，作为最后一次模型产出时间，不得冒充真实抓取时间。
+- 30 分钟 `model_result_30m` 可以刷新最近模型产出时间；但当 owner 基于当前阶段事实已经判为 `data_wait`、`stopped` 或 `completed` 时，历史快照不得把状态、分数、当前判断、关键依据或风险结论复活为 `continue_watch` / `opportunity`。
 - 观察台输出 `last_monitor_at`、`monitor_interval_minutes` 和 `monitoring_summary`，由现有 Day2 watch、Day2 trigger、post-entry monitor、Day3 和 outcome 阶段记录只读派生；若底层阶段表没有真实计数字段，不伪造监测次数。
 - 观察台同步输出 `model_score`、`model_score_label`、`score_state` 和 `model_score_version=t_board_relay_observation_score_v1`。分数由模型四 owner 根据 Day1 封单/分歧吸收、Day2 五分钟滚动接近涨停、ASK 扫卖盘确认、BID 主动砸盘风险、触发后封板维护、Day3 去留和 outcome 阶段事实综合计算；关键事实缺失时 `model_score=NULL`、`score_state=data_wait`，不得用 0 或前端推断补齐。接口先构建最多 500 条 Day1 合格对象的评分排序窗口，再按 `model_score` 降序、无分后置、更新时间倒序返回 `limit` 条。
 
@@ -516,6 +518,19 @@ Day2 输出：
 - 回滚方式：回退本对象后续 owner 时间字段 / snapshot 分流变更，并重新构建或重启受影响 owner 容器做 readyz、observation-board、snapshot 和 frontend compact 只读验收；不得通过清库、全栈重建或重启 `source-data-service` 回滚时间事实。
 - 验证清单：30 分钟模型结果能推动 `last_model_output_at/model_evaluated_at`；5 分钟快照只推动 `latest_projection_snapshot_at`；真实抓取/阶段事实时间不被投影覆盖；前端同时展示“模型”和“抓取”两段时间；模型四、research 和前端合同测试通过；scheduler/data-inspector/source 健康。
 
+### t-board-relay-service -> observation-board -> terminal data gap and stale result guard
+
+- 冻结对象：`t-board-relay-service -> observation-board -> terminal data gap and stale result guard`。
+- 冻结时间：2026-07-02 Asia/Shanghai。
+- 拍板人 / 确认来源：用户在本轮交付报告后明确回复“拍板”；此前用户指出模型四前端不应让第二天或第三天已经不符合的对象继续留在待观察状态。
+- 锁定范围：`GET /t-board-relay/observation-board` 的 Day2 窗口过期判定、`data_wait` 投影、模型分空态和 30 分钟历史结果快照覆盖边界。Day2 `09:30-10:30` 窗口已过且没有有效 Day2 watch / trigger 事实时，必须投影为 `observation_status=data_wait`、`score_state=data_wait`、`model_score=NULL`，不得继续显示观察中。窗口是否已过必须按 Asia/Shanghai 先由 Day1 推导预期 Day2 工作日并周末顺延；当前日期晚于预期 Day2 时即视为窗口已过，不受当前时刻是否到 10:30 影响。30 分钟 `model_result_30m` 只能刷新模型产出时间；当 owner 当前投影已基于真实阶段事实或缺口判为 `data_wait`、`stopped` 或 `completed` 时，历史模型结果快照不得把状态、分数、当前判断、关键依据或风险结论复活为 `continue_watch` / `opportunity`。
+- 当前冻结证据：2026-07-02 重新构建并单独重启 `t-board-relay-service` 后 `/readyz=ready`；`/t-board-relay/observation-board?limit=20` 中 `000823.SZ` 为 `observation_status=data_wait`、`model_score=NULL`，Day1 为 `2026-06-26`，真实阶段事实时间仍为 `2026-06-26T07:53:37.143354+00:00`，最后模型产出时间为 `2026-07-02T07:02:00+00:00`；前端默认 `/api/model-list/tboard?limit=20` 返回 0 条，审计参数仍可查询 000823；模型四 owner 单测 30 passed。
+- 允许的只读验收：读取 `/readyz`、`/t-board-relay/observation-board`、`/t-board-relay/observation-monitor/snapshots`、`/t-board-relay/repository/status`、frontend `/api/model-list/tboard` 默认与 `include_stale_stopped=true` 响应、scheduler `/readyz`、data-inspector `/readyz`，以及模型四 owner 单测。
+- 禁止修改项：未经解锁不得把 Day2 已错过验证窗口且缺真实监测事实的对象继续显示为 `continue_watch`、不得把 `data_wait` 分数补为 0、不得让历史 `model_result_30m` 覆盖当前终止或缺口状态、不得用 5 分钟投影快照或当前时间补真实抓取 / 阶段事实时间、不得删除 observation monitor snapshot 或 owner append-only 审计事实、不得让模型四 owner 直接调用 provider/raw 或输出交易、买点、official signal。
+- 解锁条件：用户明确批准本冻结对象解锁；若涉及 Day2/Day3 状态机、正式交易日历、snapshot 表结构、scheduler 模型四频率、source 抓取链路、schema/Docker 或前端普通用户合同，必须分别说明影响范围、拟修改文件、回滚方式和验证清单。
+- 回滚方式：回退本对象后续 owner Day2 过期判定、快照覆盖边界、测试和文档变更，并仅 `--no-deps` 替换或重启 `t-board-relay-service` 做 readyz、observation-board 和 frontend compact 只读验收；不清库、不删除快照、不重启 `source-data-service`。
+- 验证清单：Day2 预期工作日已过时缺有效监测事实的对象投影为 `data_wait` 且 `model_score=NULL`；历史 30 分钟结果不得复活 `continue_watch` / 旧分数；真实抓取 / 阶段事实时间不被投影覆盖；前端默认列表下架终止 / 过期缺口对象，审计参数仍可查；模型四 owner、frontend、scheduler、data-inspector、source 健康。
+
 ### t-board-relay-service -> observation-board -> Day2 post-entry failure projection
 
 - 冻结时间：2026-06-24 Asia/Shanghai。
@@ -527,3 +542,12 @@ Day2 输出：
 - 解锁条件：用户明确批准本子对象解锁；若涉及 scheduler 时间轮、schema/source/data-inspector/Docker，需另行说明影响范围和回滚方式。
 - 回滚方式：回退后续 owner projection/repository 文档或代码变更；如曾发布镜像则仅重建/替换 t-board owner，不触碰 source-data-service/source-data-worker/data-inspector/Postgres。
 - 验证清单：4 条 Day1 合格对象可读；600172.SH 显示开板失败；风险结论不是免责声明；compact 不泄露审计 payload；Day3 自然窗口未完成前不得写成已完成结论。
+
+### t-board-relay-service -> model4 reset -> 2026-07-08 zero state
+
+- Record time: 2026-07-08 Asia/Shanghai.
+- Confirmation source: user explicitly approved clearing model4 data within the locked scope and without historical backup.
+- Cleared scope: all rows in `decision_t_relay.*`, all rows in `research_t_relay.*`, and `governance.research_model_execution_audit_v1` rows where `model_code='t_board_relay'`, `owner_service='t-board-relay-service'`, or `task_code LIKE 't_relay.%'`.
+- Preserved scope: `source.*`, `raw_*`, lineage, provider probes, source fetch queue, scheduler task store, Cookie/runtime source credentials, Docker images, service code, model thresholds, state machine, frontend contract, and locked scheduler/data-inspector/source facts.
+- Verification facts: 9 model4 owner/research tables are `0` rows; model4 research execution audit is `0` rows; `GET /t-board-relay/observation-board?limit=100&include_stale_stopped=true` returns `0` items; source, scheduler, data-inspector, and t-board-relay readyz are ready.
+- Boundary: this is an authorized zero-data operational state only. Future model4 data must be regenerated by the formal scheduler/research/owner chain and must keep real `NULL`, gap codes, blocked states, and append-only semantics.

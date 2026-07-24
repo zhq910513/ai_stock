@@ -312,3 +312,15 @@ python scripts/core_services_acceptance.py --require-postgres --source-quality-m
 - 解锁条件：用户明确批准 `hot-candidates-service -> owner contract/frontend-readonly chain -> model1 closure evidence` 解锁，并说明目标、影响范围、拟修改文件、回滚方式和验证清单；若需要改变 Cookie/API/provider/source 表或 scheduler 频率，必须另行解锁 source-data-service 或 scheduler-service 对应对象。
 - 回滚方式：回退本冻结对象相关 README/DATA_ASSETS 记录或后续被批准的合同改动，恢复当前 owner 只读消费 source 标准层、source preflight hard block 和前端只读展示口径；回滚后必须重新验证 owner ready、scheduler 热点校验、source 付费概率状态和模型一/前端测试。
 - 验证清单：`python -m pytest -q -p no:cacheprovider services/models_services/hot-candidates-service/tests`；`python -m pytest -q services/shence-frontend-service/tests/test_frontend_contract.py`；`GET /readyz`；`GET /scheduler/validate/hot-candidates`；`GET /scheduler/validate/hot-workflow`；`GET /scheduler/validate/source-schedule`；`GET /source/ths/paid-probability/cookie/status`；`GET /source/ths/paid-probability/batch-status?trade_date=2026-06-18`；`#/model-hot` 页面可见文本不出现 `source_gap:*`、接口路径、raw/provider 程序细节，缺失事实显示中文空态。
+
+### hot-candidates-service -> model1 reset -> 2026-07-08 zero state
+
+- 记录时间：2026-07-08 Asia/Shanghai。
+- 确认来源：用户批准“按此范围清理模型一数据，无需备份历史数据”，随后用户回复“你来决定”，由 Codex 判定本轮清理事实可拍板记录。
+- 清理范围：清空 `decision_hot.*` 全部模型一事实表；删除 `governance.research_model_execution_audit_v1` 中 `model_code='hot_candidates'`、`owner_service='hot-candidates-service'` 或 `task_code LIKE 'hot.%'` 的执行审计行。
+- 明确未清范围：未清理 `source.*`、`raw_ths.*`、`governance.source_lineage_v1`、`governance.ths_paid_probability_batch_status_v1`、`governance.ths_paid_probability_cookie_v1`、scheduler task store、source fetch queue、provider probe evidence、Docker 镜像或代码。
+- 当前运行事实：清理后 `decision_hot_total=0`，模型一 execution audit 剩余 `0`；`/research/model-list/hot?limit=20` 返回 `item_count=0`；source 概率 `279` 行、raw 概率 `309` 行、付费概率批次状态 `17` 行、Cookie `3` 行仍在；source、scheduler、data-inspector 均 ready，source queue `queued=0/leased=0/dead_letter=0`。
+- 当前等待条件：`2026-07-08` 付费概率批次为 `no_candidates`，候选数 `0`；THS 付费概率 Cookie 状态为 `expired`，最近成功时间 `2026-06-29T12:30:18.780506Z`，最近失败原因 `ths paid probability status=403 msg=denied`。后续模型一重新产出必须等待真实收盘候选和有效 Cookie；缺候选或 Cookie 失效时必须保留真实阻断，不得用 0、手填、旧 payload、mock 或 GPT 推断补概率。
+- 只读验收：`GET /research/model-list/hot?limit=20`、`GET /source/ths/paid-probability/cookie/status`、`GET /source/ths/paid-probability/batch-status?trade_date=2026-07-08`、source queue summary、scheduler `/readyz`、数据库只读计数。
+- 禁止事项：不得把当前空列表解释为模型一已恢复产出；不得绕过 source-data-service 抓取链路；不得让 hot-candidates-service 读取 Cookie、调用 THS provider、读取 raw、补写概率或跳过 `/source/release/preflight` 发布 official signal。
+- 回滚方式：本轮按用户要求未备份历史模型一事实，无法用备份恢复已删除的 `decision_hot.*` 和模型一 execution audit；只能在后续真实 source 数据成熟后通过正式 scheduler/research/model 链路重新生成新事实。

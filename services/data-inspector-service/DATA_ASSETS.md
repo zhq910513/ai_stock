@@ -47,7 +47,7 @@ run `2095` 是 research payload 组装缺口审计，不是 `core_closure` 守�
 | 资产 | 用途 | 边界 |
 |---|---|---|
 | `GET /source/ops/production-readiness` | source 生产门禁 | 只读 |
-| `GET /source/fetch/queues/summary` | 队列 leased/dead-letter 阻断 | 只读 |
+| `GET /source/fetch/queues/summary` | 队列 dead-letter 阻断与采集进度审计 | 只读；`dead_letter_count` 阻断 startup/core，`queued_count`/`leased_count`/`failed_count` 保留为待处理、处理中和失败审计，不直接等同服务不可用 |
 | `GET /source/contracts` | source 字段合同可见性 | 只读 |
 | `POST /source/release/preflight` | 三模型 official 和模型四 Day1/Day2 preflight | 只读请求，不发布信号 |
 | `source.*` 标准事实表 | source 行存在性、覆盖度、质量状态 | 只读 |
@@ -91,7 +91,7 @@ run `2095` 是 research payload 组装缺口审计，不是 `core_closure` 守�
 
 | 冻结对象 | 数据资产范围 | 验收证据 | 只读验收 | 解锁条件 |
 |---|---|---|---|---|
-| `data-inspector-service -> core_closure -> source/model/scheduler gate` | `decision.data_inspection_*`、`source.*` 只读、`governance.source_lineage_v1`、`/source/release/preflight`、required 模型 owner `/readyz`、disabled owner `disabled_by_policy` 审计、scheduler `/readyz` | 历史 run `2085` ready；gap_count=0；p0_gap_count=0；p1_gap_count=0；15 个巡检域全部 observed；当前策略由 `DATA_INSPECTOR_REQUIRED_MODEL_SERVICES` 收窄 | `POST /inspection-runs`、`GET /inspection-runs/latest`、`GET /inspection-gaps`、runtime policy evidence | 任一 P0/P1 gap、source readiness blocked、queue dead-letter、lineage presence 缺失、required owner not ready、required model policy 变化，或用户明确批准解锁。 |
+| `data-inspector-service -> core_closure -> source/model/scheduler gate` | `decision.data_inspection_*`、`source.*` 只读、`governance.source_lineage_v1`、`/source/release/preflight`、required 模型 owner `/readyz`、disabled owner `disabled_by_policy` 审计、scheduler `/readyz` | 历史 run `2085` ready；gap_count=0；p0_gap_count=0；p1_gap_count=0；15 个巡检域全部 observed；当前策略由 `DATA_INSPECTOR_REQUIRED_MODEL_SERVICES` 收窄；2026-07-14 起 source queue health 只以 dead-letter 作为队列 P0 阻断，queued/leased/failed 仅作进度/失败审计 | `POST /inspection-runs`、`GET /inspection-runs/latest`、`GET /inspection-gaps`、runtime policy evidence | 任一 P0/P1 gap、source readiness blocked、queue dead-letter、lineage presence 缺失、required owner not ready、required model policy 变化，或用户明确批准解锁。 |
 
 ## 2026-06-18 Post Source/Scheduler Freeze 数据资产复核
 

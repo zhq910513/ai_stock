@@ -6,7 +6,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
@@ -94,6 +94,20 @@ def _parse(value: str | datetime) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _instance_lifecycle_expires_at(instance: dict[str, Any]) -> datetime | None:
+    request_body = instance.get("request_body") if isinstance(instance.get("request_body"), dict) else {}
+    context = request_body.get("orchestration_context") if isinstance(request_body.get("orchestration_context"), dict) else {}
+    for key in ("lifecycle_expires_at", "lifecycle_expires_at_local"):
+        value = context.get(key) or instance.get(key)
+        if not value:
+            continue
+        try:
+            return _parse(str(value))
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 @dataclass(frozen=True)
@@ -739,6 +753,180 @@ class SchedulerSQLiteTaskStore:
             ).fetchall()
         return {str(row["status"]): int(row["count"]) for row in rows}
 
+    def daily_source_execution_summary(
+        self,
+        *,
+        trading_day: date,
+        materialized_instances: list[dict[str, Any]],
+        now: datetime,
+        owner_service: str = "source-data-service",
+    ) -> dict[str, Any]:
+        """Read-only reconciliation between today's source schedule and task store."""
+        checked_at = _parse(now)
+        planned = [dict(item) for item in materialized_instances]
+        biz_keys = [str(item.get("biz_key") or "").strip() for item in planned if str(item.get("biz_key") or "").strip()]
+        task_by_biz_key: dict[str, dict[str, Any]] = {}
+        if biz_keys:
+            with self._db_lock:
+                for start in range(0, len(biz_keys), 900):
+                    chunk = biz_keys[start : start + 900]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = self.conn.execute(
+                        f"""
+                        SELECT *
+                        FROM task_instance_v1
+                        WHERE owner_service = ?
+                          AND biz_key IN ({placeholders})
+                        ORDER BY updated_at DESC
+                        """,
+                        (owner_service, *chunk),
+                    ).fetchall()
+                    for row in rows:
+                        item = dict(row)
+                        task_by_biz_key.setdefault(str(item.get("biz_key") or ""), item)
+
+        task_output_by_id: dict[str, dict[str, Any]] = {}
+        task_ids = [str(item.get("task_instance_id") or "").strip() for item in task_by_biz_key.values()]
+        task_ids = [item for item in task_ids if item]
+        if task_ids:
+            with self._db_lock:
+                for start in range(0, len(task_ids), 900):
+                    chunk = task_ids[start : start + 900]
+                    placeholders = ",".join("?" for _ in chunk)
+                    log_rows = self.conn.execute(
+                        f"""
+                        SELECT task_instance_id, payload_json
+                        FROM task_run_log_v1
+                        WHERE event_type = 'finished'
+                          AND task_instance_id IN ({placeholders})
+                        ORDER BY event_time DESC
+                        """,
+                        tuple(chunk),
+                    ).fetchall()
+                    for log_row in log_rows:
+                        task_instance_id = str(log_row["task_instance_id"] or "")
+                        if task_instance_id in task_output_by_id:
+                            continue
+                        try:
+                            payload = json.loads(str(log_row["payload_json"] or "{}"))
+                        except json.JSONDecodeError:
+                            payload = {}
+                        task_output_by_id[task_instance_id] = payload if isinstance(payload, dict) else {}
+
+        rows: list[dict[str, Any]] = []
+        latest_task_update_at: str | None = None
+        status_counts: dict[str, int] = {}
+        table_counts: dict[str, dict[str, Any]] = {}
+
+        for instance in planned:
+            biz_key = str(instance.get("biz_key") or "")
+            task = task_by_biz_key.get(biz_key)
+            scheduled_at = _parse(instance.get("scheduled_at"))
+            is_due = scheduled_at <= checked_at
+            lifecycle_expires_at = _instance_lifecycle_expires_at(instance)
+            lifecycle_expired = bool(is_due and lifecycle_expires_at and checked_at > lifecycle_expires_at)
+            raw_status = str(task.get("status") if task else ("not_due" if not is_due else "not_enqueued"))
+            status_counts[raw_status] = status_counts.get(raw_status, 0) + 1
+            if task and task.get("updated_at"):
+                update_text = str(task.get("updated_at"))
+                if latest_task_update_at is None or _parse(update_text) > _parse(latest_task_update_at):
+                    latest_task_update_at = update_text
+            task_output = task_output_by_id.get(str(task.get("task_instance_id") or ""), {}) if task else {}
+            if raw_status in {"success", "source_duplicate_skipped"}:
+                execution_status = "completed"
+                status_label = "已执行"
+            elif raw_status == "running":
+                execution_status = "collecting"
+                status_label = "执行中"
+            elif raw_status in {"retry_ready", "dead_letter", "failed", "blocked_data_gap"}:
+                execution_status = "failed"
+                status_label = "????"
+            elif lifecycle_expired and raw_status in {"not_enqueued", "pending"}:
+                execution_status = "expired_closed"
+                status_label = "?????"
+            elif not is_due:
+                execution_status = "not_due"
+                status_label = "??????"
+            else:
+                execution_status = "awaiting_dispatch"
+                status_label = "?????"
+
+            source_table_name = str(instance.get("source_table_name") or "")
+            table_bucket = table_counts.setdefault(
+                source_table_name,
+                {
+                    "source_table_name": source_table_name,
+                    "planned_task_count": 0,
+                    "due_task_count": 0,
+                    "completed_task_count": 0,
+                    "not_due_task_count": 0,
+                    "collecting_task_count": 0,
+                    "failed_task_count": 0,
+                    "awaiting_dispatch_task_count": 0,
+                    "expired_closed_task_count": 0,
+                },
+            )
+            table_bucket["planned_task_count"] += 1
+            table_bucket["due_task_count"] += 1 if is_due else 0
+            table_bucket[f"{execution_status}_task_count"] = int(table_bucket.get(f"{execution_status}_task_count") or 0) + 1
+
+            rows.append(
+                {
+                    **instance,
+                    "owner_service": owner_service,
+                    "task_instance_id": task.get("task_instance_id") if task else None,
+                    "task_status": raw_status,
+                    "execution_status": execution_status,
+                    "status": execution_status,
+                    "status_label": status_label,
+                    "is_due": is_due,
+                    "lifecycle_expires_at": lifecycle_expires_at.isoformat() if lifecycle_expires_at else None,
+                    "lifecycle_expired": lifecycle_expired,
+                    "started_at": task.get("started_at") if task else None,
+                    "finished_at": task.get("finished_at") if task else None,
+                    "updated_at": task.get("updated_at") if task else None,
+                    "error_code": task.get("error_code") if task else None,
+                    "retry_count": int(task.get("retry_count") or 0) if task else 0,
+                    "source_fetch_batch_id": task_output.get("fetch_batch_id") if task_output else None,
+                    "source_fetch_status": task_output.get("status") if task_output else None,
+                    "source_fetch_queue_name": task_output.get("queue_name") if task_output else None,
+                    "source_submitted_job_count": int(task_output.get("submitted_job_count") or 0) if task_output else 0,
+                    "source_skipped_duplicate_count": int(task_output.get("skipped_duplicate_count") or 0) if task_output else 0,
+                    "source_producer_ack": task_output.get("producer_ack") if task_output else None,
+                }
+            )
+
+        planned_count = len(rows)
+        completed_count = sum(1 for row in rows if row["execution_status"] == "completed")
+        not_due_count = sum(1 for row in rows if row["execution_status"] == "not_due")
+        collecting_count = sum(1 for row in rows if row["execution_status"] == "collecting")
+        failed_count = sum(1 for row in rows if row["execution_status"] == "failed")
+        awaiting_dispatch_count = sum(1 for row in rows if row["execution_status"] == "awaiting_dispatch")
+        expired_closed_count = sum(1 for row in rows if row["execution_status"] == "expired_closed")
+        due_count = planned_count - not_due_count
+        return {
+            "contract_kind": "scheduler_daily_source_execution_summary_v1",
+            "read_only": True,
+            "task_store_version": TASK_STORE_VERSION,
+            "owner_service": owner_service,
+            "trading_day": trading_day.isoformat(),
+            "generated_at": checked_at.isoformat(),
+            "summary": {
+                "planned_task_count": planned_count,
+                "due_task_count": due_count,
+                "completed_task_count": completed_count,
+                "unfinished_task_count": max(planned_count - completed_count, 0),
+                "not_due_task_count": not_due_count,
+                "collecting_task_count": collecting_count,
+                "failed_task_count": failed_count,
+                "awaiting_dispatch_task_count": awaiting_dispatch_count,
+                "expired_closed_task_count": expired_closed_count,
+                "latest_task_update_at": latest_task_update_at,
+                "status_counts": status_counts,
+            },
+            "by_source_table": sorted(table_counts.values(), key=lambda item: item["source_table_name"]),
+            "tasks": rows,
+        }
     def _ensure_payload_column(self) -> None:
         columns = {
             str(row["name"])

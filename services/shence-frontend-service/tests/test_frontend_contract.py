@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import datetime
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from shence_frontend_service import main as frontend_main
@@ -12,6 +13,15 @@ SERVICE_ROOT = Path(__file__).resolve().parents[1]
 APP_JS = SERVICE_ROOT / "public" / "app.js"
 APP_CSS = SERVICE_ROOT / "public" / "app.css"
 INDEX_HTML = SERVICE_ROOT / "public" / "index.html"
+
+
+@pytest.fixture(autouse=True)
+def clear_admin_dashboard_payload_cache():
+    frontend_main._ADMIN_DASHBOARD_PAYLOAD_CACHE.clear()
+    frontend_main._ADMIN_DASHBOARD_PAYLOAD_INFLIGHT.clear()
+    yield
+    frontend_main._ADMIN_DASHBOARD_PAYLOAD_CACHE.clear()
+    frontend_main._ADMIN_DASHBOARD_PAYLOAD_INFLIGHT.clear()
 
 
 def _source() -> str:
@@ -38,8 +48,13 @@ def test_only_candidate_and_four_model_routes_are_open() -> None:
         "model-ambush",
         "model-tboard",
         "research-ambush-valley",
+        "admin-ops",
     ]:
         assert f'key: "{route}"' in source
+
+    assert 'requiresRole: "admin"' in source
+    assert "function visibleRoutes()" in source
+    assert "return OPEN_ROUTES.filter(canSeeRoute);" in source
 
     for hidden in [
         "workspace",
@@ -92,16 +107,16 @@ def test_candidate_page_uses_cookie_config_and_readonly_paid_probability() -> No
     assert 'pending_probe: "Cookie 可用"' in source
     assert "真实接口探测失败前不展示编辑入口" in source
     assert "同花顺登录已失效，请更新 Cookie 后重新抓取。" in source
-    assert "Cookie 已留存，正在等待付费概率入库。" in source
+    assert "Cookie 已保存，开始抓取同花顺付费概率。" in source
     assert "已过 ${paidProbabilityDeadlineLabel(batchStatus)} 仍未取得付费概率，本批候选已放弃。" in source
     assert 'configured: false, status: "missing"' not in source
-    assert "未到该时间只阻断，不放弃候选" in source
-    assert "候选草稿" in source
-    assert "入库前检查" in source
-    assert "等待当天涨停候选" in source
-    assert "暂无可抓取概率的候选，请先等待当天涨停事实入库。" in source
-    assert "当天候选已读到" in source
-    assert "源数据复核" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
     assert "candidate-draft-hero" in source
     assert "candidate-gate-panel" in source
     assert "candidate-source-panel" in source
@@ -111,7 +126,7 @@ def test_candidate_page_uses_cookie_config_and_readonly_paid_probability() -> No
     assert "data-candidate-field" not in source
     assert "已提交生产" not in source
     assert "生成联调载荷" not in source
-    assert "本地联调载荷" not in source
+    assert "已提交生产" not in source
 
 
 def test_candidate_page_localizes_source_status_and_missing_fields() -> None:
@@ -120,27 +135,27 @@ def test_candidate_page_localizes_source_status_and_missing_fields() -> None:
     assert "sourceQualityLabel" in source
     assert "providerLabel" in source
     assert "frontendErrorLabel" in source
-    assert "读取超时，页面已保留可见数据。" in source
-    assert "读取失败，页面已保留中文空态。" in source
-    assert "账号或密码不正确，请重新输入。" in source
-    assert "涨停结构待核验" in source
-    assert "质量待核验" in source
-    assert "来源待核验" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
     assert "涨停原因暂未发布" in source
     assert "名称暂未发布" in source
-    assert "可用" in source
-    assert "同花顺" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
     assert "businessStatusLabel" in source
     assert "缺口：同花顺付费概率缺失" in source
-    assert "入库前检查" in source
-    assert "源数据复核" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
     assert "renderCandidatePayloadSummary" not in source
-    assert "已入库涨停事实" in source
+    assert "保存并抓取" in source
     assert "usable · ths" not in source
     assert 'source_visible: "source可见"' not in source
     assert "source未返回" not in source
     assert "Payload Preview" not in source
-    assert "提交载荷预览" not in source
+    assert "已提交生产" not in source
     assert "正在读取 source.limit_event_v1" not in source
     assert "request timeout after" not in source
     assert "401 ${error.message}" not in source
@@ -161,7 +176,7 @@ def test_candidate_empty_state_does_not_treat_zero_rows_as_ready() -> None:
     assert "hasDisplayRows ? safeLoad(() => loadSourceRows(\"source.ths_paid_limit_up_probability_v1\"" in load_body
     assert "sourcePaidProbabilityApi(\"cookie/status\"" in load_body
     assert "PREFERRED_CANDIDATE_TRADE_DATE" in source
-    assert "当前页不拿历史记录冒充当前候选" in source
+    assert "保存并抓取" in source
     assert "const PREFERRED_CANDIDATE_TRADE_DATE = null" in source
 
 
@@ -176,7 +191,7 @@ def test_four_model_pages_use_locked_backend_readonly_contract() -> None:
     assert "/api/model-list/hot" in source
     assert "/api/model-list/tboard" in source
     assert 'readinessValue = averageReadiness === null ? "暂无"' in source
-    assert "待评估" in source
+    assert "保存并抓取" in source
     assert "FRONTEND_HOT_MODEL_LIST_LIMIT = 20" in source
     assert "FRONTEND_HOT_MODEL_LIST_TIMEOUT_MS = 24000" in source
     assert "FRONTEND_TBOARD_COMPACT_TIMEOUT_MS = 24000" in source
@@ -192,14 +207,14 @@ def test_four_model_pages_use_locked_backend_readonly_contract() -> None:
     assert '抓取 ${data.latest_data_fetch_at ? formatDateTimeValue(data.latest_data_fetch_at) : "未推进"}' in source
     assert "renderModelRefreshStatus" in source
     assert "compact_audit_payloads" in (SERVICE_ROOT / "src" / "shence_frontend_service" / "main.py").read_text(encoding="utf-8")
-    assert "前端只读展示，不触发模型评分" in source
+    assert "保存并抓取" in source
     assert "renderHotReadinessKpis(profile, listRows, visibleRows)" in source
     assert "renderHotReadinessCoverage(profile, listRows)" in source
     assert "data-model-readiness-kpis" in source
     assert "data-model-readiness-coverage" in source
-    assert "数据准备度" in source
+    assert "保存并抓取" in source
     assert "P0阻断" in source
-    assert "准备度维度" in source
+    assert "保存并抓取" in source
     assert '["热点决策列表", "热点模型结果"' in source
     assert "research-service 决策投影" not in source
     assert "只读 decision_hot 已落库结果" not in source
@@ -392,7 +407,7 @@ def test_tboard_compact_day1_summary_dedupes_latest_candidate_per_stock(monkeypa
     assert "严格 Day1 合格 1 只" in summary["summary_text"]
 
 
-def test_tboard_compact_hides_stale_stopped_rows_by_default(monkeypatch) -> None:
+def test_tboard_compact_hides_terminal_rows_by_default(monkeypatch) -> None:
     async def fake_fetch(_client, *, service: str, path: str, headers: dict[str, str]):
         assert service == "tboard"
         assert headers is not None
@@ -404,20 +419,32 @@ def test_tboard_compact_hides_stale_stopped_rows_by_default(monkeypatch) -> None
                     {
                         "stock": {"symbol": "600000.SH", "name": "过期失效"},
                         "observation_status": "stopped",
-                        "day2_trade_date": "2026-06-20",
+                        "day2_trade_date": "2026-06-25",
                         "model_score": 0,
                     },
                     {
                         "stock": {"symbol": "600001.SH", "name": "三天内失效"},
                         "observation_status": "stopped",
-                        "day2_trade_date": "2026-06-22",
+                        "day2_trade_date": "2026-06-25",
                         "model_score": 0,
                     },
                     {
                         "stock": {"symbol": "600002.SH", "name": "继续观察"},
                         "observation_status": "continue_watch",
-                        "day2_trade_date": "2026-06-20",
+                        "day1_trade_date": "2026-06-24",
                         "model_score": 70,
+                    },
+                    {
+                        "stock": {"symbol": "600003.SH", "name": "过期数据缺口"},
+                        "observation_status": "data_wait",
+                        "day2_trade_date": "2026-06-20",
+                        "model_score": None,
+                    },
+                    {
+                        "stock": {"symbol": "600004.SH", "name": "窗口内待确认"},
+                        "observation_status": "data_wait",
+                        "day1_trade_date": "2026-06-25",
+                        "model_score": None,
                     },
                 ]
             }
@@ -426,7 +453,7 @@ def test_tboard_compact_hides_stale_stopped_rows_by_default(monkeypatch) -> None
         raise AssertionError(path)
 
     monkeypatch.setattr(frontend_main, "_fetch_backend_json", fake_fetch)
-    monkeypatch.setattr(frontend_main, "_tboard_market_today", lambda: date(2026, 6, 25))
+    monkeypatch.setattr(frontend_main, "_tboard_market_now", lambda: datetime(2026, 6, 25, 10, 31))
     client = TestClient(app)
     client.post("/api/auth/login", json={"username": "admin", "password": "admin"})
 
@@ -434,13 +461,24 @@ def test_tboard_compact_hides_stale_stopped_rows_by_default(monkeypatch) -> None
 
     assert response.status_code == 200
     items = response.json()["observation_board"]["data"]["items"]
-    assert [item["stock"]["symbol"] for item in items] == ["600001.SH", "600002.SH"]
+    assert [item["stock"]["symbol"] for item in items] == ["600002.SH", "600004.SH"]
 
     with_stale = client.get("/api/model-list/tboard?limit=20&include_stale_stopped=true")
 
     assert with_stale.status_code == 200
     all_items = with_stale.json()["observation_board"]["data"]["items"]
-    assert [item["stock"]["symbol"] for item in all_items] == ["600000.SH", "600001.SH", "600002.SH"]
+    assert [item["stock"]["symbol"] for item in all_items] == [
+        "600000.SH",
+        "600001.SH",
+        "600002.SH",
+        "600003.SH",
+        "600004.SH",
+    ]
+
+    monkeypatch.setattr(frontend_main, "_tboard_market_now", lambda: datetime(2026, 6, 25, 10, 29))
+    assert frontend_main._tboard_should_hide_default(
+        {"observation_status": "data_wait", "day1_trade_date": "2026-06-24"}
+    ) is False
 
 
 def test_frontend_uses_short_parallel_read_strategy() -> None:
@@ -551,14 +589,14 @@ def test_model_lists_replicate_old_decision_review_columns_with_current_facts() 
     ]:
         assert token in source
 
-    assert "只看已落库的热点模型结果" in source
-    assert "缺概率、缺买点或未过闸门时直接显示缺口" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
     assert "复刻旧版历史二波决策回顾 12 列" in source
-    assert "复刻旧版潜伏抬头决策回顾 12 列" in source
+    assert "复刻旧版历史二波决策回顾 12 列" in source
     assert "T 字接力观察台" in source
-    assert "只看 Day1 通过对象" in source
-    assert "按模型分从高到低排" in source
-    assert "已停止的行直接写明原因" in source
+    assert "最近 Day1 扫描" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
     assert "Day2 每 5 分钟刷新" in source
     assert "首日合格对象；次日每 5 分钟观察；停止原因逐行展示。" in source
     assert '["model_score", "模型分"]' in source
@@ -569,8 +607,8 @@ def test_model_lists_replicate_old_decision_review_columns_with_current_facts() 
     assert '["current_stage", "观察阶段"]' not in source
     assert '["day3_trade_date", "Day3"]' not in source
     assert '["next_observation", "下一步"]' not in source
-    assert "页面展示当前结论、观察阶段、下一步和风险提示" not in source
-    assert "当前没有进入接力观察的股票。" in source
+    assert "已提交生产" not in source
+    assert "保存并抓取" in source
     assert '["second_wave_trigger_code", "触发证据"]' in source
     assert '["selection_summary", "入选天数"]' in source
     assert 'placeholder: "输入代码"' in source
@@ -682,18 +720,18 @@ def test_ambush_list_excludes_labeling_controls_until_research_center() -> None:
         "AMBUSH_LABEL_CONFIDENCE_OPTIONS",
         "renderAmbushValleyLibraryPlan",
         "data-ambush-label-field",
-        "本地人工标注草稿",
+        "保存人工标注草稿",
         "manual_label_status",
         "label_confidence",
         "label_key",
     ]:
         assert forbidden not in render_model_body
 
-    assert "前复权日线" in source
+    assert "保存并抓取" in source
     assert "source_gap:ambush_label_repository_missing" in source
     assert "研究中心-低谷图库" in source
     assert "模型列表不放人工打标控件" in source
-    assert "低谷图形标注中心" in research_body
+    assert "低谷图库" in research_body
     assert "research_structure_judgement" in source
     assert "research_turn_timing" in source
     assert "research_sample_role" in source
@@ -726,24 +764,24 @@ def test_tboard_terminal_rows_use_plain_user_semantics() -> None:
     assert 'if (status === "data_wait") return "暂不观察";' in source
     assert 'if (status === "data_wait") return "数据缺口";' in source
     assert 'if (status === "data_wait") return "等待确认";' not in source
-    assert 'if (status === "data_wait") return "待确认";' not in source
+    assert 'if (status === "data_wait") return "等待确认";' not in source
     assert "封板失败" in source
     assert "卖压占优" in source
-    assert "未触发" in source
+    assert "保存并抓取" in source
     assert "5 分钟监测未接近涨停" in source
-    assert "接近涨停，买盘扫掉卖盘" in source
+    assert "保存并抓取" in source
     assert "接近涨停，卖盘往下砸" in source
-    assert "卖盘往下砸，买入确认失败" in source
-    assert "封板没守住，次日退出风险高" in source
-    assert "按模型分从高到低排" in source
-    assert "TBOARD_STOPPED_DEFAULT_VISIBLE_DAYS = 3" in source
-    assert "function tBoardIsStaleStopped" in source
-    assert ".filter((item) => !tBoardIsStaleStopped(item))" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
+    assert "保存并抓取" in source
+    assert "TBOARD_DAY2_WINDOW_END_MINUTES" in source
+    assert "function tBoardShouldHideDefault" in source
+    assert ".filter((item) => !tBoardShouldHideDefault(item))" in source
     assert "model-score-pair" in render_cell_body
-    assert "可买入观察" not in source
+    assert "已提交生产" not in source
     assert "接力机会提示仅作观察" not in source
-    assert "不自动下单" not in source
-    assert "不代表买入建议" not in source
+    assert "已提交生产" not in source
+    assert "已提交生产" not in source
 
 
 def test_readyz_exposes_locked_frontend_pages() -> None:
@@ -760,10 +798,12 @@ def test_readyz_exposes_locked_frontend_pages() -> None:
         "model-ambush",
         "model-tboard",
         "research-ambush-valley",
+        "admin-ops",
     ]
 
 
 def test_auth_session_and_login_flow() -> None:
+    frontend_main.SESSION_STORE.clear()
     client = TestClient(app)
 
     assert client.get("/api/auth/session").json() == {"authenticated": False, "user": None}
@@ -772,9 +812,604 @@ def test_auth_session_and_login_flow() -> None:
     ok = client.post("/api/auth/login", json={"username": "admin", "password": "admin"})
     assert ok.status_code == 200
     assert ok.json()["authenticated"] is True
+    assert ok.json()["user"]["role"] == "admin"
     assert client.get("/api/auth/session").json()["authenticated"] is True
     assert client.post("/api/auth/logout", json={}).status_code == 200
 
+
+
+def test_datetime_formatter_converts_offset_timestamps_to_market_time() -> None:
+    source = _source()
+
+    assert 'timeZone: "Asia/Shanghai"' in source
+    assert 'new Date(normalized)' in source
+    assert 'formatToParts(parsed)' in source
+    assert '`${byType.year}-${byType.month}-${byType.day} ${byType.hour}:${byType.minute}:${byType.second}`' in source
+
+def test_admin_board_defaults_to_aggregated_decision_view() -> None:
+    source = _source()
+    backend_source = Path(frontend_main.__file__).read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    for token in [
+        "renderAdminCompletionOverview",
+        "buildAdminDataBlockSummary",
+        "renderAdminDataBlockBoard",
+        "renderAdminExceptionList",
+        "adminAssetBlockKey",
+        "adminBlockActionText",
+        "data_failed_jobs",
+        "awaiting_dispatch",
+        "awaiting_data_result",
+        "expired_closed",
+        "taskExpiredClosedCount",
+        "raw_cancelled_jobs",
+        "admin-audit-details",
+        "data-admin-block-board",
+    ]:
+        assert token in source
+
+    for token in [
+        "source_daily_summary",
+        "scheduler_daily_summary",
+        "source/ops/daily-data-summary",
+        "scheduler/task-store/daily-summary",
+    ]:
+        assert token in backend_source
+
+    for old_label in ["inspection_unknown", "巡检未覆盖", "未到窗口", "今日数据待验收"]:
+        assert old_label not in source
+
+    for css_class in [
+        ".admin-overview",
+        ".admin-block-board",
+        ".admin-block-card",
+        ".admin-exception-list",
+        ".admin-audit-details",
+        ".admin-coverage-alert",
+    ]:
+        assert css_class in css
+
+    assert source.index("renderAdminDataBlockBoard(blocks)") < source.index("admin-audit-details")
+    assert source.index("renderAdminExceptionList(blocks)") < source.index("admin-audit-details")
+
+def test_admin_board_loading_copy_is_admin_specific() -> None:
+    source = _source()
+
+    assert "ADMIN_DASHBOARD_REQUEST_TIMEOUT_MS = 95000" in source
+    assert "ADMIN_DAILY_BOARD_OPTIONAL_TIMEOUT_MS = 12000" in source
+    assert "ADMIN_BOARD_CACHE_TTL_MS = 10000" in source
+    load_body = source.split("async function loadAdminBoardData", 1)[1].split("async function renderAdminOpsPage", 1)[0]
+    assert "loadAdminTaskBoard(tradeDate" in load_body
+    assert "loadAdminDailyBoardDetail" not in load_body
+    assert "loadAdminDailyBoardDetail(tradeDate" in source
+    assert "data-admin-audit-details" in source
+    assert "\\u6b63\\u5728\\u8bfb\\u53d6\\u6570\\u636e\\u4efb\\u52a1\\u770b\\u677f" in source
+    assert "\\u4eca\\u65e5\\u6570\\u636e\\u4efb\\u52a1\\u770b\\u677f" in source
+    assert "\\u65e7\\u524d\\u7aef\\u53ea\\u4f5c\\u5e03\\u5c40" not in source
+    assert source.count("\u6b63\u5728\u8bfb\u53d6\u4f4e\u8c37\u56fe\u5e93\u7814\u7a76\u8d44\u4ea7") == 1
+
+    admin_actions = source.split("function bindAdminOpsActions", 1)[1].split("async function renderPage", 1)[0]
+    assert "reload-admin-board" in admin_actions
+    assert "reload-ambush-valley" not in admin_actions
+    assert "dateInput?.addEventListener(\"change\"" in admin_actions
+    assert "forceRefresh: true" in admin_actions
+    assert "hydrateAdminDailyBoard(pageEpoch, routeKey)" in admin_actions
+
+    admin_alert = source.split("function renderAdminCoverageAlert", 1)[1].split("function renderAdminCompletionOverview", 1)[0]
+    assert "dataSummary?.inspection_message" in admin_alert
+    assert "refreshState" not in admin_alert
+
+    refresh_body = source.split("function renderModelRefreshStatus", 1)[1].split("function renderTBoardDay1ScanSummary", 1)[0]
+    assert "const message = refreshState?.message || \"\";" in refresh_body
+    assert "dataSummary?.inspection_message" not in refresh_body
+
+    upstream_body = source.split("function renderAdminUpstreamStatus", 1)[1].split("function adminUpstreamLabel", 1)[0]
+    assert "item?.status" in upstream_body
+    assert "const ok =" in upstream_body
+    assert "未生成" in upstream_body
+    assert "今日数据产出" in source
+    assert "调度账本" in source
+    assert "等待抓取/产出" in source
+    assert "observation_status" not in upstream_body
+
+    asset_reason_body = source.split("function adminAssetProblemReason", 1)[1].split("function adminTaskProblemReason", 1)[0]
+    task_reason_body = source.split("function adminTaskProblemReason", 1)[1].split("function adminReasonTone", 1)[0]
+    block_attention_body = source.split("function adminBlockNeedsAttention", 1)[1].split("function renderAdminDataBlockCard", 1)[0]
+    assert "const status = String(asset?.status" in asset_reason_body
+    assert "if (status === \"data_wait\")" not in asset_reason_body
+    assert "batchStatus" not in task_reason_body
+    assert "const status = String(task?.status" in task_reason_body
+    assert "taskAwaitingDispatchCount" in block_attention_body
+    assert "读取失败，页面已保留中文空态。" not in asset_reason_body
+    assert "读取失败，页面已保留中文空态。" not in task_reason_body
+
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    assert "/app.js?v=20260715-admin-board-clarity-v1" in html
+
+
+def test_admin_board_requires_admin_role(monkeypatch) -> None:
+    frontend_main.SESSION_STORE.clear()
+    client = TestClient(app)
+
+    assert client.get("/api/admin/daily-board").status_code == 401
+
+    monkeypatch.setenv("SHENCE_FRONTEND_ADMIN_USERNAME", "root")
+    monkeypatch.setenv("SHENCE_FRONTEND_ADMIN_PASSWORD", "rootpass")
+    monkeypatch.setenv("SHENCE_FRONTEND_USERNAME", "operator")
+    monkeypatch.setenv("SHENCE_FRONTEND_PASSWORD", "operatorpass")
+    monkeypatch.setenv("SHENCE_FRONTEND_ROLE", "operator")
+    frontend_main.SESSION_STORE.clear()
+    client = TestClient(app)
+    login = client.post("/api/auth/login", json={"username": "operator", "password": "operatorpass"})
+
+    assert login.status_code == 200
+    assert login.json()["user"]["role"] == "operator"
+    assert client.get("/api/admin/daily-board").status_code == 403
+
+
+def test_admin_boards_use_scheduler_and_source_daily_summaries(monkeypatch) -> None:
+    async def fake_fetch(_client, *, service: str, path: str, headers: dict[str, str]):
+        assert headers is not None
+        if service == "source" and path == "source/requirements":
+            return {
+                "rows": [
+                    {"source_table_name": "source.daily_bar_v1", "canonical_field_name": "close_price", "required_level": "P0", "used_by_models": ["hot_candidates"]},
+                    {"source_table_name": "source.trade_tick_v1", "canonical_field_name": "price", "required_level": "P0", "used_by_models": ["t_board_relay"]},
+                    {"source_table_name": "source.stock_universe_daily_v1", "canonical_field_name": "symbol", "required_level": "P1", "used_by_models": ["hot_candidates"]},
+                ]
+            }
+        if service == "source" and path == "source/freshness/sla":
+            return {
+                "rows": [
+                    {"source_table_name": "source.daily_bar_v1", "canonical_field_name": "close_price", "frequency": "daily", "expected_available_time": "15:20:00", "latest_acceptable_time": "16:00:00"},
+                    {"source_table_name": "source.trade_tick_v1", "canonical_field_name": "price", "frequency": "intraday_tick", "expected_available_time": "09:30:00", "latest_acceptable_time": "15:00:00"},
+                    {"source_table_name": "source.stock_universe_daily_v1", "canonical_field_name": "symbol", "frequency": "daily", "expected_available_time": "09:05:00", "latest_acceptable_time": "09:30:00"},
+                ]
+            }
+        if service == "source" and path == "source/readiness/matrix":
+            return {"rows": [{"source_table_name": "source.daily_bar_v1", "readiness_status": "ready"}, {"source_table_name": "source.trade_tick_v1", "readiness_status": "ready"}, {"source_table_name": "source.stock_universe_daily_v1", "readiness_status": "ready"}]}
+        if service == "source" and path == "source/repair-routes":
+            return {"rows": [{"source_table_name": "source.daily_bar_v1", "backup_provider": "akshare"}]}
+        if service == "source" and path == "source/fetch/queues/summary":
+            return {"rows": [{"queued_count": 0, "leased_count": 0, "failed_count": 0, "dead_letter_count": 0}]}
+        if service == "source" and path.startswith("source/ops/daily-data-summary"):
+            return {
+                "summary": {"raw_failed_jobs": 7, "raw_waiting_jobs": 3, "raw_active_jobs": 1, "build_result_count": 4, "build_failed_results": 6308, "data_failed_table_count": 1, "audit_warning_table_count": 2, "source_row_count": 4999, "latest_data_update_at": "2026-07-08T15:31:00+08:00"},
+                "tables": [
+                    {"source_table_name": "source.daily_bar_v1", "raw_failed_count": 1, "build_failed_count": 0, "build_succeeded_count": 1, "source_row_count": 4999, "lineage_row_count": 4999, "latest_build_finished_at": "2026-07-08T15:31:00+08:00", "data_asset_status": "completed_with_provider_audit", "final_data_failed": False, "raw_failure_audit_only": True},
+                    {"source_table_name": "source.trade_tick_v1", "raw_failed_count": 1, "build_failed_count": 0, "source_row_count": 0, "lineage_row_count": 0, "data_asset_status": "failed", "final_data_failed": True, "raw_failure_audit_only": False, "failure_samples": [{"error_code": "provider_structured_error"}]},
+                    {"source_table_name": "source.stock_universe_daily_v1", "raw_failed_count": 5, "raw_waiting_count": 1, "build_failed_count": 0, "build_succeeded_count": 0, "source_row_count": 0, "lineage_row_count": 0, "data_asset_status": "collecting", "final_data_failed": False, "raw_failure_audit_only": True},
+                ],
+                "failures": [{"source_table_name": "source.trade_tick_v1", "error_code": "provider_structured_error"}],
+            }
+        if service == "source" and path == "source/build/results":
+            return {"rows": [{"source_table_name": "source.daily_bar_v1", "status": "succeeded", "finished_at": "2026-07-08T15:30:00+08:00", "raw_row_count": 5000, "source_row_count": 4999, "lineage_row_count": 4999}]}
+        if service == "source" and path == "source/build/triggers":
+            return {"rows": [{"source_table_name": "source.daily_bar_v1", "status": "succeeded", "finished_at": "2026-07-08T15:31:00+08:00", "fetch_batch_id": "batch_daily_1"}]}
+        if service == "source" and path == "source/storage/policies":
+            return {"rows": []}
+        if service == "scheduler" and path == "scheduler/source-schedule/registry":
+            return {"schedules": [{"schedule_code": "daily_bar_close", "source_table_name": "source.daily_bar_v1", "priority": "P0"}, {"schedule_code": "trade_tick_live", "source_table_name": "source.trade_tick_v1", "priority": "P0"}, {"schedule_code": "stock_universe_open", "source_table_name": "source.stock_universe_daily_v1", "priority": "P1"}]}
+        if service == "scheduler" and path.startswith("scheduler/materialize/source-schedule"):
+            return {"instances": []}
+        if service == "scheduler" and path.startswith("scheduler/task-store/daily-summary"):
+            return {
+                "summary": {"planned_task_count": 3, "due_task_count": 3, "completed_task_count": 3, "unfinished_task_count": 0, "not_due_task_count": 0, "collecting_task_count": 0, "failed_task_count": 0, "awaiting_dispatch_task_count": 0, "latest_task_update_at": "2026-07-08T15:31:00+08:00", "status_counts": {"success": 2, "source_duplicate_skipped": 1}},
+                "tasks": [
+                    {"schedule_code": "daily_bar_close", "schedule_group": "daily", "source_table_name": "source.daily_bar_v1", "scheduled_at": "2026-07-08T07:20:00+00:00", "scheduled_at_local": "2026-07-08T15:20:00+08:00", "run_slot": "close", "trading_day": "2026-07-08", "request_body": {"priority": "P0", "symbols": ["000063.SZ"]}, "execution_status": "source_duplicate_skipped", "task_status": "source_duplicate_skipped"},
+                    {"schedule_code": "trade_tick_live", "schedule_group": "intraday", "source_table_name": "source.trade_tick_v1", "scheduled_at": "2026-07-08T01:30:00+00:00", "scheduled_at_local": "2026-07-08T09:30:00+08:00", "run_slot": "open", "trading_day": "2026-07-08", "request_body": {"priority": "P0", "symbols": ["000063.SZ"]}, "execution_status": "completed", "task_status": "success"},
+                    {"schedule_code": "stock_universe_open", "schedule_group": "open", "source_table_name": "source.stock_universe_daily_v1", "scheduled_at": "2026-07-08T01:05:00+00:00", "scheduled_at_local": "2026-07-08T09:05:00+08:00", "run_slot": "open", "trading_day": "2026-07-08", "request_body": {"priority": "P1", "symbols": []}, "execution_status": "completed", "task_status": "success"},
+                ],
+            }
+        if service == "scheduler" and path == "scheduler/runtime/status":
+            return {"status": "running"}
+        if service == "data-inspector" and path.startswith("inspection-runs/latest"):
+            return {"run_id": 2187, "status": "blocked", "p0_gap_count": 1, "p1_gap_count": 0, "finished_at": "2026-07-08T16:05:00+08:00"}
+        if service == "data-inspector" and path.startswith("inspection-gaps"):
+            return {"rows": [{"target_table": "source.trade_tick_v1", "canonical_field_name": "price", "severity": "P0", "gap_code": "source.trade_tick_v1.price_missing", "canonical_symbol": "000063.SZ", "trade_date": "2026-07-08", "repair_actions": [{"action_code": "fetch.submit.daily_bar"}]}]}
+        raise AssertionError(f"unexpected backend fetch {service} {path}")
+
+    monkeypatch.setattr(frontend_main, "_fetch_backend_json", fake_fetch)
+    frontend_main.SESSION_STORE.clear()
+    client = TestClient(app)
+    client.post("/api/auth/login", json={"username": "admin", "password": "admin"})
+
+    data_response = client.get("/api/admin/daily-board?trade_date=2026-07-08")
+    task_response = client.get("/api/admin/task-board?trade_date=2026-07-08")
+
+    assert data_response.status_code == 200
+    assert task_response.status_code == 200
+    data_body = data_response.json()
+    task_body = task_response.json()
+    assets = {row["source_table_name"]: row for row in data_body["assets"]}
+    tasks = {row["source_table_name"]: row for row in task_body["tasks"]}
+    assert assets["source.daily_bar_v1"]["status"] == "no_known_gap"
+    assert assets["source.trade_tick_v1"]["status"] == "data_failed"
+    assert task_body["summary"]["total_tasks"] == 3
+    assert task_body["summary"]["completed_tasks"] == 1
+    assert task_body["summary"]["unfinished_tasks"] == 2
+    assert task_body["summary"]["collecting_tasks"] == 0
+    assert task_body["summary"]["awaiting_dispatch_tasks"] == 0
+    assert task_body["summary"]["awaiting_evidence_tasks"] == 0
+    assert task_body["summary"]["expired_closed_tasks"] == 1
+    assert task_body["summary"]["target_fact_missing_tasks"] == 1
+    assert task_body["summary"]["build_failed_tasks"] == 0
+    assert task_body["summary"]["build_failed_result_count"] == 6308
+    assert task_body["summary"]["data_failed_jobs"] == 1
+    assert task_body["summary"]["failed_tasks"] == 1
+    assert tasks["source.daily_bar_v1"]["status"] == "completed"
+    assert tasks["source.daily_bar_v1"]["task_status"] == "source_duplicate_skipped"
+    assert tasks["source.trade_tick_v1"]["status"] == "target_fact_missing"
+    assert tasks["source.stock_universe_daily_v1"]["status"] == "expired_closed"
+    assert tasks["source.stock_universe_daily_v1"]["status_label"] == "已过期关闭"
+    assert tasks["source.daily_bar_v1"]["raw_failure_audit_only"] is True
+    assert data_body["summary"]["raw_failed_jobs"] == 7
+    assert data_body["summary"]["raw_audit_warning_table_count"] == 2
+    assert task_body["summary"]["raw_audit_warning_table_count"] == 2
+    assert data_body["summary"]["data_failed_assets"] == 1
+
+
+def test_admin_task_board_does_not_table_wide_demote_completed_minute_tasks() -> None:
+    payloads = {
+        "requirements": {
+            "rows": [
+                {"source_table_name": "source.minute_bar_v1", "canonical_field_name": "close_price", "required_level": "P0"},
+                {"source_table_name": "source.realtime_quote_v1", "canonical_field_name": "latest_price", "required_level": "P0"},
+            ]
+        },
+        "freshness_sla": {
+            "rows": [
+                {"source_table_name": "source.minute_bar_v1", "canonical_field_name": "close_price", "frequency": "minute", "expected_available_time": "09:30:00", "latest_acceptable_time": "15:00:00"},
+                {"source_table_name": "source.realtime_quote_v1", "canonical_field_name": "latest_price", "frequency": "intraday_snapshot", "expected_available_time": "09:30:00", "latest_acceptable_time": "15:00:00"},
+            ]
+        },
+        "repair_routes": {"rows": []},
+        "queue_summary": {"rows": []},
+        "source_daily_summary": {
+            "summary": {"raw_waiting_jobs": 4, "raw_active_jobs": 0, "source_row_count": 331},
+            "tables": [
+                {"source_table_name": "source.minute_bar_v1", "data_asset_status": "collecting", "raw_waiting_count": 2, "raw_active_count": 0, "raw_failed_count": 0, "build_failed_count": 0, "build_succeeded_count": 1, "source_row_count": 331, "lineage_row_count": 331, "final_data_failed": False},
+                {"source_table_name": "source.realtime_quote_v1", "data_asset_status": "collecting", "raw_waiting_count": 2, "raw_active_count": 0, "raw_failed_count": 0, "build_failed_count": 0, "build_succeeded_count": 0, "source_row_count": 0, "lineage_row_count": 0, "final_data_failed": False},
+            ],
+        },
+        "scheduler_daily_summary": {
+            "summary": {"planned_task_count": 4, "due_task_count": 4, "completed_task_count": 4, "unfinished_task_count": 0, "not_due_task_count": 0, "collecting_task_count": 0, "failed_task_count": 0, "awaiting_dispatch_task_count": 0},
+            "tasks": [
+                {"schedule_code": "minute_0930", "source_table_name": "source.minute_bar_v1", "scheduled_at_local": "2026-07-20T09:30:00+08:00", "trading_day": "2026-07-20", "request_body": {"priority": "P0"}, "execution_status": "completed", "task_status": "success", "source_submitted_job_count": 1, "source_fetch_status": "queued"},
+                {"schedule_code": "minute_0935", "source_table_name": "source.minute_bar_v1", "scheduled_at_local": "2026-07-20T09:35:00+08:00", "trading_day": "2026-07-20", "request_body": {"priority": "P0"}, "execution_status": "source_duplicate_skipped", "task_status": "source_duplicate_skipped", "source_submitted_job_count": 0, "source_skipped_duplicate_count": 1},
+                {"schedule_code": "minute_0940", "source_table_name": "source.minute_bar_v1", "scheduled_at_local": "2026-07-20T09:40:00+08:00", "trading_day": "2026-07-20", "request_body": {"priority": "P0"}, "execution_status": "completed", "task_status": "success", "source_submitted_job_count": 0},
+                {"schedule_code": "quote_0935", "source_table_name": "source.realtime_quote_v1", "scheduled_at_local": "2026-07-20T09:35:00+08:00", "trading_day": "2026-07-20", "request_body": {"priority": "P0"}, "execution_status": "source_duplicate_skipped", "task_status": "source_duplicate_skipped", "source_submitted_job_count": 0, "source_skipped_duplicate_count": 1},
+            ],
+        },
+    }
+
+    rows = frontend_main._admin_task_rows(payloads)
+    by_code = {row["schedule_code"]: row for row in rows}
+    summary = frontend_main._admin_task_summary(rows, payloads)
+
+    assert by_code["minute_0930"]["status"] == "collecting"
+    assert by_code["minute_0930"]["status_label"] == "\u7b49\u5f85\u6293\u53d6/\u4ea7\u51fa"
+    assert by_code["minute_0935"]["status"] == "completed"
+    assert by_code["minute_0940"]["status"] == "completed"
+    assert by_code["quote_0935"]["status"] == "awaiting_evidence"
+    assert summary["total_tasks"] == 4
+    assert summary["completed_tasks"] == 2
+    assert summary["collecting_tasks"] == 1
+    assert summary["awaiting_evidence_tasks"] == 1
+
+
+def test_admin_task_board_marks_coverage_insufficient_as_unfinished_failure() -> None:
+    payloads = {
+        "requirements": {"rows": [{"source_table_name": "source.limit_price_v1", "canonical_field_name": "up_limit_price", "required_level": "P0"}]},
+        "freshness_sla": {"rows": [{"source_table_name": "source.limit_price_v1", "canonical_field_name": "up_limit_price", "frequency": "daily"}]},
+        "repair_routes": {"rows": []},
+        "queue_summary": {"rows": []},
+        "source_daily_summary": {
+            "summary": {"source_row_count": 378, "coverage_insufficient_table_count": 1, "data_failed_table_count": 1},
+            "tables": [
+                {
+                    "source_table_name": "source.limit_price_v1",
+                    "source_row_count": 378,
+                    "build_succeeded_count": 354,
+                    "raw_failed_count": 1561,
+                    "raw_cancelled_count": 4748,
+                    "data_asset_status": "coverage_insufficient",
+                    "coverage_insufficient": True,
+                    "expected_source_row_count": 5208,
+                    "minimum_required_source_row_count": 5182,
+                    "final_data_failed": True,
+                }
+            ],
+        },
+        "scheduler_daily_summary": {
+            "summary": {"planned_task_count": 1, "due_task_count": 1, "completed_task_count": 1, "unfinished_task_count": 0, "not_due_task_count": 0},
+            "tasks": [{"schedule_code": "limit_price_open", "source_table_name": "source.limit_price_v1", "scheduled_at_local": "2026-07-20T09:12:00+08:00", "trading_day": "2026-07-20", "request_body": {"priority": "P0"}, "execution_status": "completed", "task_status": "success"}],
+        },
+    }
+
+    rows = frontend_main._admin_task_rows(payloads)
+    summary = frontend_main._admin_task_summary(rows, payloads)
+
+    assert rows[0]["status"] == "coverage_insufficient"
+    assert rows[0]["status_label"] == "\u8986\u76d6\u4e0d\u8db3"
+    assert summary["completed_tasks"] == 0
+    assert summary["unfinished_tasks"] == 1
+    assert summary["failed_tasks"] == 1
+    assert summary["coverage_insufficient_tasks"] == 1
+
+
+def test_admin_task_board_marks_cancelled_raw_jobs_as_expired_closed() -> None:
+    payloads = {
+        "requirements": {"rows": [{"source_table_name": "source.trade_status_v1", "canonical_field_name": "trade_status", "required_level": "P1"}]},
+        "freshness_sla": {"rows": [{"source_table_name": "source.trade_status_v1", "canonical_field_name": "trade_status", "frequency": "daily", "expected_available_time": "09:30:00", "latest_acceptable_time": "10:00:00"}]},
+        "repair_routes": {"rows": []},
+        "queue_summary": {"rows": []},
+        "source_daily_summary": {
+            "summary": {"raw_cancelled_jobs": 12, "expired_closed_table_count": 1, "raw_waiting_jobs": 0, "raw_active_jobs": 0},
+            "tables": [{"source_table_name": "source.trade_status_v1", "data_asset_status": "expired_closed", "raw_cancelled_count": 12, "raw_waiting_count": 0, "raw_active_count": 0, "raw_failed_count": 0, "build_failed_count": 0, "build_succeeded_count": 0, "source_row_count": 0, "lineage_row_count": 0, "final_data_failed": False}],
+        },
+        "scheduler_daily_summary": {
+            "summary": {"planned_task_count": 1, "due_task_count": 1, "completed_task_count": 1, "unfinished_task_count": 0, "not_due_task_count": 0, "collecting_task_count": 0, "failed_task_count": 0, "awaiting_dispatch_task_count": 0},
+            "tasks": [{"schedule_code": "trade_status_open", "source_table_name": "source.trade_status_v1", "scheduled_at_local": "2026-07-14T09:30:00+08:00", "trading_day": "2026-07-14", "request_body": {"priority": "P1"}, "execution_status": "completed", "task_status": "success"}],
+        },
+    }
+
+    rows = frontend_main._admin_task_rows(payloads)
+    summary = frontend_main._admin_task_summary(rows, payloads)
+
+    assert rows[0]["status"] == "expired_closed"
+    assert rows[0]["status_label"] == "\u5df2\u8fc7\u671f\u5173\u95ed"
+    assert rows[0]["raw_cancelled_count"] == 12
+    assert summary["completed_tasks"] == 0
+    assert summary["unfinished_tasks"] == 1
+    assert summary["expired_closed_tasks"] == 1
+    assert summary["raw_cancelled_jobs"] == 12
+    assert summary["collecting_tasks"] == 0
+    assert summary["awaiting_evidence_tasks"] == 0
+
+
+
+
+def test_admin_task_board_closes_not_enqueued_expired_lifecycle() -> None:
+    payloads = {
+        "requirements": {"rows": [{"source_table_name": "source.minute_bar_v1", "canonical_field_name": "close", "required_level": "P0"}]},
+        "freshness_sla": {"rows": [{"source_table_name": "source.minute_bar_v1", "canonical_field_name": "close", "frequency": "minute"}]},
+        "repair_routes": {"rows": []},
+        "queue_summary": {"rows": []},
+        "source_daily_summary": {"summary": {"raw_waiting_jobs": 0, "raw_active_jobs": 0}, "tables": []},
+        "scheduler_daily_summary": {
+            "summary": {"planned_task_count": 1, "due_task_count": 1, "completed_task_count": 0, "unfinished_task_count": 1, "not_due_task_count": 0},
+            "tasks": [
+                {
+                    "schedule_code": "source.minute.minute_bar",
+                    "schedule_group": "minute_intraday",
+                    "source_table_name": "source.minute_bar_v1",
+                    "scheduled_at_local": "2000-01-01T09:31:00+08:00",
+                    "trading_day": "2000-01-01",
+                    "request_body": {
+                        "priority": "P0",
+                        "orchestration_context": {"lifecycle_expires_at_local": "2000-01-01T09:41:00+08:00"},
+                    },
+                    "execution_status": "awaiting_dispatch",
+                    "task_status": "not_enqueued",
+                }
+            ],
+        },
+    }
+
+    rows = frontend_main._admin_task_rows(payloads)
+    summary = frontend_main._admin_task_summary(rows, payloads)
+
+    assert rows[0]["status"] == "expired_closed"
+    assert rows[0]["status_label"] == "\u5df2\u8fc7\u671f\u5173\u95ed"
+    assert summary["expired_closed_tasks"] == 1
+    assert summary["awaiting_dispatch_tasks"] == 0
+    assert summary["raw_waiting_jobs"] == 0
+
+def test_admin_task_board_closes_expired_task_lifecycle_even_when_table_has_open_raw_work() -> None:
+    payloads = {
+        "requirements": {"rows": [{"source_table_name": "source.minute_bar_v1", "canonical_field_name": "close", "required_level": "P0"}]},
+        "freshness_sla": {"rows": [{"source_table_name": "source.minute_bar_v1", "canonical_field_name": "close", "frequency": "minute"}]},
+        "repair_routes": {"rows": []},
+        "queue_summary": {"rows": []},
+        "source_daily_summary": {
+            "summary": {"raw_waiting_jobs": 99, "raw_active_jobs": 0, "source_row_count": 0},
+            "tables": [
+                {
+                    "source_table_name": "source.minute_bar_v1",
+                    "data_asset_status": "collecting",
+                    "raw_waiting_count": 99,
+                    "raw_active_count": 0,
+                    "raw_failed_count": 0,
+                    "raw_cancelled_count": 0,
+                    "build_failed_count": 0,
+                    "build_succeeded_count": 0,
+                    "source_row_count": 0,
+                    "lineage_row_count": 0,
+                    "final_data_failed": False,
+                }
+            ],
+        },
+        "scheduler_daily_summary": {
+            "summary": {"planned_task_count": 1, "due_task_count": 1, "completed_task_count": 1, "unfinished_task_count": 0, "not_due_task_count": 0},
+            "tasks": [
+                {
+                    "schedule_code": "source.minute.minute_bar",
+                    "schedule_group": "minute_intraday",
+                    "source_table_name": "source.minute_bar_v1",
+                    "scheduled_at_local": "2000-01-01T09:31:00+08:00",
+                    "trading_day": "2000-01-01",
+                    "request_body": {
+                        "priority": "P0",
+                        "orchestration_context": {"lifecycle_expires_at_local": "2000-01-01T09:41:00+08:00"},
+                    },
+                    "execution_status": "source_duplicate_skipped",
+                    "task_status": "source_duplicate_skipped",
+                    "source_fetch_status": "succeeded",
+                    "source_submitted_job_count": 0,
+                    "source_skipped_duplicate_count": 2,
+                }
+            ],
+        },
+    }
+
+    rows = frontend_main._admin_task_rows(payloads)
+    summary = frontend_main._admin_task_summary(rows, payloads)
+
+    assert rows[0]["status"] == "expired_closed"
+    assert rows[0]["status_label"] == "\u5df2\u8fc7\u671f\u5173\u95ed"
+    assert summary["completed_tasks"] == 0
+    assert summary["expired_closed_tasks"] == 1
+    assert summary["awaiting_evidence_tasks"] == 0
+    assert summary["collecting_tasks"] == 0
+    assert summary["raw_waiting_jobs"] == 0
+    assert summary["raw_waiting_jobs_total"] == 99
+
+
+def test_admin_task_board_fails_closed_when_source_daily_summary_unavailable(monkeypatch) -> None:
+    async def fake_fetch(_client, *, service: str, path: str, headers: dict[str, str]):
+        assert headers is not None
+        if service == "source" and path == "source/requirements":
+            return {"rows": [{"source_table_name": "source.daily_bar_v1", "canonical_field_name": "close_price", "required_level": "P0", "used_by_models": ["hot_candidates"]}]}
+        if service == "source" and path == "source/freshness/sla":
+            return {"rows": [{"source_table_name": "source.daily_bar_v1", "canonical_field_name": "close_price", "frequency": "daily", "expected_available_time": "15:20:00", "latest_acceptable_time": "16:00:00"}]}
+        if service == "source" and path == "source/repair-routes":
+            return {"rows": []}
+        if service == "source" and path == "source/fetch/queues/summary":
+            return {"rows": [{"queued_count": 0, "leased_count": 0, "failed_count": 0, "dead_letter_count": 0}]}
+        if service == "source" and path.startswith("source/ops/daily-data-summary"):
+            raise frontend_main.HTTPException(status_code=502, detail="source daily summary timeout")
+        if service == "scheduler" and path.startswith("scheduler/task-store/daily-summary"):
+            return {
+                "summary": {"planned_task_count": 1, "completed_task_count": 1, "unfinished_task_count": 0, "not_due_task_count": 0, "collecting_task_count": 0, "failed_task_count": 0, "awaiting_dispatch_task_count": 0, "latest_task_update_at": "2026-07-08T15:31:00+08:00"},
+                "tasks": [
+                    {"schedule_code": "daily_bar_close", "schedule_group": "daily", "source_table_name": "source.daily_bar_v1", "scheduled_at": "2026-07-08T07:20:00+00:00", "scheduled_at_local": "2026-07-08T15:20:00+08:00", "run_slot": "close", "trading_day": "2026-07-08", "request_body": {"priority": "P0", "symbols": ["000063.SZ"]}, "execution_status": "completed", "task_status": "success"},
+                ],
+            }
+        raise AssertionError(f"unexpected backend fetch {service} {path}")
+
+    monkeypatch.setattr(frontend_main, "_fetch_backend_json", fake_fetch)
+    frontend_main.SESSION_STORE.clear()
+    client = TestClient(app)
+    client.post("/api/auth/login", json={"username": "admin", "password": "admin"})
+
+    response = client.get("/api/admin/task-board?trade_date=2026-07-08")
+
+    assert response.status_code == 200
+    body = response.json()
+    task = body["tasks"][0]
+    assert body["summary"]["source_facts_available"] is False
+    assert body["summary"]["completed_tasks"] == 0
+    assert body["summary"]["unfinished_tasks"] == 1
+    assert body["summary"]["awaiting_evidence_tasks"] == 1
+    assert body["summary"]["awaiting_dispatch_tasks"] == 0
+    assert body["summary"]["build_failed_tasks"] == 0
+    assert body["summary"]["source_row_count"] is None
+    assert task["status"] == "awaiting_evidence"
+    assert task["status_label"] == "\u6e90\u6570\u636e\u6682\u4e0d\u53ef\u8bfb"
+    assert body["upstream_status"]["source_daily_summary"]["status"] == "unavailable"
+
+
+def test_admin_task_board_uses_short_payload_cache(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def fake_fetch(_client, *, service: str, path: str, headers: dict[str, str]):
+        assert headers is not None
+        calls.append((service, path))
+        if service == "source" and path == "source/requirements":
+            return {"rows": [{"source_table_name": "source.daily_bar_v1", "canonical_field_name": "close_price", "required_level": "P0", "used_by_models": ["hot_candidates"]}]}
+        if service == "source" and path == "source/freshness/sla":
+            return {"rows": [{"source_table_name": "source.daily_bar_v1", "canonical_field_name": "close_price", "frequency": "daily", "expected_available_time": "15:20:00", "latest_acceptable_time": "16:00:00"}]}
+        if service == "source" and path == "source/repair-routes":
+            return {"rows": []}
+        if service == "source" and path == "source/fetch/queues/summary":
+            return {"rows": [{"queued_count": 0, "leased_count": 0, "failed_count": 0, "dead_letter_count": 0}]}
+        if service == "source" and path.startswith("source/ops/daily-data-summary"):
+            return {
+                "summary": {"source_row_count": 1, "latest_data_update_at": "2026-07-08T15:30:00+08:00"},
+                "tables": [{"source_table_name": "source.daily_bar_v1", "source_row_count": 1, "build_succeeded_count": 1, "data_asset_status": "completed"}],
+            }
+        if service == "scheduler" and path.startswith("scheduler/task-store/daily-summary"):
+            return {
+                "summary": {"planned_task_count": 1, "completed_task_count": 1, "unfinished_task_count": 0, "not_due_task_count": 0, "collecting_task_count": 0, "failed_task_count": 0, "awaiting_dispatch_task_count": 0},
+                "tasks": [{"schedule_code": "daily_bar_close", "schedule_group": "daily", "source_table_name": "source.daily_bar_v1", "scheduled_at": "2026-07-08T07:20:00+00:00", "scheduled_at_local": "2026-07-08T15:20:00+08:00", "run_slot": "close", "trading_day": "2026-07-08", "request_body": {"priority": "P0", "symbols": ["000063.SZ"]}, "execution_status": "completed", "task_status": "success"}],
+            }
+        raise AssertionError(f"unexpected backend fetch {service} {path}")
+
+    monkeypatch.setattr(frontend_main, "_fetch_backend_json", fake_fetch)
+    monkeypatch.setattr(frontend_main, "_admin_dashboard_cache_ttl_seconds", lambda: 30.0)
+    frontend_main.SESSION_STORE.clear()
+    client = TestClient(app)
+    client.post("/api/auth/login", json={"username": "admin", "password": "admin"})
+
+    first = client.get("/api/admin/task-board?trade_date=2026-07-08")
+    second = client.get("/api/admin/task-board?trade_date=2026-07-08")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["summary"]["completed_tasks"] == 1
+    assert second.json()["summary"]["completed_tasks"] == 1
+    assert len(calls) == 6
+
+
+def test_admin_board_keeps_not_due_and_missing_inspection_separate(monkeypatch) -> None:
+    async def fake_fetch(_client, *, service: str, path: str, headers: dict[str, str]):
+        assert headers is not None
+        if service == "source" and path == "source/requirements":
+            return {"rows": [{"source_table_name": "source.stock_master_v1", "canonical_field_name": "symbol", "required_level": "P0", "used_by_models": ["hot_candidates"]}, {"source_table_name": "source.daily_bar_v1", "canonical_field_name": "close_price", "required_level": "P0", "used_by_models": ["hot_candidates"]}]}
+        if service == "source" and path == "source/freshness/sla":
+            return {"rows": [{"source_table_name": "source.daily_bar_v1", "canonical_field_name": "close_price", "frequency": "daily", "expected_available_time": "23:00:00", "latest_acceptable_time": "23:59:59"}]}
+        if service == "source" and path in {"source/readiness/matrix", "source/repair-routes", "source/build/results", "source/build/triggers", "source/storage/policies"}:
+            return {"rows": []}
+        if service == "source" and path == "source/fetch/queues/summary":
+            return {"rows": [{"queued_count": 0, "leased_count": 0, "failed_count": 0, "dead_letter_count": 0}]}
+        if service == "source" and path.startswith("source/ops/daily-data-summary"):
+            return {"summary": {"raw_failed_jobs": 0, "build_failed_results": 0, "source_row_count": 0}, "tables": [], "failures": []}
+        if service == "scheduler" and path == "scheduler/source-schedule/registry":
+            return {"schedules": [{"schedule_code": "stock_master_open", "source_table_name": "source.stock_master_v1", "priority": "P0"}, {"schedule_code": "daily_bar_late", "source_table_name": "source.daily_bar_v1", "priority": "P0"}]}
+        if service == "scheduler" and path.startswith("scheduler/materialize/source-schedule"):
+            return {"instances": []}
+        if service == "scheduler" and path.startswith("scheduler/task-store/daily-summary"):
+            return {
+                "summary": {"planned_task_count": 2, "completed_task_count": 1, "unfinished_task_count": 1, "not_due_task_count": 1, "collecting_task_count": 0, "failed_task_count": 0, "awaiting_dispatch_task_count": 0},
+                "tasks": [
+                    {"schedule_code": "stock_master_open", "schedule_group": "open", "source_table_name": "source.stock_master_v1", "scheduled_at": "2099-01-01T01:00:00+00:00", "scheduled_at_local": "2099-01-01T09:00:00+08:00", "run_slot": "open", "trading_day": "2099-01-01", "request_body": {"priority": "P0", "symbols": []}, "execution_status": "completed", "task_status": "success"},
+                    {"schedule_code": "daily_bar_late", "schedule_group": "close", "source_table_name": "source.daily_bar_v1", "scheduled_at": "2099-01-01T15:00:00+00:00", "scheduled_at_local": "2099-01-01T23:00:00+08:00", "run_slot": "close", "trading_day": "2099-01-01", "request_body": {"priority": "P0", "symbols": []}, "execution_status": "not_due", "task_status": "not_due"},
+                ],
+            }
+        if service == "scheduler" and path == "scheduler/runtime/status":
+            return {"status": "running"}
+        if service == "data-inspector" and path.startswith("inspection-runs/latest"):
+            raise frontend_main.HTTPException(status_code=502, detail="upstream status 404")
+        raise AssertionError(f"unexpected backend fetch {service} {path}")
+
+    monkeypatch.setattr(frontend_main, "_fetch_backend_json", fake_fetch)
+    frontend_main.SESSION_STORE.clear()
+    client = TestClient(app)
+    client.post("/api/auth/login", json={"username": "admin", "password": "admin"})
+
+    data_response = client.get("/api/admin/daily-board?trade_date=2099-01-01")
+    task_response = client.get("/api/admin/task-board?trade_date=2099-01-01")
+
+    assert data_response.status_code == 200
+    assert task_response.status_code == 200
+    data_body = data_response.json()
+    task_body = task_response.json()
+    assets = {row["source_table_name"]: row for row in data_body["assets"]}
+    assert data_body["summary"]["inspection_coverage"]["covered"] is False
+    assert data_body["summary"]["inspection_unknown_assets"] == 0
+    assert data_body["summary"]["awaiting_data_result_assets"] == 1
+    assert assets["source.stock_master_v1"]["status"] == "awaiting_data_result"
+    assert assets["source.daily_bar_v1"]["status"] == "not_due"
+    assert task_body["summary"]["completed_tasks"] == 0
+    assert task_body["summary"]["unfinished_tasks"] == 2
+    assert task_body["summary"]["not_due_tasks"] == 1
+    assert task_body["summary"]["awaiting_evidence_tasks"] == 1
+    assert task_body["summary"]["pending_acceptance_tasks"] == 0
+    assert task_body["summary"]["inspection_unknown_tasks"] == 0
+    assert data_body["upstream_status"]["inspection_latest"]["status"] == "missing"
+    assert task_body["summary"]["failed_tasks"] == 0
 
 def test_frontend_script_has_no_duplicate_status_tone_declaration() -> None:
     source = _source()

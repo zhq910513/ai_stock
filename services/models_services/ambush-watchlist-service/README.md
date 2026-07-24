@@ -360,3 +360,24 @@ python scripts/core_services_acceptance.py --require-postgres --source-quality-m
 ## 当前闭环结论
 
 潜伏抬头 owner service 的 source capability、图库、多通道签名、三路召回、谷底观察、有效抬头、Phase3 release、买点参考、observation、outcome、失败归因和锁定候选合同已在当前代码中实现。2026-06-14 本地 Docker 闭环中，`scripts/core_services_acceptance.py --require-postgres --real-provider-probe --source-quality-matrix` 返回 0，`ambush.phase3.release_gate.close` 经 scheduler live dispatch 到本服务返回 200，source release preflight 为 `can_release_official_signal=true`、`coverage_status=passed`、`freshness_status=passed`、`blocking_reasons=[]`。Baidu `source.event_news_v1` 已通过 source-data-service 真实 raw/source/lineage 写入验证，但在本模型中仍只作为 `event_news_context` research-only 题材/事件解释证据，不改变 P0/P1 source gate。当前最小闭环依赖 source-data-service、scheduler-service 和后续持久化编排；未阻断优化项见根目录 `需优化点.MD`。
+
+### ambush-watchlist-service -> model3 reset -> 2026-07-08 zero state
+
+- Record time: 2026-07-08 Asia/Shanghai.
+- Confirmation source: user explicitly approved clearing model2/model3 execution audit and model3 taxonomy without historical backup, and explicitly requested not to start model2/model3 owner services.
+- Cleared scope for model3: `governance.research_model_execution_audit_v1` rows where `model_code='ambush_watchlist'`, `owner_service='ambush-watchlist-service'`, `task_code LIKE 'ambush.%'`, or `task_code LIKE 'dragon.%'`; `3` rows were deleted. `research_ambush.ambush_valley_label_taxonomy_v1` was cleared; `11` taxonomy rows were deleted.
+- Current data state: all current `decision_ambush.*`, `research_ambush.*`, compatible `decision.ambush_*`, and compatible `decision.dragon_*` tables have `0` rows.
+- Runtime state: `ai-stock-ambush-watchlist-service` remains `Exited (0)` as requested; source, scheduler, data-inspector, and research services remain ready.
+- Boundary: this is an authorized zero-data operational state only. Future ambush facts and taxonomy/reference rows must be regenerated through approved research/scheduler/owner flows, not manual table writes or mock data.
+
+### ambush-watchlist-service -> model3 reset -> zero-data state freeze 2026-07-08
+
+- 冻结对象：`ambush-watchlist-service -> model3 reset -> zero-data state`。
+- 冻结时间：2026-07-08 Asia/Shanghai。
+- 拍板人 / 确认来源：用户回复“你来决定拍板”；Codex 基于本轮数据库计数、服务健康和 owner 未启动状态决定可以拍板冻结。
+- 锁定范围：模型三当前零数据运行状态；`decision_ambush.*`、`research_ambush.*`、兼容 `decision.ambush_*` 与兼容 `decision.dragon_*` 表均为 `0` 行；模型三 research execution audit 为 `0` 行；`research_ambush.ambush_valley_label_taxonomy_v1` 已按用户授权清为 `0` 行；`ai-stock-ambush-watchlist-service` 按用户要求保持 `Exited (0)`，本轮不启动。
+- 允许的只读验收：数据库只读计数、`governance.research_model_execution_audit_v1` 模型三过滤计数、taxonomy 计数、Docker 只读状态、source/scheduler/data-inspector/research readyz。
+- 禁止修改项：未经解锁不得手工写入模型三事实表或 taxonomy 字典、不得用 `0`、空字符串、mock payload 或推断补缺口、不得绕过 scheduler/research/owner 正式链路生成模型三事实、不得借本冻结记录修改模型三图库、阈值、状态机、调度或接口。
+- 解锁条件：用户明确批准启动模型三 owner、恢复模型三正式调度/执行、重建模型三事实、重新初始化 taxonomy/图库字典、恢复历史数据或修改模型三数据合同。
+- 回滚方式：本轮无历史备份；已删除的 3 条模型三 execution audit 和 11 条 taxonomy 字典不能从本轮备份恢复。若需要恢复，只能通过正式初始化、研究或 scheduler/research/owner 链路重新生成；文档冻结记录可按 Git 差异回退。
+- 验证清单：模型三相关表非零残留为 0；模型三 execution audit 为 0；taxonomy 为 0；核心服务 ready；ambush owner 仍未启动。

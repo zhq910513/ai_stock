@@ -120,12 +120,76 @@ services:
       SOURCE_DATA_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
       SOURCE_DATA_QUEUE_BACKEND: ${SOURCE_DATA_QUEUE_BACKEND:-postgres}
       SOURCE_DATA_WORKER_ID: ${SOURCE_DATA_WORKER_ID:-source-data-worker-1}
-      SOURCE_DATA_WORKER_MAX_JOBS: ${SOURCE_DATA_WORKER_MAX_JOBS:-5}
+      SOURCE_DATA_WORKER_MAX_JOBS: ${SOURCE_DATA_WORKER_MAX_JOBS:-20}
       SOURCE_DATA_WORKER_LEASE_SECONDS: ${SOURCE_DATA_WORKER_LEASE_SECONDS:-120}
       SOURCE_DATA_WORKER_POLL_SECONDS: ${SOURCE_DATA_WORKER_POLL_SECONDS:-1}
       SOURCE_DATA_WORKER_DRY_RUN_PROVIDER: ${SOURCE_DATA_WORKER_DRY_RUN_PROVIDER:-false}
+      SOURCE_DATA_WORKER_PROVIDERS: ${SOURCE_DATA_WORKER_PROVIDERS:-}
+      SOURCE_DATA_WORKER_QUEUE_NAMES: ${SOURCE_DATA_WORKER_QUEUE_NAMES:-}
       SOURCE_DATA_TUSHARE_TOKEN: ${SOURCE_DATA_TUSHARE_TOKEN:-}
       SERVICE_NAME: source-data-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-bootstrap:
+        condition: service_completed_successfully
+      source-data-service:
+        condition: service_healthy
+    command: ["python", "-m", "source_data_service.worker_loop"]
+    restart: unless-stopped
+
+  source-data-worker-eastmoney-research:
+    build:
+      context: ..
+      dockerfile: infra/docker/service.Dockerfile
+      args:
+        SERVICE_DIR: services/source-data-service
+        SERVICE_EXTRAS: "[providers]"
+    container_name: ai-stock-source-data-worker-eastmoney-research
+    environment:
+      AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_QUEUE_BACKEND: ${SOURCE_DATA_QUEUE_BACKEND:-postgres}
+      SOURCE_DATA_WORKER_ID: source-data-worker-eastmoney-research-1
+      SOURCE_DATA_WORKER_MAX_JOBS: ${SOURCE_DATA_EASTMONEY_WORKER_MAX_JOBS:-1}
+      SOURCE_DATA_WORKER_LEASE_SECONDS: ${SOURCE_DATA_WORKER_LEASE_SECONDS:-120}
+      SOURCE_DATA_WORKER_POLL_SECONDS: ${SOURCE_DATA_WORKER_POLL_SECONDS:-1}
+      SOURCE_DATA_WORKER_DRY_RUN_PROVIDER: ${SOURCE_DATA_WORKER_DRY_RUN_PROVIDER:-false}
+      SOURCE_DATA_WORKER_PROVIDERS: eastmoney
+      SOURCE_DATA_WORKER_QUEUE_NAMES: research_queue
+      SOURCE_DATA_TUSHARE_TOKEN: ${SOURCE_DATA_TUSHARE_TOKEN:-}
+      SERVICE_NAME: source-data-worker-eastmoney-research
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-bootstrap:
+        condition: service_completed_successfully
+      source-data-service:
+        condition: service_healthy
+    command: ["python", "-m", "source_data_service.worker_loop"]
+    restart: unless-stopped
+
+  source-data-worker-tencent-normal:
+    build:
+      context: ..
+      dockerfile: infra/docker/service.Dockerfile
+      args:
+        SERVICE_DIR: services/source-data-service
+        SERVICE_EXTRAS: "[providers]"
+    container_name: ai-stock-source-data-worker-tencent-normal
+    environment:
+      AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
+      SOURCE_DATA_QUEUE_BACKEND: ${SOURCE_DATA_QUEUE_BACKEND:-postgres}
+      SOURCE_DATA_WORKER_ID: source-data-worker-tencent-normal-1
+      SOURCE_DATA_WORKER_MAX_JOBS: ${SOURCE_DATA_TENCENT_WORKER_MAX_JOBS:-1}
+      SOURCE_DATA_WORKER_LEASE_SECONDS: ${SOURCE_DATA_WORKER_LEASE_SECONDS:-120}
+      SOURCE_DATA_WORKER_POLL_SECONDS: ${SOURCE_DATA_WORKER_POLL_SECONDS:-1}
+      SOURCE_DATA_WORKER_DRY_RUN_PROVIDER: ${SOURCE_DATA_WORKER_DRY_RUN_PROVIDER:-false}
+      SOURCE_DATA_WORKER_PROVIDERS: tencent
+      SOURCE_DATA_WORKER_QUEUE_NAMES: normal_daily_ingest_queue
+      SOURCE_DATA_TUSHARE_TOKEN: ${SOURCE_DATA_TUSHARE_TOKEN:-}
+      SERVICE_NAME: source-data-worker-tencent-normal
     depends_on:
       postgres:
         condition: service_healthy

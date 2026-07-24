@@ -30,3 +30,24 @@
 
 缺交易日历年龄时 `memory_age_days=NULL`，状态为 `blocked_data_gap`；不得用自然日、0 或空字符串伪装交易日龄。
 
+
+### candidate-memory-service -> model2 reset -> 2026-07-08 data asset state
+
+- Record time: 2026-07-08 Asia/Shanghai.
+- Confirmation source: user explicitly approved clearing model2/model3 execution audit and model3 taxonomy without historical backup, and explicitly requested not to start model2/model3 owner services.
+- Cleared audit scope: `governance.research_model_execution_audit_v1` rows where `model_code='candidate_memory'`, `owner_service='candidate-memory-service'`, or `task_code LIKE 'memory.%'`; the audit scope was already empty, so `0` rows were deleted.
+- Current asset state: all current `decision_memory.*`, `research_memory.*`, and compatible `decision.candidate_memory*` tables have `0` rows.
+- Preserved scope: source standard tables, raw provider tables, lineage, source fetch queue, scheduler task store, provider probe evidence, Cookie/runtime source credentials, and owner service code/config were not cleared or rewritten.
+- Runtime state: `ai-stock-candidate-memory-service` remains `Exited (0)` as requested.
+
+### candidate-memory-service -> model2 reset -> zero-data asset freeze 2026-07-08
+
+- 冻结对象：`candidate-memory-service -> model2 reset -> zero-data asset state`。
+- 冻结时间：2026-07-08 Asia/Shanghai。
+- 拍板人 / 确认来源：用户授权 Codex 决定拍板；Codex 判定当前模型二数据资产已满足零数据状态。
+- 锁定范围：`decision_memory.*`、`research_memory.*`、兼容 `decision.candidate_memory*` 和模型二 execution audit 的零行状态；source/raw/lineage/source queue/scheduler task store/provider probe/Cookie 均不属于本冻结对象。
+- 允许的只读验收：只读 SQL 计数、owner 容器状态查看、核心服务 readyz、source queue summary。
+- 禁止修改项：未经解锁不得直接插入、更新或删除模型二事实资产；不得重启 owner 来掩盖缺口；不得把缺失交易日龄、缺 source 或缺 upstream 事实补成 `0` 或空值。
+- 解锁条件：用户明确批准模型二 owner 启动、模型二数据再生、执行审计恢复、数据资产合同变化或调度恢复。
+- 回滚方式：无本轮数据备份；恢复事实只能走正式链路再生成，不能手工补库。
+- 验证清单：所有模型二资产计数为 0；模型二 audit 计数为 0；candidate-memory owner 保持退出；source/scheduler/data-inspector/research ready。

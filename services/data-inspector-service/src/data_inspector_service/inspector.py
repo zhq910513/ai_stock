@@ -375,9 +375,16 @@ class DataInspector:
             rows = queue.data.get("rows") or queue.data.get("queues") or []
             queued = sum(int(row.get("queued_count") or 0) for row in rows if isinstance(row, dict))
             leased = sum(int(row.get("leased_count") or 0) for row in rows if isinstance(row, dict))
+            failed = sum(int(row.get("failed_count") or 0) for row in rows if isinstance(row, dict))
             dead = sum(int(row.get("dead_letter_count") or 0) for row in rows if isinstance(row, dict))
-            queue_blocked = leased > 0 or dead > 0
-            evidence["queue_totals"] = {"queued": queued, "leased": leased, "dead_letter": dead}
+            queue_blocked = dead > 0
+            evidence["queue_totals"] = {"queued": queued, "leased": leased, "failed": failed, "dead_letter": dead}
+            evidence["queue_health_policy"] = {
+                "dead_letter_count": "blocks startup_guard/core_closure because work reached a terminal queue state",
+                "queued_count": "visible backlog; does not block while source-data-worker is running",
+                "leased_count": "active source-data-worker progress; does not block readiness",
+                "failed_count": "provider/job failure audit; source daily data summary decides final data failure",
+            }
         if queue.ok and not queue_blocked:
             observed.add("source_queue_health")
         else:
@@ -386,7 +393,7 @@ class DataInspector:
                     domain_code="source_queue_health",
                     target_table="/source/fetch/queues/summary",
                     severity="P0",
-                    details=evidence["queue_summary"],
+                    details={"queue_summary": evidence["queue_summary"], "queue_totals": evidence.get("queue_totals"), "queue_health_policy": evidence.get("queue_health_policy")},
                     remediation_status="queue_blocked",
                 )
             )

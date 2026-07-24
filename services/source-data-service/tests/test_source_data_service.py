@@ -8,11 +8,12 @@ from fastapi.testclient import TestClient
 
 from source_data_service.api import app
 import source_data_service.fetch_orchestrator as fetch_orchestrator
+import source_data_service.fetch_persistence as fetch_persistence
 import source_data_service.source_repository as source_repository
 import source_data_service.worker_executor as worker_executor
 from source_data_service.gap_detector import build_repair_plan
 from source_data_service.fetch_orchestrator import build_fetch_plan
-from source_data_service.models import CallbackEventType, FetchCallbackEventOut, FetchPlanRequest, FetchPriority, FetchStrategy, FetchTriggerType, FetchUniverseScope, FetchWorkerRunOnceRequest, Provider, QualityStatus, RawFetchResult, RawRow, ReleasePreflightRequest, SourceBuildExecuteRequest, SourceCanonicalRowOut, SourceGapRequest, SourceLineageRecordOut
+from source_data_service.models import CallbackEventType, FetchCallbackEventOut, FetchPlanRequest, FetchPriority, FetchStrategy, FetchTriggerType, FetchUniverseScope, FetchWorkerRunOnceRequest, FetchJobStatus, FetchJobStatusOut, FetchQueueName, Provider, QualityStatus, RawFetchResult, RawRow, ReleasePreflightRequest, SourceBuildExecuteRequest, SourceBuildTriggerOut, SourceBuildWorkerRunOnceRequest, SourceCanonicalRowOut, SourceGapRequest, SourceLineageRecordOut
 import source_data_service.operational_governance as operational_governance
 import source_data_service.ths_paid_probability as ths_paid_probability
 from source_data_service.postgres_repository import (
@@ -30,7 +31,7 @@ from source_data_service.postgres_repository import (
 from source_data_service.provider_registry import get_api_spec, list_api_specs, list_source_requirements
 from source_data_service.provider_runtime import adapter_implemented
 from source_data_service.resilience import CircuitBreaker, CircuitOpenError
-from source_data_service.source_repository import _build_values, _canonical_fields_for_source_build, _extract_symbol, execute_source_build_trigger, ingest_raw_fetch_result
+from source_data_service.source_repository import _build_values, _canonical_fields_for_source_build, _extract_symbol, execute_source_build_trigger, ingest_raw_fetch_result, run_source_build_worker_once
 from source_data_service.symbol_rules import is_a_share_symbol, normalize_symbol
 
 
@@ -259,10 +260,114 @@ def test_fetch_plan_merges_daily_backup_plans_and_prioritizes_price_coverage() -
     assert any(item.provider == Provider.SOHU and item.api_name == "daily_bars" for item in backups)
 
 
+def test_fetch_plan_orchestration_context_partitions_scheduler_run_slots() -> None:
+    base = {
+        "source_table_name": "source.minute_bar_v1",
+        "canonical_fields": ["close_price"],
+        "symbols": ["000063.SZ"],
+        "trade_date": date(2026, 7, 20),
+        "trigger_type": FetchTriggerType.SCHEDULED_PERIODIC,
+        "priority": FetchPriority.P0_URGENT_RELEASE,
+        "request_source": "scheduler-service",
+        "dry_run": True,
+    }
+    first = build_fetch_plan(
+        FetchPlanRequest(
+            **base,
+            orchestration_context={"schedule_code": "source.minute.minute_bar", "run_slot": "093000"},
+        )
+    )
+    second = build_fetch_plan(
+        FetchPlanRequest(
+            **base,
+            orchestration_context={"schedule_code": "source.minute.minute_bar", "run_slot": "093500"},
+        )
+    )
+
+    assert first.job_count == 1
+    assert second.job_count == 1
+    assert first.jobs[0].request_hash != second.jobs[0].request_hash
+    assert first.jobs[0].request_params["__orchestration_context"]["run_slot"] == "093000"
+    assert second.jobs[0].request_params["__orchestration_context"]["run_slot"] == "093500"
+
+
+def test_scheduler_orchestration_context_expires_same_day_urgent_jobs() -> None:
+    now = datetime(2026, 7, 20, 9, 45, tzinfo=timezone.utc)
+    job = FetchJobStatusOut(
+        job_item_id="fetch_job_lifecycle",
+        fetch_batch_id="fetch_batch_lifecycle",
+        provider=Provider.EASTMONEY,
+        api_name="minute_bars",
+        raw_table_name="raw_eastmoney.minute_bars_v1",
+        request_params={
+            "secid": "0.000063",
+            "__orchestration_context": {
+                "request_source": "scheduler-service",
+                "lifecycle_expires_at": "2026-07-20T09:40:00+00:00",
+            },
+        },
+        request_hash="hash_lifecycle",
+        source_table_name="source.minute_bar_v1",
+        canonical_fields=["close_price"],
+        symbol="000063.SZ",
+        trade_date=date(2026, 7, 20),
+        priority=FetchPriority.P0_URGENT_RELEASE,
+        queue_name=FetchQueueName.URGENT_RELEASE_GATE_QUEUE,
+        status=FetchJobStatus.QUEUED,
+        created_at=now,
+        updated_at=now,
+    )
+    future_job = job.model_copy(
+        update={
+            "request_params": {
+                "secid": "0.000063",
+                "__orchestration_context": {
+                    "request_source": "scheduler-service",
+                    "lifecycle_expires_at": "2026-07-20T09:50:00+00:00",
+                },
+            }
+        }
+    )
+    no_context_job = job.model_copy(update={"request_params": {"secid": "0.000063"}})
+
+    assert fetch_orchestrator._is_daily_lifecycle_expirable(job, date(2026, 7, 20), now) is True
+    assert fetch_orchestrator._is_daily_lifecycle_expirable(future_job, date(2026, 7, 20), now) is False
+    assert fetch_orchestrator._is_daily_lifecycle_expirable(no_context_job, date(2026, 7, 20), now) is False
+
+
+def test_fetch_plan_full_a_share_internal_read_uses_unbounded_source_rows(monkeypatch) -> None:
+    calls: list[tuple[str, str | None, int | None]] = []
+
+    def fake_list_source_rows(source_table_name: str, trade_date: str | None = None, limit: int | None = 1000):
+        calls.append((source_table_name, trade_date, limit))
+        return []
+
+    monkeypatch.setattr(fetch_orchestrator, "_list_source_rows", fake_list_source_rows)
+
+    try:
+        build_fetch_plan(
+            FetchPlanRequest(
+                source_table_name="source.daily_bar_v1",
+                canonical_fields=["close_price"],
+                universe_scope=FetchUniverseScope.FULL_A_SHARE,
+                trade_date=date(2026, 7, 13),
+                trigger_type=FetchTriggerType.DATA_INSPECTION_GAP_REPAIR,
+                priority=FetchPriority.P1_NORMAL_INGEST,
+                request_source="data-inspector-service",
+                dry_run=True,
+            )
+        )
+    except ValueError:
+        pass
+
+    assert ("source.stock_universe_daily_v1", "2026-07-13", 20000) in calls
+    assert ("source.stock_master_v1", None, 20000) in calls
+
+
 def test_fetch_plan_full_a_share_daily_expands_source_universe_without_sample_fallback(monkeypatch) -> None:
     available = datetime(2026, 6, 22, 8, 0, tzinfo=timezone.utc)
 
-    def fake_list_source_rows(source_table_name: str, trade_date: str | None = None):
+    def fake_list_source_rows(source_table_name: str, trade_date: str | None = None, limit: int | None = 1000):
         if source_table_name == "source.stock_universe_daily_v1" and trade_date == "2026-06-22":
             return [
                 SourceCanonicalRowOut(
@@ -373,6 +478,42 @@ def test_baostock_query_all_stock_builds_stock_universe_values() -> None:
     assert values["stock_name"] == "中百集团"
 
 
+def test_baostock_daily_raw_builds_stock_universe_backup_values(monkeypatch) -> None:
+    available = datetime(2026, 7, 13, 8, 0, tzinfo=timezone.utc)
+
+    def fake_list_source_rows(source_table_name: str, symbol: str | None = None, trade_date: str | None = None, limit: int | None = 1000):
+        if source_table_name == "source.stock_master_v1" and symbol == "000063.SZ":
+            return [
+                SourceCanonicalRowOut(
+                    source_table_name="source.stock_master_v1",
+                    source_pk="000063.SZ",
+                    symbol="000063.SZ",
+                    values={"stock_name": "ZTE"},
+                    source_quality_status=QualityStatus.USABLE,
+                    primary_provider=Provider.BAOSTOCK,
+                    build_batch_id="build-master-test",
+                    available_at=available,
+                    updated_at=available,
+                )
+            ]
+        return []
+
+    monkeypatch.setattr(source_repository, "list_source_rows", fake_list_source_rows)
+
+    values, warnings = _build_values(
+        Provider.BAOSTOCK,
+        "query_history_k_data_plus_daily_raw",
+        "source.stock_universe_daily_v1",
+        {"date": "2026-07-13", "code": "sz.000063", "tradestatus": "1", "isST": "0"},
+        ["is_tradable", "trade_status"],
+    )
+
+    assert warnings == []
+    assert values["is_tradable"] is True
+    assert values["trade_status"] == "1"
+    assert values["stock_name"] == "ZTE"
+
+
 def test_baostock_query_all_stock_builds_non_tradable_universe_values() -> None:
     values, warnings = _build_values(
         Provider.BAOSTOCK,
@@ -409,6 +550,38 @@ def test_baostock_query_all_stock_skips_non_a_share_universe_rows() -> None:
         assert warnings == []
 
 
+def test_stock_basic_builds_trade_status_delisting_risk_values() -> None:
+    active_values, active_warnings = _build_values(
+        Provider.BAOSTOCK,
+        "query_stock_basic",
+        "source.trade_status_v1",
+        {"code": "sz.000063", "status": "1", "out_date": ""},
+        ["is_delisting_risk"],
+    )
+    assert active_warnings == []
+    assert active_values == {"is_delisting_risk": False}
+
+    delisted_values, delisted_warnings = _build_values(
+        Provider.BAOSTOCK,
+        "query_stock_basic",
+        "source.trade_status_v1",
+        {"code": "sz.000000", "status": "0", "outDate": "20200101"},
+        ["is_delisting_risk"],
+    )
+    assert delisted_warnings == []
+    assert delisted_values == {"is_delisting_risk": True}
+
+    unknown_values, unknown_warnings = _build_values(
+        Provider.TUSHARE,
+        "stock_basic",
+        "source.trade_status_v1",
+        {"ts_code": "000001.SZ"},
+        ["is_delisting_risk"],
+    )
+    assert unknown_values == {}
+    assert unknown_warnings == ["raw stock basic status/out_date is missing or unparseable for is_delisting_risk"]
+
+
 def test_fetch_plan_stage_candidates_requires_explicit_symbols() -> None:
     try:
         build_fetch_plan(
@@ -432,7 +605,7 @@ def test_fetch_plan_stage_candidates_requires_explicit_symbols() -> None:
 def test_hot_preopen_preflight_uses_previous_trade_day_for_daily_bar(monkeypatch) -> None:
     captured: list[tuple[str, str | None, str | None]] = []
 
-    def fake_list_source_rows(source_table_name: str, symbol: str | None = None, trade_date: str | None = None):
+    def fake_list_source_rows(source_table_name: str, symbol: str | None = None, trade_date: str | None = None, limit: int | None = 1000):
         captured.append((source_table_name, symbol, trade_date))
         available = datetime(2026, 6, 18, 8, 0, tzinfo=timezone.utc)
         if source_table_name == "source.trade_calendar_v1" and trade_date == "2026-06-19":
@@ -1433,7 +1606,7 @@ def test_source_build_derives_limit_price_and_event_from_real_daily_bar() -> Non
 def test_limit_price_build_uses_previous_daily_close_when_raw_preclose_missing(monkeypatch) -> None:
     available = datetime(2026, 6, 23, 8, 0, tzinfo=timezone.utc)
 
-    def fake_list_source_rows(source_table_name: str, symbol: str | None = None, trade_date: str | None = None):
+    def fake_list_source_rows(source_table_name: str, symbol: str | None = None, trade_date: str | None = None, limit: int | None = 1000):
         if source_table_name == "source.trade_calendar_v1":
             return [
                 SourceCanonicalRowOut(
@@ -2572,6 +2745,230 @@ def test_fetch_submit_pull_complete_and_callback_status_are_persistent_in_servic
     assert {"batch_submitted", "job_leased", "job_succeeded", "batch_completed"} <= event_types
 
 
+def test_fetch_submit_uses_durable_idempotency_before_plan_expansion(monkeypatch) -> None:
+    client = TestClient(app)
+    request_payload = {
+        "source_table_name": "source.daily_bar_v1",
+        "canonical_fields": ["close_price"],
+        "symbols": ["000063.SZ"],
+        "trade_date": "2026-06-12",
+        "trigger_type": "manual_backfill",
+        "priority": "P2_backfill",
+        "request_source": "scheduler-service",
+        "dry_run": True,
+        "idempotency_key": "scheduler:source.daily.close_bars:2026-06-12",
+    }
+    first = client.post("/source/fetch/submit", json=request_payload)
+    assert first.status_code == 200
+    first_batch_id = first.json()["fetch_batch_id"]
+    for job in fetch_orchestrator._JOBS.values():
+        if job.fetch_batch_id == first_batch_id:
+            job.status = fetch_orchestrator.FetchJobStatus.SUCCEEDED
+            job.updated_at = datetime.now(timezone.utc)
+    fetch_orchestrator._IDEMPOTENCY_TO_BATCH.clear()
+
+    plan_expanded = False
+
+    def fake_durable_idempotency_lookup(idempotency_key: str) -> str | None:
+        assert idempotency_key == request_payload["idempotency_key"]
+        return first_batch_id
+
+    def fail_if_plan_expands(_request):
+        nonlocal plan_expanded
+        plan_expanded = True
+        raise AssertionError("duplicate idempotency submit must not expand a new fetch plan")
+
+    monkeypatch.setattr(
+        fetch_orchestrator,
+        "durable_fetch_batch_id_by_idempotency_key_if_enabled",
+        fake_durable_idempotency_lookup,
+    )
+    monkeypatch.setattr(fetch_orchestrator, "build_fetch_plan", fail_if_plan_expands)
+
+    duplicate = client.post("/source/fetch/submit", json=request_payload)
+
+    assert duplicate.status_code == 200
+    payload = duplicate.json()
+    assert payload["fetch_batch_id"] == first_batch_id
+    assert payload["submitted_job_count"] == 0
+    assert payload["skipped_duplicate_count"] >= 1
+    assert payload["producer_ack"] == "duplicate_idempotency_key_returned_existing_batch"
+    assert plan_expanded is False
+def test_stock_universe_market_batch_failure_fans_out_symbol_backups(monkeypatch) -> None:
+    client = TestClient(app)
+    available = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+
+    def fake_list_source_rows(source_table_name: str, trade_date: str | None = None, limit: int | None = 1000):
+        if source_table_name == "source.stock_universe_daily_v1":
+            return []
+        if source_table_name == "source.stock_master_v1":
+            return [
+                SourceCanonicalRowOut(
+                    source_table_name="source.stock_master_v1",
+                    source_pk="000063.SZ",
+                    symbol="000063.SZ",
+                    values={"list_status": "1", "stock_name": "ZTE"},
+                    source_quality_status=QualityStatus.USABLE,
+                    primary_provider=Provider.BAOSTOCK,
+                    updated_at=available,
+                ),
+                SourceCanonicalRowOut(
+                    source_table_name="source.stock_master_v1",
+                    source_pk="600000.SH",
+                    symbol="600000.SH",
+                    values={"list_status": "1", "stock_name": "SPDB"},
+                    source_quality_status=QualityStatus.USABLE,
+                    primary_provider=Provider.BAOSTOCK,
+                    updated_at=available,
+                ),
+                SourceCanonicalRowOut(
+                    source_table_name="source.stock_master_v1",
+                    source_pk="399001.SZ",
+                    symbol="399001.SZ",
+                    values={"list_status": "1", "stock_name": "index"},
+                    source_quality_status=QualityStatus.USABLE,
+                    primary_provider=Provider.BAOSTOCK,
+                    updated_at=available,
+                ),
+            ]
+        return []
+
+    monkeypatch.setattr(fetch_orchestrator, "_list_source_rows", fake_list_source_rows)
+    submit = client.post(
+        "/source/fetch/submit",
+        json={
+            "source_table_name": "source.stock_universe_daily_v1",
+            "canonical_fields": ["is_tradable", "trade_status"],
+            "universe_scope": "full_a_share",
+            "trade_date": "2026-07-14",
+            "trigger_type": "data_inspection_gap_repair",
+            "priority": "P1_normal_ingest",
+            "request_source": "data-inspector-service",
+            "dry_run": True,
+            "prefer_batch": True,
+        },
+    )
+    assert submit.status_code == 200
+    batch_id = submit.json()["fetch_batch_id"]
+    pull = client.post(
+        "/source/fetch/worker/pull",
+        json={"worker_id": "worker-universe-primary", "max_jobs": 1, "queue_names": ["repair_queue"]},
+    ).json()
+    primary = pull["jobs"][0]
+    assert primary["api_name"] == "query_all_stock"
+    failed = client.post(
+        f"/source/fetch/jobs/{primary['job_item_id']}/complete",
+        json={"worker_id": "worker-universe-primary", "success": False, "error_code": "provider_structured_error", "error_message": "provider returned zero rows; backup required"},
+    )
+    assert failed.status_code == 200
+
+    batch = client.get(f"/source/fetch/batches/{batch_id}").json()
+    assert batch["queued_count"] == 2
+    callbacks = client.get(f"/source/fetch/callbacks?fetch_batch_id={batch_id}").json()
+    fanout_events = [event for event in callbacks if event["event_type"] == "backup_job_queued" and event["payload"].get("fanout_backup")]
+    assert {event["payload"]["symbol"] for event in fanout_events} == {"000063.SZ", "600000.SH"}
+
+    pull_backups = client.post(
+        "/source/fetch/worker/pull",
+        json={"worker_id": "worker-universe-backup", "max_jobs": 5, "queue_names": ["repair_queue"]},
+    ).json()
+    assert pull_backups["leased_count"] == 2
+    assert {job["api_name"] for job in pull_backups["jobs"]} == {"query_history_k_data_plus_daily_raw"}
+    assert {job["symbol"] for job in pull_backups["jobs"]} == {"000063.SZ", "600000.SH"}
+    assert {tuple(job["canonical_fields"]) for job in pull_backups["jobs"]} == {("is_tradable", "trade_status")}
+    for job in pull_backups["jobs"]:
+        completed = client.post(
+            f"/source/fetch/jobs/{job['job_item_id']}/complete",
+            json={"worker_id": "worker-universe-backup", "success": False, "error_code": "provider_structured_error", "error_message": "backup test completed"},
+        )
+        assert completed.status_code == 200
+
+
+def test_daily_summary_marks_full_a_partial_output_as_coverage_insufficient() -> None:
+    item = {
+        "source_table_name": "source.limit_price_v1",
+        "raw_job_count": 6660,
+        "raw_succeeded_count": 354,
+        "raw_active_count": 0,
+        "raw_failed_count": 1561,
+        "raw_waiting_count": 0,
+        "raw_cancelled_count": 4748,
+        "build_result_count": 354,
+        "build_succeeded_count": 354,
+        "build_failed_count": 0,
+        "build_failure_audit_count": 0,
+        "source_row_count": 378,
+        "lineage_row_count": 0,
+        "gap_count": 0,
+        "p0_gap_count": 0,
+        "p1_gap_count": 0,
+    }
+
+    decorated = fetch_persistence.PostgresQueuePersistence._decorate_daily_table_status(
+        item,
+        universe_row_count=5208,
+    )
+
+    assert decorated["data_asset_status"] == "coverage_insufficient"
+    assert decorated["final_data_failed"] is True
+    assert decorated["coverage_insufficient"] is True
+    assert decorated["expected_source_row_count"] == 5208
+    assert decorated["minimum_required_source_row_count"] == 5182
+    assert decorated["raw_failure_audit_only"] is False
+
+
+def test_scheduler_stock_universe_fanout_backup_blocks_oversized_lifecycle(monkeypatch) -> None:
+    now = datetime(2026, 7, 21, 1, 6, tzinfo=timezone.utc)
+    symbols = [f"{index:06d}.SZ" for index in range(1, 205)]
+    job = FetchJobStatusOut(
+        job_item_id="fetch_job_scheduler_universe_primary",
+        fetch_batch_id="fetch_batch_scheduler_universe_primary",
+        provider=Provider.BAOSTOCK,
+        api_name="query_all_stock",
+        raw_table_name="raw_baostock.query_all_stock_v1",
+        request_params={
+            "day": "2026-07-21",
+            "__orchestration_context": {
+                "request_source": "scheduler-service",
+                "schedule_code": "source.daily.preopen_universe",
+                "lifecycle_expires_at": "2026-07-21T15:59:59Z",
+            },
+        },
+        request_hash="scheduler-universe-primary-hash",
+        source_table_name="source.stock_universe_daily_v1",
+        canonical_fields=["is_tradable", "trade_status"],
+        symbol=None,
+        trade_date=date(2026, 7, 21),
+        priority=FetchPriority.P1_NORMAL_INGEST,
+        queue_name=FetchQueueName.NORMAL_DAILY_INGEST_QUEUE,
+        status=FetchJobStatus.FAILED,
+        created_at=now,
+        updated_at=now,
+    )
+    saved_jobs = dict(fetch_orchestrator._JOBS)
+    saved_callbacks = list(fetch_orchestrator._CALLBACKS)
+    try:
+        fetch_orchestrator._JOBS.clear()
+        fetch_orchestrator._CALLBACKS.clear()
+        monkeypatch.setattr(fetch_orchestrator, "_load_full_a_share_symbols", lambda _request: symbols)
+
+        queued = fetch_orchestrator._queue_stock_universe_daily_fanout_backup_jobs(
+            job,
+            fetch_batch_id=job.fetch_batch_id,
+            now=now,
+            reason="provider_structured_error",
+        )
+
+        assert queued == 0
+        assert fetch_orchestrator._JOBS == {}
+        assert any(callback.payload.get("fanout_backup_blocked") for callback in fetch_orchestrator._CALLBACKS)
+    finally:
+        fetch_orchestrator._JOBS.clear()
+        fetch_orchestrator._JOBS.update(saved_jobs)
+        fetch_orchestrator._CALLBACKS.clear()
+        fetch_orchestrator._CALLBACKS.extend(saved_callbacks)
+
+
 def test_failed_primary_fetch_queues_backup_job_without_losing_status() -> None:
     client = TestClient(app)
     submit = client.post(
@@ -2693,6 +3090,96 @@ def test_provider_runtime_status_exposes_concurrency_queue_counts() -> None:
     assert all(row["max_concurrency"] >= 1 for row in rows)
 
 
+def test_baostock_daily_repair_rate_limit_policy_has_repair_burst_capacity() -> None:
+    policies = {item.api_name: item for item in fetch_orchestrator.list_rate_limit_policies(Provider.BAOSTOCK)}
+
+    assert policies["query_history_k_data_plus_daily_raw"].max_concurrency >= 12
+    assert policies["query_history_k_data_plus_daily_raw"].requests_per_minute >= 300
+    assert policies["query_history_k_data_plus_daily_qfq"].max_concurrency >= 12
+    assert policies["query_history_k_data_plus_daily_qfq"].requests_per_minute >= 300
+
+
+def test_lease_fetch_jobs_interleaves_same_priority_daily_source_tables(monkeypatch) -> None:
+    from source_data_service.models import FetchBatchStatus, FetchJobLeaseRequest
+
+    now = datetime(2026, 7, 23, 10, 0, tzinfo=timezone.utc)
+    source_tables = [
+        "source.limit_price_v1",
+        "source.daily_bar_v1",
+        "source.adjusted_daily_bar_v1",
+    ]
+    saved = (
+        dict(fetch_orchestrator._BATCHES),
+        dict(fetch_orchestrator._JOBS),
+        dict(fetch_orchestrator._REQUEST_HASH_TO_JOB),
+        list(fetch_orchestrator._CALLBACKS),
+    )
+    try:
+        fetch_orchestrator._BATCHES.clear()
+        fetch_orchestrator._JOBS.clear()
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.clear()
+        fetch_orchestrator._CALLBACKS.clear()
+        monkeypatch.setattr(fetch_orchestrator, "_hydrate_active_state_from_persistence", lambda **_kwargs: None)
+        monkeypatch.setattr(fetch_orchestrator, "_cancel_expired_daily_lifecycle_jobs", lambda: 0)
+        monkeypatch.setattr(fetch_orchestrator, "requeue_expired_leases", lambda: type("LeaseMaintenance", (), {"requeued_count": 0})())
+        monkeypatch.setattr(fetch_orchestrator, "persist_job_if_enabled", lambda _job: None)
+        monkeypatch.setattr(fetch_orchestrator, "persist_callback_if_enabled", lambda _event: None)
+
+        for table_index, source_table in enumerate(source_tables):
+            batch_id = f"batch_fair_{table_index}"
+            fetch_orchestrator._BATCHES[batch_id] = fetch_orchestrator.BatchRecord(
+                fetch_batch_id=batch_id,
+                fetch_plan_id=f"plan_fair_{table_index}",
+                source_table_name=source_table,
+                trigger_type=FetchTriggerType.DATA_INSPECTION_GAP_REPAIR,
+                priority=FetchPriority.P0_URGENT_RELEASE,
+                queue_name=FetchQueueName.REPAIR_QUEUE,
+                callback_url=None,
+                status=FetchBatchStatus.QUEUED,
+                created_at=now + timedelta(seconds=table_index),
+                updated_at=now + timedelta(seconds=table_index),
+            )
+            for item_index in range(4):
+                job_id = f"job_fair_{table_index}_{item_index}"
+                fetch_orchestrator._JOBS[job_id] = FetchJobStatusOut(
+                    job_item_id=job_id,
+                    fetch_batch_id=batch_id,
+                    provider=Provider.BAOSTOCK,
+                    api_name="query_history_k_data_plus_daily_raw",
+                    raw_table_name="raw_baostock.query_history_k_data_plus_daily_raw_v1",
+                    request_params={"code": f"sz.00000{item_index}", "date": "2026-07-23"},
+                    request_hash=f"hash_fair_{table_index}_{item_index}",
+                    source_table_name=source_table,
+                    canonical_fields=["close_price"],
+                    symbol=f"00000{item_index}.SZ",
+                    trade_date=date(2026, 7, 23),
+                    priority=FetchPriority.P0_URGENT_RELEASE,
+                    queue_name=FetchQueueName.REPAIR_QUEUE,
+                    status=FetchJobStatus.QUEUED,
+                    created_at=now + timedelta(minutes=table_index, seconds=item_index),
+                    updated_at=now + timedelta(minutes=table_index, seconds=item_index),
+                )
+
+        lease = fetch_orchestrator.lease_fetch_jobs(
+            FetchJobLeaseRequest(worker_id="worker-fair", max_jobs=6, providers=[Provider.BAOSTOCK], queue_names=[FetchQueueName.REPAIR_QUEUE])
+        )
+
+        counts = {source_table: 0 for source_table in source_tables}
+        for job in lease.jobs:
+            counts[job.source_table_name] += 1
+        assert lease.leased_count == 6
+        assert counts == {source_table: 2 for source_table in source_tables}
+    finally:
+        fetch_orchestrator._BATCHES.clear()
+        fetch_orchestrator._BATCHES.update(saved[0])
+        fetch_orchestrator._JOBS.clear()
+        fetch_orchestrator._JOBS.update(saved[1])
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.clear()
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.update(saved[2])
+        fetch_orchestrator._CALLBACKS.clear()
+        fetch_orchestrator._CALLBACKS.extend(saved[3])
+
+
 def test_ds5_persistence_status_queue_summary_and_idempotent_submit() -> None:
     client = TestClient(app)
     status = client.get("/source/fetch/persistence/status")
@@ -2722,6 +3209,69 @@ def test_ds5_persistence_status_queue_summary_and_idempotent_submit() -> None:
     summary = client.get("/source/fetch/queues/summary")
     assert summary.status_code == 200
     assert any(row["queue_name"] == "normal_daily_ingest_queue" for row in summary.json()["rows"])
+
+
+def test_fetch_submit_uses_bulk_durable_request_hash_lookup(monkeypatch) -> None:
+    saved_batches = dict(fetch_orchestrator._BATCHES)
+    saved_jobs = dict(fetch_orchestrator._JOBS)
+    saved_request_hash = dict(fetch_orchestrator._REQUEST_HASH_TO_JOB)
+    saved_callbacks = list(fetch_orchestrator._CALLBACKS)
+    saved_build_triggers = list(fetch_orchestrator._BUILD_TRIGGERS)
+    saved_idempotency = dict(fetch_orchestrator._IDEMPOTENCY_TO_BATCH)
+    try:
+        fetch_orchestrator._BATCHES.clear()
+        fetch_orchestrator._JOBS.clear()
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.clear()
+        fetch_orchestrator._CALLBACKS.clear()
+        fetch_orchestrator._BUILD_TRIGGERS.clear()
+        fetch_orchestrator._IDEMPOTENCY_TO_BATCH.clear()
+        bulk_calls: list[list[tuple[Provider, str, str, str]]] = []
+        single_calls: list[tuple[Provider, str, str, str]] = []
+
+        def fake_bulk(requests: list[tuple[Provider, str, str, str]]) -> dict[tuple[str, str, str, str], str]:
+            bulk_calls.append(requests)
+            return {}
+
+        def fake_single(provider: Provider, api_name: str, raw_table_name: str, request_hash: str) -> str | None:
+            single_calls.append((provider, api_name, raw_table_name, request_hash))
+            return None
+
+        monkeypatch.setattr(fetch_orchestrator, "find_existing_job_item_ids_if_enabled", fake_bulk)
+        monkeypatch.setattr(fetch_orchestrator, "find_existing_job_item_id_if_enabled", fake_single)
+
+        client = TestClient(app)
+        submit = client.post(
+            "/source/fetch/submit",
+            json={
+                "source_table_name": "source.daily_bar_v1",
+                "canonical_fields": ["close_price"],
+                "symbols": ["000780.SZ", "000781.SZ"],
+                "trade_date": "2026-07-14",
+                "trigger_type": "scheduled_periodic",
+                "priority": "P1_normal_ingest",
+                "request_source": "scheduler-service",
+                "dry_run": True,
+            },
+        )
+
+        assert submit.status_code == 200
+        assert submit.json()["submitted_job_count"] == 2
+        assert len(bulk_calls) == 1
+        assert len(bulk_calls[0]) == 2
+        assert single_calls == []
+    finally:
+        fetch_orchestrator._BATCHES.clear()
+        fetch_orchestrator._BATCHES.update(saved_batches)
+        fetch_orchestrator._JOBS.clear()
+        fetch_orchestrator._JOBS.update(saved_jobs)
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.clear()
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.update(saved_request_hash)
+        fetch_orchestrator._CALLBACKS.clear()
+        fetch_orchestrator._CALLBACKS.extend(saved_callbacks)
+        fetch_orchestrator._BUILD_TRIGGERS.clear()
+        fetch_orchestrator._BUILD_TRIGGERS.extend(saved_build_triggers)
+        fetch_orchestrator._IDEMPOTENCY_TO_BATCH.clear()
+        fetch_orchestrator._IDEMPOTENCY_TO_BATCH.update(saved_idempotency)
 
 
 def test_ds5_worker_run_once_creates_source_build_trigger() -> None:
@@ -2762,6 +3312,38 @@ def test_ds5_worker_run_once_creates_source_build_trigger() -> None:
     assert any(event["event_type"] == "job_heartbeat" for event in callbacks)
     assert any(event["event_type"] == "source_build_trigger_created" for event in callbacks)
 
+
+def test_source_build_worker_uses_durable_queued_trigger_window(monkeypatch) -> None:
+    trigger = SourceBuildTriggerOut(
+        trigger_id="source_build_trigger_durable_window",
+        fetch_batch_id="fetch_batch_durable_window",
+        job_item_id=None,
+        source_table_name="source.daily_bar_v1",
+        symbol="000001.SZ",
+        trade_date=date(2026, 7, 14),
+        build_scope="symbol_date",
+        status="queued",
+        created_at=datetime(2026, 7, 14, 1, 0, tzinfo=timezone.utc),
+    )
+
+    monkeypatch.setattr(
+        source_repository,
+        "durable_queued_build_triggers_if_enabled",
+        lambda *, limit=100, source_table_names=None: [trigger],
+    )
+    monkeypatch.setattr(
+        source_repository,
+        "durable_build_trigger_if_enabled",
+        lambda trigger_id: trigger if trigger_id == trigger.trigger_id else None,
+    )
+
+    result = run_source_build_worker_once(
+        SourceBuildWorkerRunOnceRequest(worker_id="builder-durable-window", max_triggers=1, dry_run=True)
+    )
+
+    assert result.leased_trigger_count == 1
+    assert result.results[0].trigger_id == trigger.trigger_id
+    assert result.results[0].status == "dry_run"
 
 def test_idle_fetch_worker_drains_queued_source_build_triggers() -> None:
     saved_batches = dict(fetch_orchestrator._BATCHES)
@@ -3211,6 +3793,16 @@ def test_worker_pull_hydrates_durable_batch_for_queued_job_after_restart(monkeyp
         created_at=now,
         updated_at=now,
     )
+    older_job = job.model_copy(
+        update={
+            "job_item_id": "fetch_job_restart_hydrate_older_trade_day",
+            "request_hash": "restart-hydrate-request-hash-older",
+            "symbol": "000759.SZ",
+            "trade_date": date(2026, 5, 27),
+            "created_at": now - timedelta(days=1),
+            "updated_at": now - timedelta(days=1),
+        }
+    )
 
     saved_batches = dict(fetch_orchestrator._BATCHES)
     saved_jobs = dict(fetch_orchestrator._JOBS)
@@ -3229,7 +3821,7 @@ def test_worker_pull_hydrates_durable_batch_for_queued_job_after_restart(monkeyp
             }
         )
 
-        monkeypatch.setattr(fetch_orchestrator, "load_active_state_if_enabled", lambda: ([], [job]))
+        monkeypatch.setattr(fetch_orchestrator, "load_active_state_if_enabled", lambda **_kwargs: ([], [older_job, job]))
         monkeypatch.setattr(
             fetch_orchestrator,
             "durable_fetch_batch_if_enabled",
@@ -3272,6 +3864,7 @@ def test_requeue_expired_leases_uses_durable_jobs_after_restart(monkeypatch) -> 
     from source_data_service.models import (
         FetchBatchStatus,
         FetchBatchStatusOut,
+        FetchJobLeaseRequest,
         FetchJobStatus,
         FetchJobStatusOut,
         FetchQueueName,
@@ -3345,6 +3938,26 @@ def test_requeue_expired_leases_uses_durable_jobs_after_restart(monkeypatch) -> 
         ]
         assert requeued_events
         assert requeued_events[-1].callback_url == batch.callback_url
+
+        fetch_orchestrator._JOBS[requeued_job.job_item_id] = requeued_job.model_copy(
+            update={
+                "status": FetchJobStatus.LEASED,
+                "worker_id": "stale-worker",
+                "lease_expires_at": now - timedelta(minutes=1),
+                "updated_at": now - timedelta(minutes=1),
+            }
+        )
+        lease = fetch_orchestrator.lease_fetch_jobs(
+            FetchJobLeaseRequest(
+                worker_id="worker-after-expired-lease",
+                max_jobs=1,
+                queue_names=[FetchQueueName.NORMAL_DAILY_INGEST_QUEUE],
+            )
+        )
+        assert lease.leased_count == 1
+        assert lease.jobs[0].job_item_id == requeued_job.job_item_id
+        assert lease.jobs[0].status == FetchJobStatus.LEASED
+        assert lease.jobs[0].worker_id == "worker-after-expired-lease"
     finally:
         fetch_orchestrator._BATCHES.clear()
         fetch_orchestrator._BATCHES.update(saved_batches)
@@ -3354,6 +3967,230 @@ def test_requeue_expired_leases_uses_durable_jobs_after_restart(monkeypatch) -> 
         fetch_orchestrator._REQUEST_HASH_TO_JOB.update(saved_request_hash)
         fetch_orchestrator._CALLBACKS.clear()
         fetch_orchestrator._CALLBACKS.extend(saved_callbacks)
+
+
+def test_load_active_state_if_enabled_passes_provider_queue_filters(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+
+    class FakePersistence:
+        def load_active_state(self, *, queue_names=None, providers=None):
+            calls["queue_names"] = queue_names
+            calls["providers"] = providers
+            return ["batch"], ["job"]
+
+    monkeypatch.setattr(
+        fetch_persistence,
+        "queue_persistence_summary",
+        lambda: fetch_persistence.QueuePersistenceSummary(
+            backend="postgres",
+            durable=True,
+            database_url_configured=True,
+            driver_available=True,
+            ready_for_production_queue=True,
+            note="test",
+        ),
+    )
+    monkeypatch.setattr(fetch_persistence, "_PG", FakePersistence())
+
+    batches, jobs = fetch_persistence.load_active_state_if_enabled(
+        queue_names=["research_queue"],
+        providers=["eastmoney"],
+    )
+
+    assert batches == ["batch"]
+    assert jobs == ["job"]
+    assert calls == {"queue_names": ["research_queue"], "providers": ["eastmoney"]}
+
+
+def test_lease_fetch_jobs_hydrates_durable_state_with_requested_filters(monkeypatch) -> None:
+    from source_data_service import fetch_orchestrator
+    from source_data_service.models import FetchBatchStatus, FetchBatchStatusOut, FetchJobLeaseRequest, FetchJobStatus, FetchJobStatusOut, FetchQueueName
+
+    now = datetime(2026, 7, 15, 2, 0, tzinfo=timezone.utc)
+    batch = FetchBatchStatusOut(
+        fetch_batch_id="fetch_batch_filtered_hydrate",
+        fetch_plan_id="fetch_plan_filtered_hydrate",
+        source_table_name="source.stock_moneyflow_daily_v1",
+        trigger_type=FetchTriggerType.SCHEDULED_PERIODIC,
+        priority=FetchPriority.RESEARCH,
+        queue_name=FetchQueueName.RESEARCH_QUEUE,
+        status=FetchBatchStatus.QUEUED,
+        job_count=1,
+        queued_count=1,
+        leased_count=0,
+        succeeded_count=0,
+        failed_count=0,
+        skipped_duplicate_count=0,
+        callback_url=None,
+        created_at=now,
+        updated_at=now,
+    )
+    job = FetchJobStatusOut(
+        job_item_id="fetch_job_filtered_hydrate",
+        fetch_batch_id=batch.fetch_batch_id,
+        provider=Provider.EASTMONEY,
+        api_name="moneyflow_stock_series",
+        raw_table_name="raw_eastmoney.moneyflow_stock_series_v1",
+        request_params={"symbol": "000063.SZ"},
+        request_hash="filtered-hydrate-request-hash",
+        source_table_name=batch.source_table_name,
+        canonical_fields=["net_inflow"],
+        symbol="000063.SZ",
+        trade_date=date(2026, 7, 15),
+        priority=FetchPriority.RESEARCH,
+        queue_name=FetchQueueName.RESEARCH_QUEUE,
+        status=FetchJobStatus.QUEUED,
+        created_at=now,
+        updated_at=now,
+    )
+    calls: list[tuple[list[str] | None, list[str] | None]] = []
+
+    def fake_load_active_state_if_enabled(*, queue_names=None, providers=None):
+        calls.append((queue_names, providers))
+        return [batch], [job]
+
+    saved_batches = dict(fetch_orchestrator._BATCHES)
+    saved_jobs = dict(fetch_orchestrator._JOBS)
+    saved_hashes = dict(fetch_orchestrator._REQUEST_HASH_TO_JOB)
+    saved_callbacks = list(fetch_orchestrator._CALLBACKS)
+    saved_lifecycle_at = fetch_orchestrator._LAST_LIFECYCLE_MAINTENANCE_AT
+    try:
+        fetch_orchestrator._BATCHES.clear()
+        fetch_orchestrator._JOBS.clear()
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.clear()
+        fetch_orchestrator._CALLBACKS.clear()
+        fetch_orchestrator._LAST_LIFECYCLE_MAINTENANCE_AT = None
+        monkeypatch.setattr(fetch_orchestrator, "_utcnow", lambda: now)
+        monkeypatch.setattr(fetch_orchestrator, "load_active_state_if_enabled", fake_load_active_state_if_enabled)
+        monkeypatch.setattr(fetch_orchestrator, "requeue_expired_leases_if_enabled", lambda _now: [])
+        monkeypatch.setattr(fetch_orchestrator, "cancel_expired_daily_jobs_if_enabled", lambda **_kwargs: [])
+        monkeypatch.setattr(fetch_orchestrator, "persist_job_if_enabled", lambda _job: None)
+        monkeypatch.setattr(fetch_orchestrator, "persist_batch_if_enabled", lambda _batch: None)
+        monkeypatch.setattr(fetch_orchestrator, "persist_callback_if_enabled", lambda _event: None)
+
+        lease = fetch_orchestrator.lease_fetch_jobs(
+            FetchJobLeaseRequest(
+                worker_id="worker-filtered-hydrate",
+                max_jobs=1,
+                providers=[Provider.EASTMONEY],
+                queue_names=[FetchQueueName.RESEARCH_QUEUE],
+            )
+        )
+
+        assert lease.leased_count == 1
+        assert lease.jobs[0].job_item_id == job.job_item_id
+        assert calls[0] == (["research_queue"], ["eastmoney"])
+    finally:
+        fetch_orchestrator._BATCHES.clear(); fetch_orchestrator._BATCHES.update(saved_batches)
+        fetch_orchestrator._JOBS.clear(); fetch_orchestrator._JOBS.update(saved_jobs)
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.clear(); fetch_orchestrator._REQUEST_HASH_TO_JOB.update(saved_hashes)
+        fetch_orchestrator._CALLBACKS.clear(); fetch_orchestrator._CALLBACKS.extend(saved_callbacks)
+        fetch_orchestrator._LAST_LIFECYCLE_MAINTENANCE_AT = saved_lifecycle_at
+
+
+def test_postgres_cancel_expired_daily_jobs_includes_legacy_scheduler_fallback() -> None:
+    class Cursor:
+        def __init__(self) -> None:
+            self.sql = ""
+            self.params = ()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, sql, params):
+            self.sql = sql
+            self.params = params
+
+        def fetchall(self):
+            return []
+
+    class Conn:
+        def __init__(self, cursor: Cursor) -> None:
+            self._cursor = cursor
+            self.committed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def cursor(self):
+            return self._cursor
+
+        def commit(self) -> None:
+            self.committed = True
+
+    cursor = Cursor()
+    conn = Conn(cursor)
+    repo = fetch_persistence.PostgresQueuePersistence.__new__(fetch_persistence.PostgresQueuePersistence)
+    repo.ready = True
+    repo._connect = lambda: conn
+    now = datetime(2026, 7, 20, 11, 30, tzinfo=timezone.utc)
+
+    cancelled = repo.cancel_expired_daily_jobs(now=now, market_today=date(2026, 7, 20))
+
+    assert cancelled == []
+    assert conn.committed is True
+    assert "job.trade_date = %s" in cursor.sql
+    assert "source.adjusted_daily_bar_v1" in cursor.sql
+    assert "source.stock_moneyflow_daily_v1" in cursor.sql
+    assert "source.realtime_quote_v1" in cursor.sql
+    assert "INTERVAL '10 minutes'" in cursor.sql
+    assert "INTERVAL '30 minutes'" in cursor.sql
+    assert "INTERVAL '2 hours'" in cursor.sql
+    assert "INTERVAL '4 hours'" in cursor.sql
+    assert cursor.params[:4] == (now, date(2026, 7, 20), date(2026, 7, 20), now)
+
+
+def test_lease_fetch_jobs_cancels_expired_daily_lifecycle_jobs(monkeypatch) -> None:
+    from source_data_service import fetch_orchestrator
+    from source_data_service.models import FetchBatchStatus, FetchJobLeaseRequest, FetchJobStatus, FetchJobStatusOut, FetchQueueName
+
+    now = datetime(2026, 7, 15, 2, 0, tzinfo=timezone.utc)
+    BR = fetch_orchestrator.BatchRecord
+
+    def batch(batch_id: str) -> object:
+        return BR(batch_id, f"plan_{batch_id}", "source.trade_status_v1", FetchTriggerType.SCHEDULED_PERIODIC, FetchPriority.P1_NORMAL_INGEST, FetchQueueName.NORMAL_DAILY_INGEST_QUEUE, None, FetchBatchStatus.QUEUED, now, now)
+
+    def job(job_id: str, batch_id: str, trade_day: date) -> FetchJobStatusOut:
+        return FetchJobStatusOut(job_item_id=job_id, fetch_batch_id=batch_id, provider=Provider.BAOSTOCK, api_name="query_history_k_data_plus_daily_raw", raw_table_name="raw_baostock.query_history_k_data_plus_daily_raw_v1", request_params={"date": trade_day.isoformat()}, request_hash=f"hash-{job_id}", source_table_name="source.trade_status_v1", canonical_fields=["trade_status"], symbol="000063.SZ", trade_date=trade_day, priority=FetchPriority.P1_NORMAL_INGEST, queue_name=FetchQueueName.NORMAL_DAILY_INGEST_QUEUE, status=FetchJobStatus.QUEUED, created_at=now, updated_at=now)
+
+    old_job = job("job_expired_lifecycle", "batch_expired_lifecycle", date(2026, 7, 14))
+    today_job = job("job_current_lifecycle", "batch_current_lifecycle", date(2026, 7, 15))
+    saved = (dict(fetch_orchestrator._BATCHES), dict(fetch_orchestrator._JOBS), dict(fetch_orchestrator._REQUEST_HASH_TO_JOB), list(fetch_orchestrator._CALLBACKS), fetch_orchestrator._LAST_LIFECYCLE_MAINTENANCE_AT)
+    try:
+        fetch_orchestrator._BATCHES.clear(); fetch_orchestrator._JOBS.clear(); fetch_orchestrator._REQUEST_HASH_TO_JOB.clear(); fetch_orchestrator._CALLBACKS.clear()
+        fetch_orchestrator._LAST_LIFECYCLE_MAINTENANCE_AT = None
+        fetch_orchestrator._BATCHES[old_job.fetch_batch_id] = batch(old_job.fetch_batch_id)
+        fetch_orchestrator._BATCHES[today_job.fetch_batch_id] = batch(today_job.fetch_batch_id)
+        for item in (old_job, today_job):
+            fetch_orchestrator._JOBS[item.job_item_id] = item
+            fetch_orchestrator._REQUEST_HASH_TO_JOB[item.request_hash] = item.job_item_id
+        monkeypatch.setattr(fetch_orchestrator, "_utcnow", lambda: now)
+        monkeypatch.setattr(fetch_orchestrator, "persistence_market_today", lambda _now: date(2026, 7, 15))
+        monkeypatch.setattr(fetch_orchestrator, "load_active_state_if_enabled", lambda **_kwargs: ([], []))
+        monkeypatch.setattr(fetch_orchestrator, "requeue_expired_leases_if_enabled", lambda _now: None)
+        monkeypatch.setattr(fetch_orchestrator, "cancel_expired_daily_jobs_if_enabled", lambda **_kwargs: None)
+        monkeypatch.setattr(fetch_orchestrator, "persist_job_if_enabled", lambda _job: None)
+        monkeypatch.setattr(fetch_orchestrator, "persist_batch_if_enabled", lambda _batch: None)
+        monkeypatch.setattr(fetch_orchestrator, "persist_callback_if_enabled", lambda _event: None)
+        lease = fetch_orchestrator.lease_fetch_jobs(FetchJobLeaseRequest(worker_id="worker-lifecycle", max_jobs=5, queue_names=[FetchQueueName.NORMAL_DAILY_INGEST_QUEUE]))
+        assert lease.leased_count == 1
+        assert lease.jobs[0].job_item_id == today_job.job_item_id
+        assert fetch_orchestrator._JOBS[old_job.job_item_id].status == FetchJobStatus.CANCELLED
+        assert fetch_orchestrator._JOBS[old_job.job_item_id].last_error_code == "expired_lifecycle"
+        assert fetch_orchestrator._BATCHES[old_job.fetch_batch_id].status == FetchBatchStatus.CANCELLED
+    finally:
+        batches, jobs, hashes, callbacks, lifecycle_at = saved
+        fetch_orchestrator._BATCHES.clear(); fetch_orchestrator._BATCHES.update(batches)
+        fetch_orchestrator._JOBS.clear(); fetch_orchestrator._JOBS.update(jobs)
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.clear(); fetch_orchestrator._REQUEST_HASH_TO_JOB.update(hashes)
+        fetch_orchestrator._CALLBACKS.clear(); fetch_orchestrator._CALLBACKS.extend(callbacks)
+        fetch_orchestrator._LAST_LIFECYCLE_MAINTENANCE_AT = lifecycle_at
 
 
 def test_ds6_raw_ingest_source_build_lineage_and_repository_status() -> None:
@@ -4058,6 +4895,137 @@ def test_duplicate_raw_job_submit_creates_new_source_build_trigger_for_reused_so
     assert triggers[0]["job_item_id"] == raw_job["job_item_id"]
 
 
+def test_duplicate_succeeded_backup_creates_target_source_build_trigger() -> None:
+    client = TestClient(app)
+    first = client.post(
+        "/source/fetch/submit",
+        json={
+            "source_table_name": "source.trade_status_v1",
+            "canonical_fields": ["is_tradable"],
+            "symbols": ["000768.SZ"],
+            "trade_date": "2026-05-29",
+            "trigger_type": "model_release_preflight",
+            "priority": "P0_urgent_release",
+            "request_source": "source-data-service-test",
+            "dry_run": True,
+        },
+    )
+    assert first.status_code == 200
+    pull_primary = client.post(
+        "/source/fetch/worker/pull",
+        json={"worker_id": "worker-duplicate-backup-primary", "max_jobs": 1, "providers": ["baostock"], "queue_names": ["urgent_release_gate_queue"]},
+    )
+    assert pull_primary.status_code == 200
+    primary_job = pull_primary.json()["jobs"][0]
+    fail_primary = client.post(
+        f"/source/fetch/jobs/{primary_job['job_item_id']}/complete",
+        json={
+            "worker_id": "worker-duplicate-backup-primary",
+            "success": False,
+            "error_code": "provider_timeout",
+            "error_message": "primary provider timeout",
+        },
+    )
+    assert fail_primary.status_code == 200
+
+    pull_backup = client.post(
+        "/source/fetch/worker/pull",
+        json={"worker_id": "worker-duplicate-backup-success", "max_jobs": 1, "providers": ["tencent"], "queue_names": ["urgent_release_gate_queue"]},
+    )
+    assert pull_backup.status_code == 200
+    backup_job = pull_backup.json()["jobs"][0]
+    complete_backup = client.post(
+        f"/source/fetch/jobs/{backup_job['job_item_id']}/complete",
+        json={
+            "worker_id": "worker-duplicate-backup-success",
+            "success": True,
+            "row_count": 1,
+            "raw_request_hash": "raw-request-000768-tencent-daily",
+            "raw_response_schema_hash": "schema-000768-tencent-daily",
+        },
+    )
+    assert complete_backup.status_code == 200
+
+    daily_submit = client.post(
+        "/source/fetch/submit",
+        json={
+            "source_table_name": "source.daily_bar_v1",
+            "canonical_fields": ["close_price"],
+            "symbols": ["000768.SZ"],
+            "trade_date": "2026-05-29",
+            "trigger_type": "model_release_preflight",
+            "priority": "P0_urgent_release",
+            "request_source": "hot-candidates-service",
+            "dry_run": True,
+        },
+    )
+    assert daily_submit.status_code == 200
+    payload = daily_submit.json()
+    assert payload["submitted_job_count"] == 0
+    assert payload["skipped_duplicate_count"] == 1
+    triggers = client.get(f"/source/build/triggers?fetch_batch_id={payload['fetch_batch_id']}").json()
+    assert any(
+        trigger["source_table_name"] == "source.daily_bar_v1"
+        and trigger["job_item_id"] == backup_job["job_item_id"]
+        and trigger["symbol"] == "000768.SZ"
+        and trigger["trade_date"] == "2026-05-29"
+        for trigger in triggers
+    )
+
+
+def test_active_duplicate_repair_promotes_queued_normal_job_priority() -> None:
+    client = TestClient(app)
+    symbol = "000778.SZ"
+    first = client.post(
+        "/source/fetch/submit",
+        json={
+            "source_table_name": "source.trade_status_v1",
+            "canonical_fields": ["is_tradable"],
+            "symbols": [symbol],
+            "universe_scope": "stage_candidates",
+            "trade_date": "2026-07-04",
+            "trigger_type": "scheduled_periodic",
+            "priority": "P1_normal_ingest",
+            "request_source": "scheduler-service",
+            "dry_run": True,
+        },
+    )
+    assert first.status_code == 200
+    first_batch_id = first.json()["fetch_batch_id"]
+    job = next(item for item in fetch_orchestrator._JOBS.values() if item.fetch_batch_id == first_batch_id)
+    assert job.status == FetchJobStatus.QUEUED
+    assert job.priority == FetchPriority.P1_NORMAL_INGEST
+    assert job.queue_name == FetchQueueName.NORMAL_DAILY_INGEST_QUEUE
+
+    repair = client.post(
+        "/source/fetch/submit",
+        json={
+            "source_table_name": "source.trade_status_v1",
+            "canonical_fields": ["is_tradable"],
+            "symbols": [symbol],
+            "universe_scope": "stage_candidates",
+            "trade_date": "2026-07-04",
+            "trigger_type": "data_inspection_gap_repair",
+            "priority": "P0_urgent_release",
+            "request_source": "data-inspector-service",
+            "dry_run": True,
+        },
+    )
+    assert repair.status_code == 200
+    assert repair.json()["skipped_duplicate_count"] == 1
+
+    promoted = fetch_orchestrator._JOBS[job.job_item_id]
+    assert promoted.priority == FetchPriority.P0_URGENT_RELEASE
+    assert promoted.queue_name == FetchQueueName.REPAIR_QUEUE
+    assert promoted.next_retry_at is None
+    assert any(
+        event.event_type == CallbackEventType.JOB_REQUEUED
+        and event.job_item_id == promoted.job_item_id
+        and event.payload.get("reason") == "active_duplicate_promoted_for_higher_priority_alias"
+        for event in fetch_orchestrator._CALLBACKS
+    )
+
+
 def test_active_duplicate_raw_jobs_create_alias_triggers_after_completion() -> None:
     client = TestClient(app)
     symbols = ["000771.SZ", "000772.SZ"]
@@ -4129,6 +5097,290 @@ def test_active_duplicate_raw_jobs_create_alias_triggers_after_completion() -> N
     assert {trigger["symbol"] for trigger in triggers} == set(symbols)
     assert {trigger["source_table_name"] for trigger in triggers} == {"source.daily_bar_v1"}
     assert {trigger["build_scope"] for trigger in triggers} == {"symbol_date"}
+
+
+def test_duplicate_failed_market_batch_creates_auditable_repair_job(monkeypatch) -> None:
+    client = TestClient(app)
+
+    def fake_list_source_rows(source_table_name: str, trade_date: str | None = None, limit: int | None = 1000):
+        return []
+
+    monkeypatch.setattr(fetch_orchestrator, "_list_source_rows", fake_list_source_rows)
+    first = client.post(
+        "/source/fetch/submit",
+        json={
+            "source_table_name": "source.stock_universe_daily_v1",
+            "canonical_fields": ["is_tradable", "trade_status"],
+            "universe_scope": "full_a_share",
+            "trade_date": "2026-07-15",
+            "trigger_type": "data_inspection_gap_repair",
+            "priority": "P1_normal_ingest",
+            "request_source": "data-inspector-service",
+            "dry_run": True,
+            "prefer_batch": True,
+        },
+    )
+    assert first.status_code == 200
+    pull = client.post(
+        "/source/fetch/worker/pull",
+        json={"worker_id": "worker-universe-dup-primary", "max_jobs": 1, "queue_names": ["repair_queue"]},
+    ).json()
+    primary = pull["jobs"][0]
+    client.post(
+        f"/source/fetch/jobs/{primary['job_item_id']}/complete",
+        json={"worker_id": "worker-universe-dup-primary", "success": False, "error_code": "provider_structured_error", "error_message": "provider returned zero rows; backup required"},
+    )
+
+    second = client.post(
+        "/source/fetch/submit",
+        json={
+            "source_table_name": "source.stock_universe_daily_v1",
+            "canonical_fields": ["is_tradable", "trade_status"],
+            "universe_scope": "full_a_share",
+            "trade_date": "2026-07-15",
+            "trigger_type": "data_inspection_gap_repair",
+            "priority": "P1_normal_ingest",
+            "request_source": "codex-approved-stock-universe-repair",
+            "dry_run": True,
+            "prefer_batch": True,
+        },
+    )
+    assert second.status_code == 200
+    payload = second.json()
+    assert payload["submitted_job_count"] == 1
+    batch = client.get(f"/source/fetch/batches/{payload['fetch_batch_id']}").json()
+    assert batch["job_count"] == 1
+    assert batch["queued_count"] == 1
+    assert batch["status"] == "queued"
+    callbacks = client.get(f"/source/fetch/callbacks?fetch_batch_id={payload['fetch_batch_id']}").json()
+    assert any(event["event_type"] == "job_requeued" and event["payload"].get("repair_attempt_for_job_item_id") == primary["job_item_id"] for event in callbacks)
+
+
+def test_duplicate_success_without_reusable_source_output_requeues_primary_plan() -> None:
+    saved_batches = dict(fetch_orchestrator._BATCHES)
+    saved_jobs = dict(fetch_orchestrator._JOBS)
+    saved_request_hash = dict(fetch_orchestrator._REQUEST_HASH_TO_JOB)
+    saved_callbacks = list(fetch_orchestrator._CALLBACKS)
+    saved_build_triggers = list(fetch_orchestrator._BUILD_TRIGGERS)
+    saved_idempotency = dict(fetch_orchestrator._IDEMPOTENCY_TO_BATCH)
+    try:
+        fetch_orchestrator._BATCHES.clear()
+        fetch_orchestrator._JOBS.clear()
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.clear()
+        fetch_orchestrator._CALLBACKS.clear()
+        fetch_orchestrator._BUILD_TRIGGERS.clear()
+        fetch_orchestrator._IDEMPOTENCY_TO_BATCH.clear()
+
+        trade_date = date(2026, 7, 18)
+        plan = build_fetch_plan(
+            FetchPlanRequest(
+                source_table_name="source.event_news_v1",
+                canonical_fields=["title"],
+                trade_date=trade_date,
+                trigger_type=FetchTriggerType.DATA_INSPECTION_GAP_REPAIR,
+                priority=FetchPriority.P1_NORMAL_INGEST,
+                request_source="data-inspector-service",
+                dry_run=True,
+            )
+        )
+        planned = plan.jobs[0]
+        now = datetime(2026, 7, 18, 1, 0, tzinfo=timezone.utc)
+        primary_job_id = "fetch_job_duplicate_success_without_source_output_primary"
+        request_params = dict(planned.request_params)
+        request_params["__backup_plans"] = [item.model_dump(mode="json") for item in planned.backup_plans]
+        fetch_orchestrator._JOBS[primary_job_id] = fetch_orchestrator.FetchJobStatusOut(
+            job_item_id=primary_job_id,
+            fetch_batch_id="fetch_batch_old_primary",
+            provider=planned.provider,
+            api_name=planned.api_name,
+            raw_table_name=planned.raw_table_name,
+            request_params=request_params,
+            request_hash=planned.request_hash,
+            source_table_name=planned.source_table_name,
+            canonical_fields=planned.canonical_fields,
+            symbol=planned.symbol,
+            trade_date=planned.trade_date,
+            priority=planned.priority,
+            queue_name=planned.queue_name,
+            status=fetch_orchestrator.FetchJobStatus.SUCCEEDED,
+            created_at=now,
+            updated_at=now,
+        )
+        fetch_orchestrator._REQUEST_HASH_TO_JOB[planned.request_hash] = primary_job_id
+
+        backup = planned.backup_plans[0].model_dump(mode="json")
+        backup_job_id = "fetch_job_duplicate_success_without_source_output_backup"
+        backup_request_hash = fetch_orchestrator._job_hash(
+            Provider(backup["provider"]),
+            backup["api_name"],
+            backup["request_params"],
+            backup["raw_table_name"],
+        )
+        fetch_orchestrator._JOBS[backup_job_id] = fetch_orchestrator.FetchJobStatusOut(
+            job_item_id=backup_job_id,
+            fetch_batch_id="fetch_batch_old_backup",
+            provider=Provider(backup["provider"]),
+            api_name=backup["api_name"],
+            raw_table_name=backup["raw_table_name"],
+            request_params=backup["request_params"],
+            request_hash=backup_request_hash,
+            source_table_name=planned.source_table_name,
+            canonical_fields=planned.canonical_fields,
+            symbol=planned.symbol,
+            trade_date=planned.trade_date,
+            priority=planned.priority,
+            queue_name=planned.queue_name,
+            status=fetch_orchestrator.FetchJobStatus.FAILED,
+            backup_of_job_item_id=primary_job_id,
+            last_error_code="provider_structured_error",
+            last_error_message="backup did not produce reusable source output",
+            created_at=now,
+            updated_at=now,
+        )
+        fetch_orchestrator._REQUEST_HASH_TO_JOB[backup_request_hash] = backup_job_id
+
+        client = TestClient(app)
+        second = client.post(
+            "/source/fetch/submit",
+            json={
+                "source_table_name": "source.event_news_v1",
+                "canonical_fields": ["title"],
+                "trade_date": trade_date.isoformat(),
+                "trigger_type": "data_inspection_gap_repair",
+                "priority": "P1_normal_ingest",
+                "request_source": "data-inspector-service",
+                "dry_run": True,
+            },
+        )
+        assert second.status_code == 200
+        payload = second.json()
+        assert payload["submitted_job_count"] == 1
+        assert payload["skipped_duplicate_count"] == 0
+        batch = client.get(f"/source/fetch/batches/{payload['fetch_batch_id']}").json()
+        assert batch["job_count"] == 1
+        assert batch["queued_count"] == 1
+        repair_jobs = [job for job in fetch_orchestrator._JOBS.values() if job.fetch_batch_id == payload["fetch_batch_id"]]
+        assert len(repair_jobs) == 1
+        assert repair_jobs[0].backup_of_job_item_id == primary_job_id
+        assert repair_jobs[0].request_params.get("__repair_attempt_id") == repair_jobs[0].job_item_id
+        callbacks = client.get(f"/source/fetch/callbacks?fetch_batch_id={payload['fetch_batch_id']}").json()
+        assert any(
+            event["event_type"] == "job_requeued"
+            and event["payload"].get("repair_attempt_for_job_item_id") == primary_job_id
+            for event in callbacks
+        )
+    finally:
+        fetch_orchestrator._BATCHES.clear()
+        fetch_orchestrator._BATCHES.update(saved_batches)
+        fetch_orchestrator._JOBS.clear()
+        fetch_orchestrator._JOBS.update(saved_jobs)
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.clear()
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.update(saved_request_hash)
+        fetch_orchestrator._CALLBACKS.clear()
+        fetch_orchestrator._CALLBACKS.extend(saved_callbacks)
+        fetch_orchestrator._BUILD_TRIGGERS.clear()
+        fetch_orchestrator._BUILD_TRIGGERS.extend(saved_build_triggers)
+        fetch_orchestrator._IDEMPOTENCY_TO_BATCH.clear()
+        fetch_orchestrator._IDEMPOTENCY_TO_BATCH.update(saved_idempotency)
+
+
+def test_duplicate_success_without_target_source_row_requeues_primary_plan(monkeypatch) -> None:
+    saved_batches = dict(fetch_orchestrator._BATCHES)
+    saved_jobs = dict(fetch_orchestrator._JOBS)
+    saved_request_hash = dict(fetch_orchestrator._REQUEST_HASH_TO_JOB)
+    saved_callbacks = list(fetch_orchestrator._CALLBACKS)
+    saved_build_triggers = list(fetch_orchestrator._BUILD_TRIGGERS)
+    saved_idempotency = dict(fetch_orchestrator._IDEMPOTENCY_TO_BATCH)
+    try:
+        fetch_orchestrator._BATCHES.clear()
+        fetch_orchestrator._JOBS.clear()
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.clear()
+        fetch_orchestrator._CALLBACKS.clear()
+        fetch_orchestrator._BUILD_TRIGGERS.clear()
+        fetch_orchestrator._IDEMPOTENCY_TO_BATCH.clear()
+        monkeypatch.setattr(fetch_orchestrator, "_list_source_rows", lambda **_kwargs: [])
+        monkeypatch.setattr(fetch_orchestrator, "build_trigger_exists_if_enabled", lambda **_kwargs: False)
+
+        trade_date = date(2026, 7, 23)
+        plan = build_fetch_plan(
+            FetchPlanRequest(
+                source_table_name="source.daily_bar_v1",
+                canonical_fields=["close_price"],
+                symbols=["000063.SZ"],
+                trade_date=trade_date,
+                trigger_type=FetchTriggerType.DATA_INSPECTION_GAP_REPAIR,
+                priority=FetchPriority.P0_URGENT_RELEASE,
+                request_source="data-inspector-service",
+                dry_run=True,
+            )
+        )
+        planned = plan.jobs[0]
+        primary_job_id = "fetch_job_duplicate_success_without_target_source_row"
+        now = datetime(2026, 7, 23, 10, 0, tzinfo=timezone.utc)
+        fetch_orchestrator._JOBS[primary_job_id] = fetch_orchestrator.FetchJobStatusOut(
+            job_item_id=primary_job_id,
+            fetch_batch_id="fetch_batch_old_daily_bar",
+            provider=planned.provider,
+            api_name=planned.api_name,
+            raw_table_name=planned.raw_table_name,
+            request_params=planned.request_params,
+            request_hash=planned.request_hash,
+            source_table_name=planned.source_table_name,
+            canonical_fields=planned.canonical_fields,
+            symbol=planned.symbol,
+            trade_date=planned.trade_date,
+            priority=planned.priority,
+            queue_name=planned.queue_name,
+            status=fetch_orchestrator.FetchJobStatus.SUCCEEDED,
+            raw_request_hash="raw-request-ok",
+            raw_response_schema_hash="raw-schema-ok",
+            raw_response_row_hash="raw-row-ok",
+            created_at=now,
+            updated_at=now,
+        )
+        fetch_orchestrator._REQUEST_HASH_TO_JOB[planned.request_hash] = primary_job_id
+
+        client = TestClient(app)
+        response = client.post(
+            "/source/fetch/submit",
+            json={
+                "source_table_name": "source.daily_bar_v1",
+                "canonical_fields": ["close_price"],
+                "symbols": ["000063.SZ"],
+                "trade_date": trade_date.isoformat(),
+                "trigger_type": "data_inspection_gap_repair",
+                "priority": "P0_urgent_release",
+                "request_source": "data-inspector-service",
+                "dry_run": True,
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["submitted_job_count"] == 1
+        assert payload["skipped_duplicate_count"] == 0
+        repair_jobs = [job for job in fetch_orchestrator._JOBS.values() if job.fetch_batch_id == payload["fetch_batch_id"]]
+        assert len(repair_jobs) == 1
+        assert repair_jobs[0].backup_of_job_item_id == primary_job_id
+        callbacks = client.get(f"/source/fetch/callbacks?fetch_batch_id={payload['fetch_batch_id']}").json()
+        assert any(
+            event["event_type"] == "job_requeued"
+            and event["payload"].get("reason") == "duplicate_success_without_target_source_row"
+            for event in callbacks
+        )
+    finally:
+        fetch_orchestrator._BATCHES.clear()
+        fetch_orchestrator._BATCHES.update(saved_batches)
+        fetch_orchestrator._JOBS.clear()
+        fetch_orchestrator._JOBS.update(saved_jobs)
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.clear()
+        fetch_orchestrator._REQUEST_HASH_TO_JOB.update(saved_request_hash)
+        fetch_orchestrator._CALLBACKS.clear()
+        fetch_orchestrator._CALLBACKS.extend(saved_callbacks)
+        fetch_orchestrator._BUILD_TRIGGERS.clear()
+        fetch_orchestrator._BUILD_TRIGGERS.extend(saved_build_triggers)
+        fetch_orchestrator._IDEMPOTENCY_TO_BATCH.clear()
+        fetch_orchestrator._IDEMPOTENCY_TO_BATCH.update(saved_idempotency)
 
 
 def test_duplicate_market_batch_uses_planned_identity_for_source_build_trigger() -> None:
@@ -4355,6 +5607,8 @@ def test_duplicate_failed_raw_job_requeues_backup_for_new_source_table() -> None
     assert any(
         item["fetch_batch_id"] == payload["fetch_batch_id"]
         and item["source_table_name"] == "source.trade_status_v1"
+        and item["symbol"] == "000766.SZ"
+        and item["trade_date"] == "2026-05-29"
         for item in aliases
     )
 
@@ -4932,3 +6186,115 @@ def test_eastmoney_minute_rows_use_each_trend_datetime(monkeypatch) -> None:
 
     assert rows[0]["bar_time"] == "2026-06-12T09:30:00+08:00"
     assert rows[1]["bar_time"] == "2026-06-12T14:59:00+08:00"
+
+
+def test_daily_data_summary_reports_postgres_unavailable_without_fake_counts(monkeypatch) -> None:
+    monkeypatch.setattr(
+        fetch_persistence,
+        "queue_persistence_summary",
+        lambda: fetch_persistence.QueuePersistenceSummary(
+            backend="memory",
+            durable=False,
+            database_url_configured=False,
+            driver_available=False,
+            ready_for_production_queue=False,
+            note="test memory backend",
+        ),
+    )
+
+    result = fetch_persistence.durable_daily_data_summary_if_enabled(date(2026, 7, 10))
+
+    assert result["contract_kind"] == "source_daily_data_summary_v1"
+    assert result["read_only"] is True
+    assert result["read_status"] == "postgres_unavailable"
+    assert result["tables"] == []
+    assert result["failures"] == []
+
+
+def test_daily_data_summary_marks_backup_success_raw_failure_as_audit_only() -> None:
+    item = fetch_persistence.PostgresQueuePersistence._decorate_daily_table_status(
+        {
+            "source_table_name": "source.daily_bar_v1",
+            "raw_failed_count": 1,
+            "raw_succeeded_count": 1,
+            "raw_active_count": 0,
+            "raw_waiting_count": 0,
+            "build_succeeded_count": 1,
+            "build_failed_count": 0,
+            "source_row_count": 1,
+            "p0_gap_count": 0,
+        }
+    )
+
+    assert item["final_data_failed"] is False
+    assert item["raw_failure_audit_only"] is True
+    assert item["data_asset_status"] == "completed_with_provider_audit"
+
+
+def test_daily_data_summary_marks_recovered_build_failure_as_audit_only() -> None:
+    item = fetch_persistence.PostgresQueuePersistence._decorate_daily_table_status(
+        {
+            "source_table_name": "source.limit_price_v1",
+            "raw_failed_count": 0,
+            "raw_succeeded_count": 4,
+            "raw_active_count": 0,
+            "raw_waiting_count": 0,
+            "build_succeeded_count": 4,
+            "build_failed_count": 0,
+            "build_failure_audit_count": 4,
+            "source_row_count": 4,
+            "p0_gap_count": 0,
+        }
+    )
+
+    assert item["final_data_failed"] is False
+    assert item["build_failure_audit_only"] is True
+    assert item["data_asset_status"] == "completed_with_provider_audit"
+
+
+def test_daily_data_summary_marks_unrecovered_raw_failure_as_final_failure() -> None:
+    item = fetch_persistence.PostgresQueuePersistence._decorate_daily_table_status(
+        {
+            "source_table_name": "source.stock_universe_daily_v1",
+            "raw_failed_count": 1,
+            "raw_succeeded_count": 0,
+            "raw_active_count": 0,
+            "raw_waiting_count": 0,
+            "build_succeeded_count": 0,
+            "build_failed_count": 0,
+            "source_row_count": 0,
+            "p0_gap_count": 0,
+        }
+    )
+
+    assert item["final_data_failed"] is True
+    assert item["raw_failure_audit_only"] is False
+    assert item["data_asset_status"] == "failed"
+
+
+def test_daily_data_summary_marks_cancelled_raw_jobs_as_expired_closed() -> None:
+    item = fetch_persistence.PostgresQueuePersistence._decorate_daily_table_status(
+        {
+            "source_table_name": "source.adjusted_daily_bar_v1",
+            "raw_failed_count": 0,
+            "raw_succeeded_count": 0,
+            "raw_active_count": 0,
+            "raw_waiting_count": 0,
+            "raw_cancelled_count": 3,
+            "build_succeeded_count": 0,
+            "build_failed_count": 0,
+            "source_row_count": 0,
+            "p0_gap_count": 0,
+        }
+    )
+
+    assert item["final_data_failed"] is False
+    assert item["raw_failure_audit_only"] is False
+    assert item["data_asset_status"] == "expired_closed"
+
+
+def test_daily_data_summary_max_time_helper_ignores_empty_values() -> None:
+    older = datetime(2026, 7, 13, 9, 0, tzinfo=timezone.utc)
+    newer = datetime(2026, 7, 13, 10, 0, tzinfo=timezone.utc)
+
+    assert fetch_persistence.PostgresQueuePersistence._max_time(None, "", older, newer) == newer

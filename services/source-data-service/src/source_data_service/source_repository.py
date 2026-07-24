@@ -10,6 +10,8 @@ from source_data_service.adapters.base import stable_json_hash
 from source_data_service.fetch_orchestrator import get_fetch_job, list_source_build_triggers
 from source_data_service.fetch_persistence import (
     configured_database_url,
+    durable_build_trigger_if_enabled,
+    durable_queued_build_triggers_if_enabled,
     psycopg_available,
     queue_persistence_summary,
     update_build_trigger_status_if_enabled,
@@ -731,6 +733,33 @@ def _trade_status_from_daily_bar_values(row: dict[str, Any], canonical_fields: l
     return values, warnings
 
 
+def _trade_status_delisting_risk_values(row: dict[str, Any], canonical_fields: list[str]) -> tuple[dict[str, Any], list[str]]:
+    fields = list(dict.fromkeys(canonical_fields or ["is_delisting_risk"]))
+    delist_date = _date_text(_first_value(row, "outDate", "out_date", "delist_date"))
+    status_value = _first_value(row, "status", "list_status")
+    status = str(status_value).strip().lower() if status_value not in (None, "") else ""
+    if delist_date:
+        risk: bool | None = True
+    elif status in {"0", "d", "delisted", "??", "????"}:
+        risk = True
+    elif status in {"1", "l", "listed", "??"}:
+        risk = False
+    else:
+        risk = None
+
+    values: dict[str, Any] = {}
+    warnings: list[str] = []
+    for field in fields:
+        if field != "is_delisting_risk":
+            warnings.append(f"no build mapping for trade status stock-basic canonical field {field}")
+            continue
+        if risk is None:
+            warnings.append("raw stock basic status/out_date is missing or unparseable for is_delisting_risk")
+            continue
+        values[field] = risk
+    return values, warnings
+
+
 def _stock_universe_daily_values(row: dict[str, Any], canonical_fields: list[str]) -> tuple[dict[str, Any], list[str]]:
     symbol = _extract_symbol(row, {})
     if symbol is None:
@@ -760,6 +789,54 @@ def _stock_universe_daily_values(row: dict[str, Any], canonical_fields: list[str
             if field in {"is_st", "stock_name"}:
                 continue
             warnings.append(f"raw stock universe field for {field} is missing or unparseable")
+            continue
+        values[field] = value
+    return values, warnings
+
+
+def _stock_master_name_for_symbol(symbol: str | None) -> str | None:
+    if not symbol:
+        return None
+    try:
+        rows = list_source_rows("source.stock_master_v1", symbol=symbol, limit=10)
+    except Exception:
+        return None
+    for row in rows:
+        value = row.values.get("stock_name") if getattr(row, "values", None) else None
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _stock_universe_daily_from_daily_bar_values(row: dict[str, Any], canonical_fields: list[str]) -> tuple[dict[str, Any], list[str]]:
+    symbol = _extract_symbol(row, {})
+    if symbol is None:
+        return {}, ["stock universe daily backup row skipped: missing symbol"]
+    if not is_a_share_symbol(symbol):
+        return {}, []
+    fields = ["stock_name", "trade_status", "is_tradable", "is_st"]
+    raw_status = _first_value(row, "tradestatus", "tradeStatus", "trade_status")
+    is_tradable = _bool_value(raw_status)
+    is_st = _bool_value(_first_value(row, "isST", "is_st"))
+    derived: dict[str, Any] = {
+        "stock_name": _first_value(row, "code_name", "stock_name", "name") or _stock_master_name_for_symbol(symbol),
+        "trade_status": None if raw_status in (None, "") else str(raw_status),
+        "is_tradable": is_tradable,
+        "is_st": is_st,
+    }
+    requested = set(canonical_fields or fields)
+    requested.add("stock_name")
+    values: dict[str, Any] = {}
+    warnings: list[str] = []
+    for field in sorted(requested):
+        if field not in derived:
+            warnings.append(f"no build mapping for stock universe daily backup canonical field {field}")
+            continue
+        value = derived[field]
+        if value is None:
+            if field in {"is_st", "stock_name"}:
+                continue
+            warnings.append(f"raw daily backup field for stock universe {field} is missing or unparseable")
             continue
         values[field] = value
     return values, warnings
@@ -1067,8 +1144,15 @@ def _build_values(provider: Provider, api_name: str, source_table_name: str, row
         return _stock_master_values(row, canonical_fields)
     if provider == Provider.BAOSTOCK and api_name == "query_all_stock" and source_table_name == "source.stock_universe_daily_v1":
         return _stock_universe_daily_values(row, canonical_fields)
+    if provider == Provider.BAOSTOCK and api_name == "query_history_k_data_plus_daily_raw" and source_table_name == "source.stock_universe_daily_v1":
+        return _stock_universe_daily_from_daily_bar_values(row, canonical_fields)
     if provider == Provider.BAOSTOCK and api_name == "query_history_k_data_plus_daily_raw" and source_table_name == "source.trade_status_v1":
         return _trade_status_values(row, canonical_fields)
+    if source_table_name == "source.trade_status_v1" and (
+        (provider == Provider.BAOSTOCK and api_name == "query_stock_basic")
+        or (provider == Provider.TUSHARE and api_name == "stock_basic")
+    ):
+        return _trade_status_delisting_risk_values(row, canonical_fields)
     if provider == Provider.TENCENT and api_name == "daily_bars" and source_table_name == "source.trade_status_v1":
         return _trade_status_from_daily_bar_values(row, canonical_fields)
     if provider == Provider.THS and api_name == "limit_up_pool" and source_table_name == "source.limit_event_v1":
@@ -1159,7 +1243,9 @@ def _with_trade_calendar_pretrade(raw_rows: list[dict[str, Any]]) -> list[dict[s
 
 def execute_source_build_trigger(request: SourceBuildExecuteRequest) -> SourceBuildExecutionResult:
     started = utcnow()
-    trigger = next((item for item in list_source_build_triggers() if item.trigger_id == request.trigger_id), None)
+    trigger = durable_build_trigger_if_enabled(request.trigger_id)
+    if trigger is None:
+        trigger = next((item for item in list_source_build_triggers() if item.trigger_id == request.trigger_id), None)
     if trigger is None:
         raise KeyError(f"unknown source build trigger: {request.trigger_id}")
     if not request.dry_run:
@@ -1368,27 +1454,34 @@ def _build_trigger_key(trigger: Any) -> tuple[str, str, str, str, str, str]:
 
 def run_source_build_worker_once(request: SourceBuildWorkerRunOnceRequest) -> SourceBuildWorkerRunOnceResult:
     results: list[SourceBuildExecutionResult] = []
-    triggers = list_source_build_triggers()
-    build_results = list_build_results()
-    already_processed = {
-        item.trigger_id
-        for item in build_results
-        if item.status in {"succeeded", "failed", "dry_run", "skipped_no_raw"}
-    }
-    succeeded_trigger_ids = {item.trigger_id for item in build_results if item.status == "succeeded"}
-    succeeded_keys = {
-        _build_trigger_key(trigger)
-        for trigger in triggers
-        if trigger.status == "succeeded" or trigger.trigger_id in succeeded_trigger_ids
-    }
-    candidates = [
-        t
-        for t in triggers
-        if t.status == "queued" and t.trigger_id not in already_processed and _build_trigger_key(t) not in succeeded_keys
-    ]
-    if request.source_table_names:
-        candidates = [t for t in candidates if t.source_table_name in request.source_table_names]
-    candidates = candidates[: request.max_triggers]
+    durable_candidates = durable_queued_build_triggers_if_enabled(
+        limit=request.max_triggers,
+        source_table_names=request.source_table_names or None,
+    )
+    if durable_candidates is not None:
+        candidates = durable_candidates
+    else:
+        triggers = list_source_build_triggers()
+        build_results = list_build_results()
+        already_processed = {
+            item.trigger_id
+            for item in build_results
+            if item.status in {"succeeded", "failed", "dry_run", "skipped_no_raw"}
+        }
+        succeeded_trigger_ids = {item.trigger_id for item in build_results if item.status == "succeeded"}
+        succeeded_keys = {
+            _build_trigger_key(trigger)
+            for trigger in triggers
+            if trigger.status == "succeeded" or trigger.trigger_id in succeeded_trigger_ids
+        }
+        candidates = [
+            t
+            for t in triggers
+            if t.status == "queued" and t.trigger_id not in already_processed and _build_trigger_key(t) not in succeeded_keys
+        ]
+        if request.source_table_names:
+            candidates = [t for t in candidates if t.source_table_name in request.source_table_names]
+        candidates = candidates[: request.max_triggers]
     for trigger in candidates:
         results.append(
             execute_source_build_trigger(
@@ -1404,11 +1497,15 @@ def run_source_build_worker_once(request: SourceBuildWorkerRunOnceRequest) -> So
         results=results,
     )
 
-
-def list_source_rows(source_table_name: str | None = None, symbol: str | None = None, trade_date: str | None = None) -> list[SourceCanonicalRowOut]:
+def list_source_rows(
+    source_table_name: str | None = None,
+    symbol: str | None = None,
+    trade_date: str | None = None,
+    limit: int | None = 1000,
+) -> list[SourceCanonicalRowOut]:
     if repository_backend() == "postgres" and _PG_REPO.ready and source_table_name:
         try:
-            pg_rows = _PG_REPO.read_source_rows(source_table_name=source_table_name, symbol=symbol, trade_date=trade_date)
+            pg_rows = _PG_REPO.read_source_rows(source_table_name=source_table_name, symbol=symbol, trade_date=trade_date, limit=limit)
             if pg_rows:
                 return pg_rows
         except Exception:  # pragma: no cover - fall back to memory for diagnostics
