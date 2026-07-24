@@ -1,0 +1,24 @@
+name: Deploy ai_stock
+
+on:
+  push:
+    branches:
+      - main  # 如果你的默认分支是 master，脚本会自动触发
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploying to Tencent Cloud Server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: 22
+          script: |
+            cd /data/projects/ai_stock
+            git pull origin main
+            if [ -f "docker-compose.yml" ] || [ -f "compose.yaml" ]; then
+              docker compose up -d --build
+            fi
