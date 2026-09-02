@@ -1,0 +1,4 @@
+symbol,exchange,board,name,provider,provider_symbol,provider_market,list_date,delist_date,limit_pct,is_st,lot_size,currency,status,provider_extra_json,is_primary
+000001,SZ,main_sz,平安银行,THS,000001,HS,1991-04-03,,0.100000,false,100,CNY,active,,true
+000001,SZ,main_sz,平安银行,EASTMONEY,000001,0,1991-04-03,,0.100000,false,100,CNY,active,{"secid":"0.000001"},true
+000001,SZ,main_sz,平安银行,BAIDU,000001,ab,1991-04-03,,0.100000,false,100,CNY,active,{"path":"ab-000001"},true

@@ -77,7 +77,7 @@ services:
       context: ..
       dockerfile: infra/docker/service.Dockerfile
       args:
-        SERVICE_DIR: services/source-data-service
+        SERVICE_DIR: data_foundation/source-data-service
         SERVICE_EXTRAS: "[providers]"
     container_name: ai-stock-source-data-service
     environment:
@@ -112,7 +112,7 @@ services:
       context: ..
       dockerfile: infra/docker/service.Dockerfile
       args:
-        SERVICE_DIR: services/source-data-service
+        SERVICE_DIR: data_foundation/source-data-service
         SERVICE_EXTRAS: "[providers]"
     container_name: ai-stock-source-data-worker
     environment:
@@ -143,7 +143,7 @@ services:
       context: ..
       dockerfile: infra/docker/service.Dockerfile
       args:
-        SERVICE_DIR: services/source-data-service
+        SERVICE_DIR: data_foundation/source-data-service
         SERVICE_EXTRAS: "[providers]"
     container_name: ai-stock-source-data-worker-eastmoney-research
     environment:
@@ -174,7 +174,7 @@ services:
       context: ..
       dockerfile: infra/docker/service.Dockerfile
       args:
-        SERVICE_DIR: services/source-data-service
+        SERVICE_DIR: data_foundation/source-data-service
         SERVICE_EXTRAS: "[providers]"
     container_name: ai-stock-source-data-worker-tencent-normal
     environment:
@@ -205,7 +205,7 @@ services:
       context: ..
       dockerfile: infra/docker/service.Dockerfile
       args:
-        SERVICE_DIR: services/models_services/hot-candidates-service
+        SERVICE_DIR: intelligence/hot-candidates-service
     container_name: ai-stock-hot-candidates-service
     environment:
       AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
@@ -235,7 +235,7 @@ services:
       context: ..
       dockerfile: infra/docker/service.Dockerfile
       args:
-        SERVICE_DIR: services/models_services/candidate-memory-service
+        SERVICE_DIR: intelligence/candidate-memory-service
     container_name: ai-stock-candidate-memory-service
     environment:
       AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
@@ -265,7 +265,7 @@ services:
       context: ..
       dockerfile: infra/docker/service.Dockerfile
       args:
-        SERVICE_DIR: services/models_services/ambush-watchlist-service
+        SERVICE_DIR: intelligence/ambush-watchlist-service
     container_name: ai-stock-ambush-watchlist-service
     environment:
       AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
@@ -295,7 +295,7 @@ services:
       context: ..
       dockerfile: infra/docker/service.Dockerfile
       args:
-        SERVICE_DIR: services/models_services/t-board-relay-service
+        SERVICE_DIR: intelligence/t-board-relay-service
     container_name: ai-stock-t-board-relay-service
     environment:
       AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
@@ -325,7 +325,7 @@ services:
       context: ..
       dockerfile: infra/docker/service.Dockerfile
       args:
-        SERVICE_DIR: services/scheduler-service
+        SERVICE_DIR: runtime/scheduler-service
     container_name: ai-stock-scheduler-service
     environment:
       AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
@@ -368,7 +368,7 @@ services:
       context: ..
       dockerfile: infra/docker/service.Dockerfile
       args:
-        SERVICE_DIR: services/data-inspector-service
+        SERVICE_DIR: runtime/data-inspector-service
     container_name: ai-stock-data-inspector-service
     environment:
       AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}
@@ -405,7 +405,7 @@ services:
       context: ..
       dockerfile: infra/docker/service.Dockerfile
       args:
-        SERVICE_DIR: services/research-service
+        SERVICE_DIR: research/research-service
     container_name: ai-stock-research-service
     environment:
       AI_STOCK_DATABASE_URL: ${AI_STOCK_DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_stock}:${POSTGRES_PASSWORD:-ai_stock}@postgres:5432/${POSTGRES_DB:-ai_stock}}

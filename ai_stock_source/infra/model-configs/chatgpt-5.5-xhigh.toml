@@ -1,0 +1,31 @@
+# Project model profile for future GPT-backed data analysis.
+# This file must not contain API keys. Runtime code should read TOKENAPI_KEY
+# from the environment when this profile is wired into a service.
+
+profile = "chatgpt-5.5-xhigh"
+model_provider = "tokenapi"
+model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
+preferred_auth_method = "apikey"
+
+[model_providers.tokenapi]
+name = "tokenapi"
+base_url = "https://tokenapi.link/v1"
+env_key = "TOKENAPI_KEY"
+wire_api = "responses"
+
+[usage]
+purpose = "future_gpt_backed_financial_data_analysis_assistance_and_guidance"
+intended_roles = [
+  "analysis_assistant",
+  "data_quality_reasoning_guide",
+  "explanation_draft_reviewer",
+]
+hot_path_dependency = false
+
+[guardrails]
+mutates_recommendation_scores = false
+mutates_recommendation_states = false
+bypasses_publication_gates = false
+requires_frozen_evidence_packet = true

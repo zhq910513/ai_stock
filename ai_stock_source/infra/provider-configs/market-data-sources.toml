@@ -1,0 +1,273 @@
+# Market-data provider source catalog.
+# Non-sensitive only: store env var names, never token/password values.
+
+catalog_version = "market_data_source_catalog_v1"
+owner_service = "source-data-service"
+
+[guardrails]
+secret_values_forbidden = true
+new_adapter_requires_real_probe = true
+converter_required_before_canonical_write = true
+raw_payload_lineage_required = true
+historical_backfill_must_be_marked_replay_safe = true
+decision_time_confidence_must_not_use_future_or_replay_data = true
+jarvis_may_observe_and_recommend = true
+jarvis_may_mutate_provider_facts = false
+jarvis_may_change_data_confidence = false
+
+[access_tiers.free_public_unofficial]
+label = "Free public / unofficial"
+cost_model = "free"
+officiality = "public web or undocumented endpoint"
+sla = "none"
+production_boundary = "Allowed only after real probe, converter, raw lineage, and source-health contract exist."
+
+[access_tiers.free_public_official]
+label = "Free public / official"
+cost_model = "free_or_free_limited"
+officiality = "official public API or documented public endpoint"
+sla = "best_effort_or_public_quota"
+production_boundary = "Allowed after real probe and converter; quota and attribution must remain visible."
+
+[access_tiers.quasi_official_points]
+label = "Quasi-official / points or account gated"
+cost_model = "points_quota_or_account_gated"
+officiality = "documented data platform, not exchange-authoritative"
+sla = "platform_terms"
+production_boundary = "Good candidate for historical backfill when token/account, probe artifact, and converter are present."
+
+[access_tiers.commercial_licensed]
+label = "Commercial licensed"
+cost_model = "paid_contract"
+officiality = "contractual vendor"
+sla = "license_sla"
+production_boundary = "Preferred for production-grade historical replay after license scope, probe, and converter are verified."
+
+[providers.eastmoney]
+display_name = "Eastmoney public web/DataCenter"
+access_tier = "free_public_unofficial"
+implemented = true
+auth_required = false
+env_keys = []
+supported_modes = ["current_session", "after_close_target_day_backfill", "recent_historical_backfill"]
+decision_role = "primary_or_context_source_after_probe"
+historical_backfill_role = "limited_by_endpoint_window_and_probe_result"
+contract_status = "active_verified_adapters"
+domains = ["stock_universe", "quote", "auction", "daily_bar", "minute_bar", "moneyflow", "board_context", "northbound", "macro_lpr", "billboard"]
+planned_domains = []
+notes = "billboard uses the no-login Eastmoney DataCenter RPT_DAILYBILLBOARD_DETAILSNEW endpoint; adapter writes raw payloads and market.billboard_trade canonical rows."
+
+[providers.sina]
+display_name = "Sina public quote"
+access_tier = "free_public_unofficial"
+implemented = true
+auth_required = false
+env_keys = []
+supported_modes = ["current_session", "auction_auxiliary_confirmation"]
+decision_role = "auxiliary_confirmation_only"
+historical_backfill_role = "not_a_historical_backfill_source"
+contract_status = "active_verified_auxiliary"
+domains = ["auction"]
+
+[providers.tencent]
+display_name = "Tencent public quote/K-line"
+access_tier = "free_public_unofficial"
+implemented = true
+auth_required = false
+env_keys = []
+supported_modes = ["current_session", "recent_historical_backfill", "auction_auxiliary_confirmation", "p0_daily_bar_replacement"]
+decision_role = "p0_daily_qfq_index_replacement_after_probe"
+historical_backfill_role = "recent_window_only"
+contract_status = "active_verified_daily_bars_replacement"
+domains = ["quote", "auction", "daily_bar", "adjusted_daily_bar", "index_daily_bar", "minute_bar"]
+notes = "source-data-service TencentAdapter.daily_bars is the current AKShare/EastMoney replacement for daily raw/qfq/index OHLC and volume after real probe and raw/source/lineage build. It deliberately leaves historical target-date amount and pct_chg as NULL for individual stocks; Sohu covers those fields."
+
+[providers.sohu]
+display_name = "Sohu public historical K-line"
+access_tier = "free_public_unofficial"
+implemented = true
+auth_required = false
+env_keys = []
+supported_modes = ["recent_historical_backfill", "p0_daily_bar_field_backup"]
+decision_role = "field_level_backup_after_probe_for_daily_amount_pct_chg"
+historical_backfill_role = "bounded_public_history_after_probe"
+contract_status = "active_verified_daily_amount_pct_backup"
+domains = ["daily_bar"]
+notes = "source-data-service SohuAdapter.daily_bars uses the public hisHq endpoint as source.daily_bar_v1 amount/pct_chg/turnover_rate backup. Volume is normalized from hands to shares and amount from ten-thousand CNY to CNY before canonical comparison."
+
+[providers.coingecko]
+display_name = "CoinGecko public API"
+access_tier = "free_public_official"
+implemented = true
+auth_required = false
+env_keys = ["COINGECKO_API_KEY"]
+optional_env_keys = ["COINGECKO_DEMO_API_KEY"]
+supported_modes = ["current_session", "cross_market_context"]
+decision_role = "bounded_context_source"
+historical_backfill_role = "not_used_for_a_share_historical_backfill"
+contract_status = "active_verified_primary"
+domains = ["cross_market_crypto"]
+
+[providers.yahoo]
+display_name = "Yahoo chart public endpoint"
+access_tier = "free_public_unofficial"
+implemented = true
+auth_required = false
+env_keys = []
+supported_modes = ["current_session", "cross_market_context", "recent_historical_backfill"]
+decision_role = "global_context_primary_or_crypto_fallback"
+historical_backfill_role = "bounded_chart_window_only"
+contract_status = "active_verified_adapters"
+domains = ["cross_market_global_risk", "cross_market_crypto"]
+
+[providers.ths]
+display_name = "THS public limit-up and context"
+access_tier = "free_public_unofficial"
+implemented = true
+auth_required = false
+env_keys = []
+supported_modes = ["public_limit_up_pool_after_probe", "operator_supplied_candidate_prior", "public_context_after_probe", "after_close_target_day_context"]
+decision_role = "source_limit_event_primary_after_probe_and_context_only"
+historical_backfill_role = "public_context_recent_or_target_day_only"
+contract_status = "source_data_service_adapter_active_no_login_public_only"
+domains = ["limit_up_pool", "external_candidate_prior", "limit_up_reason", "market_state", "hot_block", "market_capital", "stock_concept", "stock_attention"]
+docs = [
+  "https://data.10jqka.com.cn/dataapi/limit_up/limit_up_pool",
+  "https://data.10jqka.com.cn/mobile/limitup/v2/index.html",
+  "https://eq.10jqka.com.cn/open/api/wencai/zhangting5.txt",
+]
+notes = "source-data-service THSAdapter implements only public no-login/no-Cookie/no-hexin-v interfaces. limit_up_pool is the preferred source.limit_event_v1 route after real probe; daily-bar derivation remains backup."
+
+[providers.baidu]
+display_name = "Baidu Finance public web feed"
+access_tier = "free_public_unofficial"
+implemented = true
+auth_required = false
+env_keys = []
+supported_modes = ["current_session", "overnight_context", "news_event_discovery"]
+decision_role = "S1_news_event_discovery_after_probe"
+historical_backfill_role = "bounded_by_public_feed_window"
+contract_status = "active_verified_news_feed"
+domains = ["news_feed", "event_discovery", "sentiment_context"]
+docs = ["https://finance.baidu.com/"]
+
+[providers.jin10]
+display_name = "Jin10 / finance-wire candidate"
+access_tier = "commercial_licensed"
+implemented = false
+auth_required = true
+env_keys = ["JIN10_API_KEY"]
+supported_modes = ["news_event_discovery", "macro_external_context"]
+decision_role = "candidate_after_license_probe_converter"
+historical_backfill_role = "candidate_after_contract_scope"
+contract_status = "candidate_unverified_requires_license"
+domains = ["news_feed", "macro_external_news", "event_discovery"]
+
+[providers.jin10_public_flash]
+display_name = "Jin10 public flash web endpoint"
+access_tier = "free_public_unofficial"
+implemented = true
+auth_required = false
+env_keys = []
+supported_modes = ["news_event_discovery", "macro_external_context"]
+decision_role = "context_supplement_after_real_probe_converter_lineage"
+historical_backfill_role = "none_realtime_flash_only"
+contract_status = "verified_public_no_cookie_context_limited"
+domains = ["news_flash", "macro_external_news", "event_discovery"]
+runtime_provider_enum = "JIN10"
+endpoint = "https://flash-api.jin10.com/get_flash_list"
+notes = [
+  "Real no-Cookie/no-account-token probe on 2026-05-19 returned HTTP 200 JSON with top-level status/message/data and 21 rows.",
+  "Requires static public x-app-id/x-version headers observed from public web traffic; these are not stored as secrets and are not account credentials.",
+  "Context/event-discovery only. Must not mutate recommendation confidence, publication gates, provider-health freshness, trades, labels, or learning weights.",
+]
+
+[providers.tushare]
+display_name = "Tushare Pro"
+access_tier = "quasi_official_points"
+implemented = false
+auth_required = true
+env_keys = ["TUSHARE_TOKEN"]
+supported_modes = ["historical_backfill", "after_close_target_day_backfill"]
+decision_role = "candidate_after_adapter_probe_only"
+historical_backfill_role = "preferred_candidate_for_stock_moneyflow_and_board_moneyflow_backfill"
+contract_status = "candidate_unverified_no_adapter"
+domains = ["daily_bar", "moneyflow", "board_moneyflow", "northbound", "index_beta"]
+docs = [
+  "https://tushare.pro/document/2?doc_id=170",
+  "https://tushare.pro/document/2?doc_id=349",
+  "https://tushare.pro/document/2?doc_id=348",
+]
+
+[providers.joinquant]
+display_name = "JoinQuant / JQData"
+access_tier = "quasi_official_points"
+implemented = false
+auth_required = true
+env_keys = ["JQDATA_USERNAME", "JQDATA_PASSWORD"]
+supported_modes = ["historical_backfill", "after_close_target_day_backfill"]
+decision_role = "candidate_after_adapter_probe_only"
+historical_backfill_role = "candidate_for_moneyflow_and_bar_backfill"
+contract_status = "candidate_unverified_no_adapter"
+domains = ["daily_bar", "moneyflow", "fundamental_context"]
+
+[providers.akshare]
+display_name = "AKShare wrapper ecosystem"
+access_tier = "free_public_unofficial"
+implemented = false
+auth_required = false
+env_keys = []
+supported_modes = ["contract_discovery", "read_only_research_probe"]
+decision_role = "not_a_production_source_until_underlying_endpoint_probe"
+historical_backfill_role = "discovery_only_until_direct_adapter_contract_exists"
+contract_status = "candidate_library_wrapper_no_canonical_adapter"
+domains = ["moneyflow", "board_context", "macro"]
+notes = "Research-only wrapper source until latest real probe passes. source-data-service currently removes AKShare/EastMoney-backed stock_zh_a_hist_daily_raw, stock_zh_a_hist_daily_qfq, index_zh_a_hist and stock_zh_a_spot_em from production probe gates when their latest real probes fail; BaoStock and Tencent cover the P0 daily/universe paths."
+
+[providers.wind]
+display_name = "Wind Financial Terminal/API"
+access_tier = "commercial_licensed"
+implemented = false
+auth_required = true
+env_keys = ["WIND_USERNAME", "WIND_PASSWORD"]
+supported_modes = ["historical_backfill", "production_replay"]
+decision_role = "candidate_after_license_and_adapter_probe"
+historical_backfill_role = "commercial_candidate_for_authoritative_history"
+contract_status = "candidate_requires_license"
+domains = ["daily_bar", "minute_bar", "moneyflow", "industry", "macro", "calendar"]
+
+[providers.choice]
+display_name = "Eastmoney Choice"
+access_tier = "commercial_licensed"
+implemented = false
+auth_required = true
+env_keys = ["CHOICE_USERNAME", "CHOICE_PASSWORD"]
+supported_modes = ["historical_backfill", "production_replay"]
+decision_role = "candidate_after_license_and_adapter_probe"
+historical_backfill_role = "commercial_candidate_for_choice_aligned_history"
+contract_status = "candidate_requires_license"
+domains = ["daily_bar", "minute_bar", "moneyflow", "industry", "macro", "calendar"]
+
+[providers.ifind]
+display_name = "Tonghuashun iFinD"
+access_tier = "commercial_licensed"
+implemented = false
+auth_required = true
+env_keys = ["IFIND_USERNAME", "IFIND_PASSWORD"]
+supported_modes = ["historical_backfill", "production_replay"]
+decision_role = "candidate_after_license_and_adapter_probe"
+historical_backfill_role = "commercial_candidate_for_ths_aligned_history"
+contract_status = "candidate_requires_license"
+domains = ["daily_bar", "minute_bar", "moneyflow", "industry", "macro", "calendar"]
+
+[providers.datayes]
+display_name = "DataYes / Uqer"
+access_tier = "commercial_licensed"
+implemented = false
+auth_required = true
+env_keys = ["DATAYES_TOKEN"]
+supported_modes = ["historical_backfill", "production_replay"]
+decision_role = "candidate_after_license_and_adapter_probe"
+historical_backfill_role = "commercial_candidate_for_research_history"
+contract_status = "candidate_requires_license"
+domains = ["daily_bar", "fundamental_context", "industry", "calendar"]

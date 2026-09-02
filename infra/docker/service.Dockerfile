@@ -15,7 +15,11 @@ ENV SERVICE_DIR=${SERVICE_DIR}
 WORKDIR /app
 
 COPY packages /app/packages
-COPY services /app/services
+COPY data_foundation /app/data_foundation
+COPY intelligence /app/intelligence
+COPY runtime /app/runtime
+COPY research /app/research
+COPY frontend /app/frontend
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     python -m pip install --upgrade pip && \

@@ -1,0 +1,13 @@
+[project]
+name = "ai-stock-candidate-memory-model-service"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "ai-stock-common",
+  "fastapi>=0.115",
+  "pydantic>=2",
+  "uvicorn[standard]>=0.30",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

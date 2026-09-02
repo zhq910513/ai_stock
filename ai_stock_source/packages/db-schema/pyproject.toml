@@ -1,0 +1,16 @@
+[project]
+name = "ai-stock-db-schema"
+version = "0.1.0"
+description = "SQL bootstrap utility for ai_stock local docker stack"
+requires-python = ">=3.12"
+dependencies = ["psycopg[binary]>=3.2,<4.0"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
